@@ -552,7 +552,7 @@
     "  timeout, and the request sometimes resolves after the totals render.",
     "",
     "● Update(tests/checkout.spec.ts)",
-    "  ⎿  Updated tests/checkout.spec.ts with 3 additions and 2 removals",
+    "  └  Updated tests/checkout.spec.ts with 3 additions and 2 removals",
     "       41 -    await page.waitForTimeout(500)",
     "       41 +    await page.waitForResponse((r) => r.url().endsWith('/coupons/apply'))",
     "",
@@ -597,7 +597,7 @@
    ],
    "w1:p4": [
     "● Bash(npm run test:e2e -- --grep login --repeat-each 20)",
-    "  ⎿  \u001b[32m✓\u001b[0m 20 passed (1.4m)",
+    "  └  \u001b[32m✓\u001b[0m 20 passed (1.4m)",
     "",
     "● The login flake is fixed. The session cookie was read before the redirect finished;",
     "  the test now waits for the dashboard heading instead of a fixed delay.",
@@ -611,7 +611,7 @@
     "\u001b[2m────────────────────────────────────────────────────────── e2e-login-flake ──\u001b[0m",
     "❯ ",
     "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
-    "\u001b[2m  ⏵⏵ accept edits on (shift+tab to cycle)\u001b[0m"
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
    ],
    "w2:p1": [
     "● I drafted the v2 reference for the orders endpoints:",
@@ -627,7 +627,7 @@
     "\u001b[2m────────────────────────────────────────────────────────── api-docs-v2 ──\u001b[0m",
     "❯ ",
     "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
-    "\u001b[2m  ⏵⏵ accept edits on (shift+tab to cycle)\u001b[0m"
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
    ],
    "w2:p2": [
     "> summarize the open questions in docs/guides/deploy.md",
@@ -643,7 +643,7 @@
     "● Reading the merged pull requests since the last tag.",
     "",
     "● Bash(git log --oneline v1.8.0..HEAD)",
-    "  ⎿  a1c9e07 Cursor pagination for orders",
+    "  └  a1c9e07 Cursor pagination for orders",
     "     4f20b11 Coupon applied before tax",
     "     9d3e5a2 Rate limit headers on every response",
     "     … +14 lines (ctrl+r to expand)",
@@ -655,26 +655,26 @@
     "\u001b[2m────────────────────────────────────────────────────────── release-notes-draft ──\u001b[0m",
     "❯ ",
     "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
-    "\u001b[2m  ⏵⏵ accept edits on (shift+tab to cycle)\u001b[0m"
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
    ]
   },
   "workstation": {
    "w1:p1": [
     "● Bash(pytest tests/auth -q)",
-    "  ⎿  \u001b[32m41 passed\u001b[0m, 2 skipped in 6.20s",
+    "  └  \u001b[32m41 passed\u001b[0m, 2 skipped in 6.20s",
     "",
     "● Replacing the session middleware with the OIDC client. The refresh flow needs the",
     "  token endpoint from discovery, so I'm caching the discovery document for an hour.",
     "",
     "● Update(app/auth/oidc.py)",
-    "  ⎿  Updated app/auth/oidc.py with 58 additions",
+    "  └  Updated app/auth/oidc.py with 58 additions",
     "",
     "\u001b[33m✻ Wiring the callback route… (2m 03s · ↓ 6.8k tokens · esc to interrupt)\u001b[0m",
     "",
     "\u001b[2m────────────────────────────────────────────────────────── migrate-auth-to-oidc ──\u001b[0m",
     "❯ ",
     "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
-    "\u001b[2m  ⏵⏵ accept edits on (shift+tab to cycle)\u001b[0m"
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
    ],
    "w1:p2": [
     "$ pytest -x --lf",
@@ -702,7 +702,7 @@
     "\u001b[2m────────────────────────────────────────────────────────── rate-limiter-review ──\u001b[0m",
     "❯ ",
     "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
-    "\u001b[2m  ⏵⏵ accept edits on (shift+tab to cycle)\u001b[0m"
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
    ],
    "w1:p4": [
     "  opencode",
@@ -732,14 +732,14 @@
     "  not the category listing that embeds it.",
     "",
     "● Search(pattern: \"cache.delete\", path: \"app\")",
-    "  ⎿  Found 7 matches",
+    "  └  Found 7 matches",
     "",
     "\u001b[33m✻ Tracing every write path… (37s · ↓ 1.6k tokens · esc to interrupt)\u001b[0m",
     "",
     "\u001b[2m────────────────────────────────────────────────────────── cache-invalidation-bug ──\u001b[0m",
     "❯ ",
     "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
-    "\u001b[2m  ⏵⏵ accept edits on (shift+tab to cycle)\u001b[0m"
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
    ],
    "w2:p1": [
     "● Here is a tighter hero section:",
@@ -752,7 +752,7 @@
     "\u001b[2m────────────────────────────────────────────────────────── landing-page-copy ──\u001b[0m",
     "❯ ",
     "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
-    "\u001b[2m  ⏵⏵ accept edits on (shift+tab to cycle)\u001b[0m"
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
    ],
    "w2:p2": [
     " Commits",
@@ -769,7 +769,7 @@
   "server": {
    "w1:p1": [
     "● Bash(kubectl describe pod -l app=api | grep -A3 Liveness)",
-    "  ⎿  Liveness:  http-get :8080/healthz delay=5s timeout=1s period=10s",
+    "  └  Liveness:  http-get :8080/healthz delay=5s timeout=1s period=10s",
     "",
     "● The liveness probe times out after 1s while a cold start loads the model files,",
     "  so the pod is killed before it is ready. I'm adding a startup probe and raising the",
@@ -780,7 +780,7 @@
     "\u001b[2m────────────────────────────────────────────────────────── probe-timeouts ──\u001b[0m",
     "❯ ",
     "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
-    "\u001b[2m  ⏵⏵ accept edits on (shift+tab to cycle)\u001b[0m"
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
    ],
    "w1:p2": [
     "\u001b[2m{\"level\":\"info\",\"msg\":\"request served\",\"path\":\"/v1/orders\",\"status\":200,\"ms\":12}\u001b[0m",
@@ -814,7 +814,7 @@
     "\u001b[2m────────────────────────────────────────────────────────── alert-noise-cleanup ──\u001b[0m",
     "❯ ",
     "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
-    "\u001b[2m  ⏵⏵ accept edits on (shift+tab to cycle)\u001b[0m"
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
    ],
    "w1:p5": [
     " cpu \u001b[32m▇▇▇▅▃▂▂▃▅▆\u001b[0m 34%   mem \u001b[33m██████░░░░\u001b[0m 6.1G/15.5G   load 0.84 0.71 0.66",
