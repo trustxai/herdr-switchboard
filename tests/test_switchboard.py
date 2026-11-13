@@ -89,6 +89,9 @@ What it has to get right, and how it fails otherwise:
 28. Colours are exactly what fzf accepts; the extra fzf entries are checked by the installed
    fzf before the popup opens, and if fzf still refuses its command line the popup says why
    and waits instead of vanishing.
+29. Snapshot text is untrusted: a newline in a title cannot fabricate a row, escape sequences
+   and control characters never reach fzf or the header, ids that could pass for options or
+   break a row are dropped, wrong types do not crash, and the preview keeps colours only.
 
     python3 tests/test_switchboard.py
 """
@@ -1724,6 +1727,89 @@ with tempfile.TemporaryDirectory() as d:
                        stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
     check("fzf-error-is-shown-not-swallowed", r.returncode != 0 and "fzf could not start: unknown action: whatever"
           in r.stdout and "Press Enter" in r.stdout, (r.returncode, r.stdout[-300:], r.stderr[-300:]))
+
+# 29. Untrusted snapshot text.
+EVIL = {
+    "workspaces": [{"workspace_id": "w1", "label": "ws\tx\x1b]0;title\x07", "number": "1"},
+                   {"workspace_id": ["list"], "label": "odd"}],
+    "tabs": [{"tab_id": "w1:t1", "label": "t\x00ab", "number": 1}],
+    "panes": [
+        {"pane_id": "w1:p1", "tab_id": "w1:t1", "workspace_id": "w1", "label": "\x1b[31mred\x1b]52;c;QUFB\x07",
+         "terminal_title_stripped": "x", "cwd": "/tmp/\x07bell"},
+        {"pane_id": "w1:p2", "tab_id": "w1:t1", "workspace_id": "w1",
+         "terminal_title_stripped": "x\nevil|a|--help|w9:t9\tforged", "cwd": "/tmp"},
+        {"pane_id": "--help", "tab_id": "w1:t1", "workspace_id": "w1", "terminal_title_stripped": "dash id"},
+        {"pane_id": "w1:p|3", "tab_id": "w1:t1", "workspace_id": "w1", "terminal_title_stripped": "pipe id"},
+        {"pane_id": "w1:p4", "tab_id": "w1:t1\n", "workspace_id": "w1", "terminal_title_stripped": "newline tab"},
+        {"pane_id": "w1:p5", "tab_id": "w1:t1", "workspace_id": ["list"], "terminal_title_stripped": "list ws"},
+        "not a dict",
+    ],
+    "agents": [{"pane_id": "w1:p1", "agent": "codex\x1b[2J", "agent_status": ["blocked"], "state_change_seq": "9",
+                "completion_seq": True},
+               {"pane_id": "w1:p2", "agent": "claude", "agent_status": "idle", "state_change_seq": 4,
+                "terminal_title_stripped": "x\nevil|a|--help|w9:t9\tforged"}],
+}
+try:
+    evil = sb.entries_from(EVIL, "m1", "box\x1b[31m1\n", 1)
+    text = sb.render(evil, [{"id": "m1", "label": "box1"}], pending=["lo\x1bading"], down=["dow\nn"])
+except Exception as exc:
+    evil, text = [], ""
+    check("evil-snapshot-does-not-crash", False, repr(exc))
+lines = text.splitlines()
+check("evil-only-safe-panes", sorted(e["pane"] for e in evil) == ["w1:p1", "w1:p2", "w1:p5"], [e["pane"] for e in evil])
+check("evil-list-is-not-a-label", all("[" not in e["ws_label"] for e in evil), [e["ws_label"] for e in evil])
+check("safe-id-no-trailing-newline", not sb.safe_id("w1:t1\n") and sb.safe_id("w1:t1"))
+check("evil-one-line-per-row", len(lines) == 1 + len(evil) + 1, lines)
+check("evil-no-forged-row", all(l.startswith("-\t") or sb.parse_id(l.split("\t", 1)[0]) for l in lines)
+      and not any(l.startswith("evil|") for l in lines), lines)
+check("evil-no-escape-or-control", not re.search(r"[\x00-\x08\x0a-\x1f\x7f-\x9f]", text.replace("\n", "").replace("\t", "")),
+      repr(text[:300]))
+check("evil-text-kept-plain", "box1" in text and "red" in text and "codex" in text and "forged" in text, text)
+check("evil-wrong-types", [(e["status"], e["seq"], e["completion"]) for e in evil if e["pane"] == "w1:p1"]
+      == [("unknown", 0, None)], [(e["status"], e["seq"], e["completion"]) for e in evil])
+check("parse-id-refuses-option-like", sb.parse_id("|a|--help|w9:t9") is None and sb.parse_id("-x|a|w1:p1|w1:t1") is None
+      and sb.parse_id("|a|w1:p1|w1:t1") is not None)
+check("evil-machine-id-refused", sb.entries_from(snap([pane("w1:p1")], []), "--machine", "x", 1) == [])
+saved_warning = sb.CONFIG_WARNING
+sb.CONFIG_WARNING = "config: bad\x1b[2J\x07 value"
+try:
+    check("warning-cleaned-in-header", "\x1b" not in sb.header([], [], [], []) and "bad value" in sb.header([], [], [], []))
+finally:
+    sb.CONFIG_WARNING = saved_warning
+screen_in = "a\x1b[31mred\x1b[0m\x1b]52;c;QUFB\x07\x1b[2J\x07\rb\tc\x1bPq#0\x1b\\d\n"
+check("preview-keeps-only-colours", sb.clean_screen(screen_in) == "a\x1b[31mred\x1b[0mb\tcd\n", repr(sb.clean_screen(screen_in)))
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    (d / "machines.json").write_text(json.dumps([
+        {"id": "m1", "label": "box\x1b[31m1\n", "enabled": True}, {"id": "-x", "label": "dash", "enabled": True},
+        {"id": ["l"], "label": "list", "enabled": True}, {"id": "m2", "label": "", "enabled": True}, "junk"]))
+    (d / "screen.txt").write_text(screen_in)
+    fh = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                                 '  *"pane read"*) cat "%(d)s/screen.txt" ;;\n  *) exit 2 ;;\nesac\n' % {"d": d})
+    saved_herdr = sb.HERDR
+    sb.HERDR = str(fh)
+    try:
+        ms = sb.saved_machines()
+        check("machines-cleaned", [(m["id"], m["label"]) for m in ms] == [("m1", "box1"), ("m2", "m2")], ms)
+    finally:
+        sb.HERDR = saved_herdr
+    r = subprocess.run([sys.executable, str(TOOL), "--preview", "|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, universal_newlines=True, env=dict(os.environ, HERDR_BIN_PATH=str(fh)),
+                       timeout=20)
+    check("preview-e2e-no-osc", "\x1b]52" not in r.stdout and "\x1b[2J" not in r.stdout and "\x1b[31mred" in r.stdout,
+          repr(r.stdout))
+calls = []
+orig = (sb.run_out, sb.local_tui_tty, sb.time.sleep, sb.local_label)
+sb.run_out = lambda argv, timeout=5: calls.append(argv[1:]) or ""
+sb.local_tui_tty = lambda ps_text=None: None
+sb.time.sleep = lambda s: None
+sb.local_label = lambda: "mac1"
+try:
+    sb.jump("box1", "a", "w1:p1", "w1:t1", "sbjabc", True, "-logs")
+    # herdr 0.9.5 keeps a "--" as part of the label, so a dash-leading label goes as it is.
+    check("jump-dash-label-as-is", ["--machine", "box1", "pane", "rename", "w1:p1", "-logs"] in calls, calls)
+finally:
+    sb.run_out, sb.local_tui_tty, sb.time.sleep, sb.local_label = orig
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0] and sb._SSH_DIR[0].startswith(_tmp_root),

@@ -73,10 +73,36 @@ CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 
 def clean(text):
-    """One line of plain text, without escape sequences or control characters."""
-    if not isinstance(text, str):
-        text = "" if text is None else str(text)
+    """One line of plain text, without escape sequences or control characters. A number
+    becomes its digits; any other non-string (a list where a label should be) becomes ""."""
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
+        text = str(text)
+    elif not isinstance(text, str):
+        return ""
     return CONTROL_CHARS.sub("", ESCAPE_SEQ.sub("", text))
+
+
+# For pane contents shown in the preview: colours (SGR) and line breaks stay, every other
+# escape (clipboard writes, title changes, screen clears) and control character goes.
+SCREEN_TOKENS = re.compile(r"(\x1b\[[0-9;:]*m)|" + ESCAPE_SEQ.pattern + r"|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def clean_screen(text):
+    return SCREEN_TOKENS.sub(lambda m: m.group(1) or "", text)
+
+
+# What a herdr id looks like ("w1:p3", a machine id). Ids go into herdr's argv and into
+# the row id, so one that could pass for an option or break a row is refused.
+SAFE_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_:.@+=-]{0,127}")
+
+
+def safe_id(value):
+    # fullmatch, not match: "$" also matches before a trailing newline.
+    return isinstance(value, str) and SAFE_ID.fullmatch(value) is not None
+
+
+def _int(value, default=0):
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
 
 # --- user-visible text ------------------------------------------------------------------
 #
@@ -660,63 +686,84 @@ def make_id(machine, kind, pane, tab):
 
 
 def parse_id(row_id):
-    """None when the row leads nowhere: the header or an offline machine."""
+    """None when the row leads nowhere: the header, an offline machine, or an id that does
+    not look like herdr's."""
     parts = row_id.split(SEP)
     if len(parts) != 4:
         return None
     machine, kind, pane, tab = parts
-    if kind not in ("a", "t"):
+    if kind not in ("a", "t") or (machine and not safe_id(machine)) or not safe_id(pane) or not safe_id(tab):
         return None
     return {"machine": machine, "kind": kind, "pane": pane, "tab": tab}
 
 
 def entries_from(snap, machine=LOCAL, machine_label="", machine_index=0):
-    """The entries (dicts) of one `herdr api snapshot`."""
-    wss = {w["workspace_id"]: w for w in snap.get("workspaces", [])}
-    tabs = {t["tab_id"]: t for t in snap.get("tabs", [])}
-    agents = {a["pane_id"]: a for a in snap.get("agents", [])}
+    """The entries (dicts) of one `herdr api snapshot`.
+
+    A snapshot is untrusted input: any process in a pane sets its own title, and a remote
+    machine sends whatever it sends. Ids must look like herdr's (they reach herdr's argv and
+    the row id), text loses escape sequences and control characters (a newline in a title
+    would otherwise make a row of its own), and numbers must be numbers."""
+    if machine and not safe_id(machine):
+        return []
+
+    def items(key):
+        value = snap.get(key) if isinstance(snap, dict) else None
+        return [x for x in value if isinstance(x, dict)] if isinstance(value, list) else []
+
+    def index(key, field):
+        return {x[field]: x for x in items(key) if isinstance(x.get(field), str)}
+
+    wss = index("workspaces", "workspace_id")
+    tabs = index("tabs", "tab_id")
+    agents = index("agents", "pane_id")
+    panes = [p for p in items("panes") if safe_id(p.get("pane_id")) and safe_id(p.get("tab_id"))]
     # A pane's number is its position inside its tab in snapshot order, as in the Goto.
     by_tab = {}
-    for p in snap.get("panes", []):
-        by_tab.setdefault(p.get("tab_id"), []).append(p["pane_id"])
+    for p in panes:
+        by_tab.setdefault(p["tab_id"], []).append(p["pane_id"])
+    machine_label = clean(machine_label)
     out = []
-    for p in snap.get("panes", []):
+    for p in panes:
         a = agents.get(p["pane_id"])
-        w = wss.get(p.get("workspace_id"), {})
-        t = tabs.get(p.get("tab_id"), {})
+        w = wss.get(p.get("workspace_id")) if isinstance(p.get("workspace_id"), str) else None
+        w = w or {}
+        t = tabs.get(p["tab_id"]) or {}
         if a:
-            status = a.get("agent_status") if a.get("agent_status") in PRIORITY else "unknown"
+            st = a.get("agent_status")
+            status = st if isinstance(st, str) and st in PRIORITY else "unknown"
         else:
             status = "shell"
         src = a or p
-        siblings = by_tab.get(p.get("tab_id"), [])
-        tab_label = t.get("label") or ""
+        siblings = by_tab.get(p["tab_id"], [])
+        tab_label = clean(t.get("label"))
+        completion = (a or {}).get("completion_seq")
         out.append({
             "machine": machine,
             "machine_label": machine_label,
             "machine_index": machine_index,
             "kind": "a" if a else "t",
             "pane": p["pane_id"],
-            "tab": p.get("tab_id", ""),
+            "tab": p["tab_id"],
             "status": status,          # what is shown: Recency.apply may raise it to done
             "server_status": status,   # what the server says
-            "seq": (a or {}).get("state_change_seq", 0) or 0,
+            "seq": _int((a or {}).get("state_change_seq")),
             # The seq at which a piece of work finished, whether anyone saw it or not.
-            "completion": (a or {}).get("completion_seq"),
-            "ws_label": w.get("label") or p.get("workspace_id", ""),
-            "ws_number": w.get("number", 0) or 0,
+            "completion": completion if _int(completion, None) is not None else None,
+            "ws_label": clean(w.get("label")) or clean(p.get("workspace_id")),
+            "ws_number": _int(w.get("number")),
             # An unnamed tab is called "1", "2": that is its number, not a name.
             "tab_name": tab_label if (t.get("custom_label") or not tab_label.isdigit()) else "",
             "tab_auto": tab_label,
-            "tab_number": t.get("number", 0) or 0,
+            "tab_number": _int(t.get("number")),
             # The pane's name: the one from `herdr pane rename`, or the agent's.
-            "pane_name": p.get("label") or (a or {}).get("name") or "",
-            "pane_label": p.get("label") or "",
-            "pane_index": siblings.index(p["pane_id"]) + 1 if p["pane_id"] in siblings else 1,
+            "pane_name": clean(p.get("label")) or clean((a or {}).get("name")),
+            "pane_label": clean(p.get("label")),
+            "pane_index": siblings.index(p["pane_id"]) + 1,
             "tab_panes": len(siblings),
-            "title": (a or {}).get("title") or src.get("terminal_title_stripped") or "",
-            "agent": (a or {}).get("agent") or "",
-            "cwd": tilde(src.get("cwd") or "", remote=bool(machine)),
+            "title": clean((a or {}).get("title")) or clean(src.get("terminal_title_stripped")),
+            "agent": clean((a or {}).get("agent")),
+            "cwd": tilde(clean(src.get("cwd")), remote=bool(machine)),
         })
     return out
 
@@ -767,7 +814,7 @@ def format_row(e):
 
 
 def down_row(label):
-    return "-\t%s· %s %s %s%s" % (DIM, pad("", 8), pad(label, MACHINE_WIDTH), tr("offline_row"), OFF)
+    return "-\t%s· %s %s %s%s" % (DIM, pad("", 8), pad(clean(label), MACHINE_WIDTH), tr("offline_row"), OFF)
 
 
 def header(entries, machines, pending, down, stale=()):
@@ -775,13 +822,13 @@ def header(entries, machines, pending, down, stale=()):
     counts = [(s, sum(1 for e in agents if e["status"] == s)) for s in ("blocked", "done", "working")]
     parts = [tr("agents", len(agents))] + [tr("count", n, tr("st_" + s)) for s, n in counts if n]
     if stale:
-        parts.append(", ".join(tr("stale", label, age) for label, age in stale))
+        parts.append(", ".join(tr("stale", clean(label), age) for label, age in stale))
     if pending:
-        parts.append(tr("loading", ", ".join(pending)))
+        parts.append(tr("loading", ", ".join(clean(x) for x in pending)))
     if down:
-        parts.append(tr("offline_list", ", ".join(down)))
+        parts.append(tr("offline_list", ", ".join(clean(x) for x in down)))
     if CONFIG_WARNING:
-        parts.insert(0, CONFIG_WARNING)
+        parts.insert(0, clean(CONFIG_WARNING))
     return "-\t%s%s   %s%s" % (GRAY, " · ".join(parts), tr("hint"), OFF)
 
 
@@ -847,11 +894,13 @@ def snapshot(machine=LOCAL, timeout=None, info=None):
 
 
 def saved_machines():
+    """The enabled saved machines, with ids herdr would produce and labels made plain."""
     try:
         ms = json.loads(herdr(["machine", "list", "--json"], 3))
     except Exception:
         return []
-    return [m for m in ms if m.get("enabled")]
+    return [dict(m, label=clean(m.get("label")) or m["id"]) for m in (ms if isinstance(ms, list) else [])
+            if isinstance(m, dict) and m.get("enabled") and safe_id(m.get("id"))]
 
 
 def _safe_name(machine):
@@ -1381,9 +1430,10 @@ def preview(row_id):
     args = ["pane", "read", target["pane"], "--source", "recent", "--lines",
             str(int(lines) * 2), "--format", "ansi"]
     try:
-        sys.stdout.write(trim_footer(herdr_on(target["machine"], args, REMOTE_TIMEOUT if target["machine"] else 5)))
+        text = herdr_on(target["machine"], args, REMOTE_TIMEOUT if target["machine"] else 5)
+        sys.stdout.write(clean_screen(trim_footer(text)))
     except Exception as exc:
-        sys.stdout.write(tr("read_failed", exc) + "\n")
+        sys.stdout.write(tr("read_failed", clean(str(exc))) + "\n")
     return 0
 
 
@@ -1483,7 +1533,7 @@ def copy(row_id, tty=None):
         try:
             screen = trim_footer(herdr_on(target["machine"], args, REMOTE_TIMEOUT if target["machine"] else 5))
         except Exception as exc:
-            print(tr("read_failed", exc))
+            print(tr("read_failed", clean(str(exc))))
             return 0
         text = last_reply_from_screen(screen) if target["kind"] == "a" else None
         what = tr("what_reply_screen")
@@ -1501,7 +1551,7 @@ def copy(row_id, tty=None):
         with open(tty, "w") as t:
             t.write(osc52(text))
     except OSError as exc:
-        print(tr("copy_failed", exc))
+        print(tr("copy_failed", clean(str(exc))))
         return 0
     print(tr("copied", what, len(text)))
     return 0
@@ -1680,8 +1730,8 @@ def select_view(row_id, tty="/dev/tty"):
     try:
         text = trim_footer(herdr_on(target["machine"], args, REMOTE_TIMEOUT if target["machine"] else 5))
     except Exception as exc:
-        text = tr("read_failed", exc)
-    lines = [l.rstrip() for l in ANSI.sub("", text).split("\n")]
+        text = tr("read_failed", clean(str(exc)))
+    lines = [CONTROL_CHARS.sub("", l).rstrip() for l in ESCAPE_SEQ.sub("", text).split("\n")]
     while len(lines) > 1 and not lines[-1]:
         lines.pop()
     import termios
@@ -2028,6 +2078,8 @@ def jump(label, kind, pane, tab, query, rename, old_label, wait=0.15, tty=None, 
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
         time.sleep(0.6)
     if rename:
+        # The label goes as it is: herdr takes a label that starts with "-" as text, and a
+        # "--" in front would become part of the label (checked against herdr 0.9.5).
         run_out([HERDR] + api + ["pane", "rename", pane] + ([old_label] if old_label else ["--clear"]), timeout=10)
     # In case the Goto landed on another pane of that machine, this puts it right.
     run_out([HERDR] + focus, timeout=10)
