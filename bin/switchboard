@@ -1234,26 +1234,29 @@ class Live:
         return dirty
 
     def consume_acks(self, path):
-        """Apply the tabs `--focus` wrote to `path`.
+        """Apply the tabs `--enter` wrote to `path`.
 
-        The file is first renamed to a private name and only then read: a `--focus` that
+        The file is first renamed to a private name and only then read: an `--enter` that
         appends while this runs writes to a new `path`, which the next call picks up.
-        Reading first and removing after would drop that line."""
-        private = "%s.%d.%d" % (path, os.getpid(), threading.get_ident())
-        try:
-            os.replace(path, private)
-        except OSError:
+        Reading first and removing after would drop that line. Everything goes through a
+        descriptor of the (private) directory and never follows a symlink."""
+        dir_fd = open_private_dir(os.path.dirname(path) or ".")
+        if dir_fd is None:
             return False
+        name = os.path.basename(path)
+        private = "%s.%d.%d" % (name, os.getpid(), threading.get_ident())
         try:
-            with open(private) as f:
-                lines = f.read().splitlines()
-        except OSError:
-            lines = []
-        finally:
             try:
-                os.remove(private)
+                os.replace(name, private, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except OSError:
+                return False
+            lines = (read_small(dir_fd, private, 1 << 20) or "").splitlines()
+            try:
+                os.remove(private, dir_fd=dir_fd)
             except OSError:
                 pass
+        finally:
+            os.close(dir_fd)
         dirty = False
         for line in lines:
             try:
@@ -1358,30 +1361,40 @@ def watch(live, sock, rows_file, stop, acks=None):
             kick.set()
             stop.wait(REMOTE_EVERY)
 
+    # The rows file is written through a descriptor of its (private) directory, never through
+    # a symlink, so a pass that outlives the directory cannot write anywhere else.
+    rows_dir = open_private_dir(os.path.dirname(rows_file) or ".")
+    rows_name = os.path.basename(rows_file)
+
     def local_pass():
         live.refresh_local()
         if acks:
             live.consume_acks(acks)
         text = live.changed()
-        if text is None:
+        if text is None or rows_dir is None:
             return
-        tmp = rows_file + ".tmp"
-        with open(tmp, "w") as f:
+        fd = os.open(rows_name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
+                     dir_fd=rows_dir)
+        with os.fdopen(fd, "w") as f:
             f.write(text)
-        os.replace(tmp, rows_file)
+        os.replace(rows_name + ".tmp", rows_name, src_dir_fd=rows_dir, dst_dir_fd=rows_dir)
         fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
 
     for i, m in enumerate(live.machines):
         threading.Thread(target=remote_loop, args=(i, m), daemon=True).start()
-    while not stop.is_set():
-        kick.wait(LOCAL_EVERY)
-        kick.clear()
-        if stop.is_set():
-            break
-        try:
-            local_pass()
-        except Exception:
-            continue
+    try:
+        while not stop.is_set():
+            kick.wait(LOCAL_EVERY)
+            kick.clear()
+            if stop.is_set():
+                break
+            try:
+                local_pass()
+            except Exception:
+                continue
+    finally:
+        if rows_dir is not None:
+            os.close(rows_dir)
 
 
 # --- actions ----------------------------------------------------------------------------
@@ -1421,16 +1434,13 @@ def machine_labels():
     return {str(k): clean(v) for k, v in labels.items()} if isinstance(labels, dict) else {}
 
 
-def record_ack(target, run_dir=None):
+RESULT_NAME = re.compile(r"focus-[0-9]+-[0-9]+")
+
+
+def record_ack(target, dir_fd):
     """Tell the popup that this row's tab was picked: one line appended to its acks file."""
-    run_dir = run_dir or os.environ.get("SWITCHBOARD_RUN_DIR")
-    if not run_dir:
-        return
-    try:
-        with open(os.path.join(run_dir, "acks"), "a") as f:
-            f.write(json.dumps([target["machine"], target["tab"]]) + "\n")
-    except OSError:
-        pass
+    if dir_fd is not None:
+        append_line(dir_fd, "acks", json.dumps([target["machine"], target["tab"]]))
 
 
 def enter(row_id, run_dir=None):
@@ -1441,38 +1451,51 @@ def enter(row_id, run_dir=None):
     recorded as seen, and a worker that does the focus is started in its own session, so
     neither fzf exiting nor the popup closing can stop it. Then it prints fzf actions at
     once: a footer saying the pane is being focused, and a background transform
-    (`--focus-wait`) that shows the worker's result when it arrives. fzf never waits on the
-    network, and killing the waiter loses nothing."""
+    (`--focus-wait`) that shows the worker's result when it arrives.
+
+    The worker outlives the popup on purpose, so it never gets the run directory's name:
+    it inherits a descriptor of that directory, opened and checked here while the popup
+    still owns it, and its argv holds only the bare name of its result file. If the popup
+    has removed the directory by the time the worker finishes, there is nowhere to write
+    and nothing is written; the focus has happened all the same."""
     target = parse_id(row_id)
     if target is None:
         return 0
     if not target["machine"] or JUMP_ENABLED:
         sys.stdout.write("accept\n")
         return 0
-    run_dir = run_dir or os.environ.get("SWITCHBOARD_RUN_DIR") or ""
-    record_ack(target, run_dir)
-    result = os.path.join(run_dir, "focus-%d-%d" % (os.getpid(), int(time.time() * 1000))) if run_dir else ""
-    me = [sys.executable, os.path.abspath(__file__)]
+    run_fd = open_private_dir(run_dir or os.environ.get("SWITCHBOARD_RUN_DIR"))
     try:
-        subprocess.Popen(me + ["--focus", row_id] + ([result] if result else []), stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
-    except OSError:
-        pass
+        record_ack(target, run_fd)
+        name = "focus-%d-%d" % (os.getpid(), int(time.time() * 1000)) if run_fd is not None else ""
+        env = {k: v for k, v in os.environ.items() if k not in ("SWITCHBOARD_RUN_DIR", "SWITCHBOARD_RUN_FD")}
+        if run_fd is not None:
+            env["SWITCHBOARD_RUN_FD"] = str(run_fd)
+        me = [sys.executable, os.path.abspath(__file__)]
+        try:
+            subprocess.Popen(me + ["--focus", row_id] + ([name] if name else []), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                             pass_fds=(run_fd,) if run_fd is not None else (), env=env)
+        except OSError:
+            pass
+    finally:
+        if run_fd is not None:
+            os.close(run_fd)
     label = machine_labels().get(target["machine"]) or target["machine"]
     actions = [fzf_action("change-footer", tr("remote_focusing", label))]
-    if result:
+    if name:
         self_cmd = " ".join(shlex.quote(x) for x in me)
         actions.append(fzf_action("bg-transform-footer", "%s --focus-wait %s %s"
-                                  % (self_cmd, shlex.quote(result), shlex.quote(row_id))))
+                                  % (self_cmd, name, shlex.quote(row_id))))
     sys.stdout.write("+".join(a for a in actions if a) + "\n")
     return 0
 
 
-def focus_remote(row_id, result=None):
-    """`--focus ROW [RESULT]`, the detached worker: focus the row's pane (or tab) on its
-    machine through herdr's API. The footer text that says how it went goes to the RESULT
-    file when one is given (written whole, then renamed into place), else to stdout. If the
-    popup is gone by then, the focus has happened all the same."""
+def focus_remote(row_id, name=None):
+    """`--focus ROW [NAME]`, the detached worker: focus the row's pane (or tab) on its
+    machine through herdr's API. With NAME, the footer text that says how it went goes to
+    that file inside the directory inherited as SWITCHBOARD_RUN_FD (checked again: ours, 0700),
+    created new and never through a symlink; without it, to stdout."""
     target = parse_id(row_id)
     if target is None or not target["machine"]:
         return 0
@@ -1484,35 +1507,41 @@ def focus_remote(row_id, result=None):
         ok = False
     label = machine_labels().get(target["machine"]) or target["machine"]
     text = tr("remote_ready" if ok else "remote_failed", label) + "\n"
-    try:
-        if result:
-            with open(result + ".tmp", "w") as f:
-                f.write(text)
-            os.replace(result + ".tmp", result)
-        else:
+    if not name:
+        try:
             sys.stdout.write(text)
             sys.stdout.flush()
-    except OSError:  # the popup and its directory are gone
-        pass
+        except OSError:
+            pass
+        return 0
+    try:
+        dir_fd = int(os.environ.get("SWITCHBOARD_RUN_FD", ""))
+    except ValueError:
+        return 0
+    if RESULT_NAME.fullmatch(name) and private_fd(dir_fd):
+        write_new(dir_fd, name, text)
     return 0
 
 
-def focus_wait(result, row_id):
-    """`--focus-wait RESULT ROW`, fzf's background transform: wait for the worker's result
-    and print it as the new footer. It gives up a little after the remote timeout."""
+def focus_wait(name, row_id):
+    """`--focus-wait NAME ROW`, fzf's background transform: wait for the worker's result file
+    NAME in the popup's run directory and print it as the new footer. The directory is opened
+    once, at the start, while the popup owns it, and only a regular file is read, never
+    through a symlink. It gives up a little after the remote timeout."""
     target = parse_id(row_id)
     label = (machine_labels().get(target["machine"]) or target["machine"]) if target else ""
+    dir_fd = open_private_dir(os.environ.get("SWITCHBOARD_RUN_DIR")) if RESULT_NAME.fullmatch(name) else None
     deadline = time.time() + REMOTE_TIMEOUT + 3
-    while time.time() < deadline:
-        try:
-            with open(result) as f:
-                text = f.read().strip()
+    try:
+        while dir_fd is not None and time.time() < deadline:
+            text = clean((read_small(dir_fd, name) or "").strip())
             if text:
                 sys.stdout.write(text + "\n")
                 return 0
-        except OSError:
-            pass
-        time.sleep(0.05)
+            time.sleep(0.05)
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
     sys.stdout.write(tr("remote_failed", label) + "\n")
     return 0
 
@@ -1966,6 +1995,85 @@ def private_dir(path):
     except OSError:
         return False
     return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
+
+
+def private_fd(fd):
+    """True when the open descriptor is a directory of this user with no access for group
+    or others."""
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
+
+
+def open_private_dir(path):
+    """A descriptor for `path` when it is a real directory (not a symlink) of this user with
+    mode 0700 or stricter; else None. Whatever is done inside it afterwards goes through the
+    descriptor, so it stays tied to this directory even if the name is later removed and
+    taken by someone else."""
+    if not path:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    if private_fd(fd):
+        return fd
+    os.close(fd)
+    return None
+
+
+def write_new(dir_fd, name, text):
+    """Write `text` to `name` inside the directory `dir_fd`: a new file (O_EXCL), never
+    through a symlink (O_NOFOLLOW), mode 0600, then renamed into place. False when it cannot,
+    for instance because that directory has been removed."""
+    tmp = name + ".tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        return True
+    except OSError:
+        return False
+
+
+def append_line(dir_fd, name, line):
+    """Append one line to `name` inside `dir_fd`, creating it 0600, never through a symlink."""
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        os.write(fd, (line + "\n").encode("utf-8"))
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def read_small(dir_fd, name, limit=65536):
+    """The text of a regular file `name` inside `dir_fd`, never through a symlink and never
+    blocking on a pipe; None when there is no such file."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return os.read(fd, limit).decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
 
 
 def find_ssh_control_dir(env=None, tmp="/tmp"):
@@ -2549,7 +2657,11 @@ def popup(self_cmd, demo=False):
         if watcher.is_alive():
             watcher.join(2)  # it may be writing the rows file that is about to be removed
         live.consume_acks(acks)  # an Enter on a remote row just before Esc
-        shutil.rmtree(tmp, ignore_errors=True)
+        # Removed only once no pass of watch() can run: a pass that outlived the directory
+        # could otherwise meet a directory someone else created under the same name. If
+        # one is stuck, the directory stays: it is ours and 0700, so nobody else can use it.
+        if not watcher.is_alive():
+            shutil.rmtree(tmp, ignore_errors=True)
     if proc.returncode == 2:
         # fzf refused its command line and drew nothing: say why instead of vanishing.
         reason = fzf_rejects(fzf, [a for a in argv[1:] if not a.startswith("--listen")]) or "exit 2"

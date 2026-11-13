@@ -104,6 +104,11 @@ What it has to get right, and how it fails otherwise:
    what failed, and neither watch loop can die.
 34. In the selection viewer an arrow key whose bytes arrive in two reads scrolls instead of
    closing the viewer, and a lone Esc still closes it.
+35. Nothing that can outlive the popup writes or reads through a name another user could
+   take over: the run directory is used only through a checked descriptor (ours, 0700),
+   files are created new and never through a symlink, and the worker gets a descriptor,
+   not the directory's path. A removed and recreated directory with planted links catches
+   nothing.
 
     python3 tests/test_switchboard.py
 """
@@ -1370,7 +1375,8 @@ with tempfile.TemporaryDirectory() as d:
                                  '  "--machine m2 "*) exit 1 ;;\n'
                                  '  "--machine m1 agent focus"*) sleep 1.5 ;;\n  *) exit 0 ;;\nesac\n' % {"d": d})
     run_dir = d / "run"
-    run_dir.mkdir()
+    run_dir.mkdir(mode=0o700)  # like the popup's own (mkdtemp): helpers refuse anything looser
+    run_dir.chmod(0o700)
 
     def run_mode(mode, *args, **kw):
         env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=str(run_dir),
@@ -1401,14 +1407,17 @@ with tempfile.TemporaryDirectory() as d:
     check("enter-remote-waits-in-background", m is not None, out)
     acks = (run_dir / "acks").read_text().splitlines() if (run_dir / "acks").exists() else []
     check("enter-remote-acks-the-tab-at-once", acks == ['["m1", "w1:t2"]'], acks)
-    result = m.group(1) if m else ""
-    check("enter-remote-result-in-the-run-dir", result.startswith(str(run_dir) + os.sep), result)
+    name = m.group(1) if m else ""
+    # Only the bare file name travels on a command line; the run directory's path never does.
+    check("enter-remote-only-a-name-in-argv", re.fullmatch(r"focus-[0-9]+-[0-9]+", name) is not None
+          and str(run_dir) not in out, out)
+    result = str(run_dir / name) if name else ""
     got = wait_for(result) if result else None
     check("enter-worker-delivers-the-result", got == "ready on box1: switch to that machine to see it · esc closes", got)
     check("enter-worker-focused-through-the-api", log.exists() and "--machine m1 agent focus w1:p4" in log.read_text(),
           log.read_text() if log.exists() else "")
-    check("focus-wait-shows-the-result", result and run_mode("--focus-wait", result, "m1|a|w1:p4|w1:t2") == got)
-    check("focus-wait-gives-up", "could not focus it on box2" in run_mode("--focus-wait", str(run_dir / "never"),
+    check("focus-wait-shows-the-result", name and run_mode("--focus-wait", name, "m1|a|w1:p4|w1:t2") == got)
+    check("focus-wait-gives-up", "could not focus it on box2" in run_mode("--focus-wait", "focus-1-1",
                                                                        "m2|t|w1:p1|w1:t1", timeout="1"))
     acks = (run_dir / "acks").read_text().splitlines() if (run_dir / "acks").exists() else []
     check("worker-does-not-ack-again", acks == ['["m1", "w1:t2"]'], acks)
@@ -1931,10 +1940,10 @@ with tempfile.TemporaryDirectory() as d:
     acks.write_text(json.dumps(["m1", T1]) + "\n")
     real_remove = sb.os.remove
 
-    def racing_remove(path):
+    def racing_remove(path, **kw):
         with open(str(acks), "a") as f:
             f.write(json.dumps(["m1", "w1:t2"]) + "\n")
-        real_remove(path)
+        real_remove(path, **kw)
     sb.os.remove = racing_remove
     try:
         lv.consume_acks(str(acks))
@@ -1949,7 +1958,8 @@ with tempfile.TemporaryDirectory() as d:
     sb.threading.excepthook = lambda a: errors.append(a.exc_type.__name__)
     try:
         gone = d / "gone"
-        gone.mkdir()
+        gone.mkdir(mode=0o700)
+        gone.chmod(0o700)
         sock = str(d / "q.sock")
         FakeFzf(sock)
         stop = _threading.Event()
@@ -2244,6 +2254,132 @@ def viewer_alive_after(chunks, gap):
 
 check("viewer-split-arrow-keeps-it-open", viewer_alive_after([b"\x1b", b"[A"], 0.02))
 check("viewer-lone-esc-closes-it", not viewer_alive_after([b"\x1b"], 0))
+
+# 35. The run directory: descriptors, not names.
+def private_tmp(base, name):
+    path = os.path.join(base, name)
+    os.mkdir(path, 0o700)
+    os.chmod(path, 0o700)
+    return path
+
+
+def decoy_in(base):
+    path = os.path.join(base, "victim")
+    with open(path, "w") as f:
+        f.write("precious\n")
+    return path
+
+
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    run = private_tmp(d, "run")
+    fd = sb.open_private_dir(run)
+    check("private-dir-opens", fd is not None)
+    loose = os.path.join(d, "loose")
+    os.mkdir(loose)
+    os.chmod(loose, 0o755)
+    link = os.path.join(d, "link-to-run")
+    os.symlink(run, link)
+    plain_file = os.path.join(d, "plain")
+    open(plain_file, "w").close()
+    check("private-dir-refuses-loose-mode", sb.open_private_dir(loose) is None)
+    check("private-dir-refuses-a-symlink", sb.open_private_dir(link) is None)
+    check("private-dir-refuses-a-file", sb.open_private_dir(plain_file) is None and sb.open_private_dir("") is None)
+    real_getuid = sb.os.getuid
+    sb.os.getuid = lambda: real_getuid() + 1
+    try:
+        check("private-dir-refuses-another-owner", sb.open_private_dir(run) is None and not sb.private_fd(fd))
+    finally:
+        sb.os.getuid = real_getuid
+
+    check("write-new-writes", sb.write_new(fd, "res", "hello\n") and open(os.path.join(run, "res")).read() == "hello\n"
+          and stat.S_IMODE(os.stat(os.path.join(run, "res")).st_mode) == 0o600)
+    decoy = decoy_in(d)
+    os.symlink(decoy, os.path.join(run, "planted.tmp"))
+    check("write-new-never-follows-a-link", sb.write_new(fd, "planted", "x\n") is False
+          and open(decoy).read() == "precious\n")
+    os.symlink(decoy, os.path.join(run, "final"))
+    check("write-new-replaces-a-link-not-its-target", sb.write_new(fd, "final", "mine\n")
+          and open(decoy).read() == "precious\n" and not os.path.islink(os.path.join(run, "final")))
+    os.symlink(decoy, os.path.join(run, "acks"))
+    check("append-never-follows-a-link", sb.append_line(fd, "acks", "x") is False and open(decoy).read() == "precious\n")
+    os.remove(os.path.join(run, "acks"))
+    check("append-appends", sb.append_line(fd, "acks", "one") and sb.append_line(fd, "acks", "two")
+          and open(os.path.join(run, "acks")).read() == "one\ntwo\n")
+    os.symlink(decoy, os.path.join(run, "readlink"))
+    os.mkfifo(os.path.join(run, "pipe"))
+    t0 = _time.time()
+    check("read-only-regular-files", sb.read_small(fd, "readlink") is None and sb.read_small(fd, "pipe") is None
+          and sb.read_small(fd, "res") == "hello\n" and _time.time() - t0 < 1)
+
+    # The directory goes away and someone recreates it with links planted: nothing reaches them.
+    shutil.rmtree(run)
+    os.mkdir(run)
+    os.symlink(decoy, os.path.join(run, "late.tmp"))
+    os.symlink(decoy, os.path.join(run, "late"))
+    check("write-new-in-a-removed-directory-writes-nothing", sb.write_new(fd, "late", "x\n") is False
+          and open(decoy).read() == "precious\n" and sorted(os.listdir(run)) == ["late", "late.tmp"])
+    check("append-in-a-removed-directory-writes-nothing", sb.append_line(fd, "acks", "x") is False
+          and "acks" not in os.listdir(run))
+    os.close(fd)
+
+    # consume_acks: an acks file that is a link is read as nothing, and its target survives.
+    acks_dir = private_tmp(d, "acks-dir")
+    os.symlink(decoy, os.path.join(acks_dir, "acks"))
+    lv = sb.Live([], [], fetch=lambda m="", t=None, i=None: snap([], []), cache=False)
+    check("consume-acks-ignores-a-link", lv.consume_acks(os.path.join(acks_dir, "acks")) is False
+          and open(decoy).read() == "precious\n")
+
+    # watch(): a rows.tmp planted as a link is never written through.
+    rows_dir = private_tmp(d, "rows-dir")
+    os.symlink(decoy, os.path.join(rows_dir, "rows.tmp"))
+    sock = os.path.join(d, "r.sock")
+    FakeFzf(sock)
+    feed35 = {"n": 1}
+    lv = sb.Live([], [], fetch=lambda m="", t=None, i=None: snap([pane("w1:p1")], [agent("w1:p1", "idle", feed35["n"])]),
+                 cache=False)
+    stop = _threading.Event()
+    t = _threading.Thread(target=sb.watch, args=(lv, sock, os.path.join(rows_dir, "rows"), stop, None))
+    t.start()
+    _time.sleep(0.3)
+    feed35["n"] = 2
+    _time.sleep(0.3)
+    stop.set()
+    t.join(3)
+    check("watch-rows-never-follow-a-link", open(decoy).read() == "precious\n")
+
+# End to end: Enter, the popup's directory removed and recreated with links planted, the
+# worker finishing afterwards. The decoy cannot change, and the focus still happens.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    run = private_tmp(d, "run")
+    decoy = decoy_in(d)
+    (pathlib.Path(d) / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
+    fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                                             '  *"agent focus"*) env > "%(d)s/worker-env"; sleep 1.5; touch "%(d)s/focused" ;;\n'
+                                             'esac\n' % {"d": d})
+    env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=run, SWITCHBOARD_LABELS=json.dumps({"m1": "box1"}))
+    out = subprocess.run([sys.executable, str(TOOL), "--enter", "m1|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=20).stdout
+    m = re.search(r"--focus-wait (focus-[0-9]+-[0-9]+) ", out)
+    check("attack-only-a-name-in-argv", m is not None and run not in out, out)
+    name = m.group(1) if m else "focus-0-0"
+    shutil.rmtree(run)
+    os.mkdir(run)
+    os.symlink(decoy, os.path.join(run, name + ".tmp"))
+    os.symlink(decoy, os.path.join(run, name))
+    waited = 0.0
+    while waited < 8 and not os.path.exists(os.path.join(d, "focused")):
+        _time.sleep(0.1)
+        waited += 0.1
+    _time.sleep(0.5)
+    check("attack-focus-still-happens", os.path.exists(os.path.join(d, "focused")), waited)
+    check("attack-decoy-unchanged", open(decoy).read() == "precious\n", open(decoy).read())
+    check("attack-nothing-written-in-the-new-directory", sorted(os.listdir(run)) == sorted([name, name + ".tmp"]),
+          os.listdir(run))
+    worker_env = open(os.path.join(d, "worker-env")).read() if os.path.exists(os.path.join(d, "worker-env")) else ""
+    # Only flags in the failure detail: the environment can hold secrets.
+    flags = {"has_run_dir": "SWITCHBOARD_RUN_DIR=" in worker_env, "has_path": run in worker_env,
+             "has_run_fd": "SWITCHBOARD_RUN_FD=" in worker_env}
+    check("attack-worker-env-has-no-path", flags == {"has_run_dir": False, "has_path": False, "has_run_fd": True}, flags)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
