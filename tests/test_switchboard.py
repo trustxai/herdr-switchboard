@@ -109,6 +109,8 @@ What it has to get right, and how it fails otherwise:
    files are created new and never through a symlink, and the worker gets a descriptor,
    not the directory's path. A removed and recreated directory with planted links catches
    nothing.
+36. --focus-wait waits as long as the worker can take (ssh, then herdr --machine, each with the
+   remote timeout), so the footer never says it failed before a slow focus lands.
 
     python3 tests/test_switchboard.py
 """
@@ -2383,6 +2385,20 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     flags = {"has_run_dir": "SWITCHBOARD_RUN_DIR=" in worker_env, "has_path": run in worker_env,
              "has_run_fd": "SWITCHBOARD_RUN_FD=" in worker_env}
     check("attack-worker-env-has-no-path", flags == {"has_run_dir": False, "has_path": False, "has_run_fd": True}, flags)
+
+# 36. --focus-wait outlasts the slowest worker.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    run = private_tmp(d, "run")
+    env = dict(os.environ, SWITCHBOARD_RUN_DIR=run, SWITCHBOARD_REMOTE_TIMEOUT="2",
+               SWITCHBOARD_LABELS=json.dumps({"m1": "box1"}))
+    waiter = subprocess.Popen([sys.executable, str(TOOL), "--focus-wait", "focus-7-7", "m1|a|w1:p1|w1:t1"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, universal_newlines=True, env=env)
+    # 2 x 2 s + 3 s = 7 s; with only 2 s + 3 s it would already have given up at 5 s.
+    _time.sleep(5.8)
+    with open(os.path.join(run, "focus-7-7"), "w") as f:
+        f.write("ready on box1: late but fine\n")
+    out, _ = waiter.communicate(timeout=10)
+    check("focus-wait-outlasts-a-double-timeout", out.strip() == "ready on box1: late but fine", out)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]

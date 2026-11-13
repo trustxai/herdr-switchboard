@@ -1527,11 +1527,12 @@ def focus_wait(name, row_id):
     """`--focus-wait NAME ROW`, fzf's background transform: wait for the worker's result file
     NAME in the popup's run directory and print it as the new footer. The directory is opened
     once, at the start, while the popup owns it, and only a regular file is read, never
-    through a symlink. It gives up a little after the remote timeout."""
+    through a symlink. It gives up a little after the longest the worker can take: herdr_on
+    may spend the remote timeout on ssh and then the same again on `herdr --machine`."""
     target = parse_id(row_id)
     label = (machine_labels().get(target["machine"]) or target["machine"]) if target else ""
     dir_fd = open_private_dir(os.environ.get("SWITCHBOARD_RUN_DIR")) if RESULT_NAME.fullmatch(name) else None
-    deadline = time.time() + REMOTE_TIMEOUT + 3
+    deadline = time.time() + 2 * REMOTE_TIMEOUT + 3
     try:
         while dir_fd is not None and time.time() < deadline:
             text = clean((read_small(dir_fd, name) or "").strip())
