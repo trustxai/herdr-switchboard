@@ -73,3 +73,11 @@ client = ""
 # "python3 /path/to/herdr-switchboard/bin/switchboard". Empty means ask herdr on the Mac
 # where it installed the plugin (`herdr plugin list --json`).
 helper = ""
+# The keys the jump types into that herdr window to open its navigator (Goto): the prefix,
+# then the navigator's key, then "/" (which focuses the navigator's search; herdr fixes that
+# one). They must match the window's herdr config, [keys] prefix and [keys] goto. These are
+# herdr's own defaults (prefix "ctrl+b", goto "prefix+g"); with other bindings, the jump
+# would type into the pane instead. Accepted: prefix "ctrl+" and a letter; goto "prefix+"
+# and one key out of a-z, 0-9 and / ? ; , . = [ ] ' ` -.
+prefix = "ctrl+b"
+goto = "prefix+g"

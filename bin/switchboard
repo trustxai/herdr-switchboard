@@ -305,6 +305,8 @@ DEFAULTS = {
         "enabled": False,
         "client": "",
         "helper": "",
+        "prefix": "ctrl+b",
+        "goto": "prefix+g",
     },
 }
 
@@ -320,6 +322,25 @@ NUMBER_RANGES = {
 # Exactly the colour values fzf accepts: -1 (terminal default), 0 to 255, #rrggbb, and the
 # names of the 16 base colours (gray and grey are aliases of bright-black). An unknown name
 # makes fzf exit before drawing anything, so it is refused here.
+# The herdr keys the jump types, in herdr's own syntax so they can be copied from its config:
+# the prefix (ctrl plus a letter) and the navigator's key after it (one plain key). They end
+# up inside an AppleScript string and Ghostty's text: action, so only these characters.
+PREFIX_KEY = re.compile(r"ctrl\+([a-z])")
+GOTO_KEY = re.compile(r"prefix\+([a-z0-9/?;,.=\[\]'`-])")
+# The text Ghostty is asked to type: the prefix as \xNN, the navigator key, and "/" (the key
+# that focuses the navigator's search, fixed in herdr).
+KEYS_TEXT = re.compile(r"\\x(0[1-9a-f]|1[0-9a])[a-z0-9/?;,.=\[\]'`-]/")
+
+
+def goto_keys(prefix, goto):
+    """The Ghostty text for these herdr keys, or None when either is not accepted."""
+    p = PREFIX_KEY.fullmatch(prefix or "")
+    g = GOTO_KEY.fullmatch(goto or "")
+    if not p or not g:
+        return None
+    return "\\x%02x%s/" % (ord(p.group(1)) - 96, g.group(1))
+
+
 COLOR_VALUE = re.compile(r"^(-1|#[0-9a-fA-F]{6}|25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]"
                          r"|(bright-)?(black|red|green|yellow|blue|magenta|cyan|white)|gray|grey)$")
 # The extra fzf entries: comma-separated "name[:value[:attribute...]]". Only the shape is
@@ -571,6 +592,10 @@ def merge_config(raw):
                 if key == "colors" and got is not None and not (
                         FZF_COLOR_SPEC.match(got) if sub == "fzf" else COLOR_VALUE.match(got)):
                     got = None
+                if key == "jump" and got is not None and (
+                        sub == "prefix" and not PREFIX_KEY.fullmatch(got)
+                        or sub == "goto" and not GOTO_KEY.fullmatch(got)):
+                    got = None
                 if got is None:
                     problems.append(tr("cfg_bad_value", key + "." + sub, lang=lang))
                 else:
@@ -627,6 +652,7 @@ COLORS = dict(DEFAULTS["colors"])
 JUMP_ENABLED = False
 JUMP_CLIENT = ""
 JUMP_HELPER = ""
+JUMP_KEYS = "\\x02g/"
 STATE_DIR = state_dir()
 
 
@@ -634,7 +660,7 @@ def configure(cfg, warning=None):
     """Turn a loaded config into the module settings. SWITCHBOARD_* variables win over the
     file (the tests use them)."""
     global CONFIG, CONFIG_WARNING, LANG, LOCAL_LABEL, LOCAL_EVERY, REMOTE_EVERY, REMOTE_TIMEOUT
-    global CACHE_MAX_AGE, REMOTE_HERDR, COLORS, JUMP_ENABLED, JUMP_CLIENT, JUMP_HELPER, LOCAL_TIMEOUT
+    global CACHE_MAX_AGE, REMOTE_HERDR, COLORS, JUMP_ENABLED, JUMP_CLIENT, JUMP_HELPER, LOCAL_TIMEOUT, JUMP_KEYS
     CONFIG, CONFIG_WARNING = cfg, warning
     LANG = cfg["lang"]
     LOCAL_LABEL = cfg["local_label"]
@@ -649,6 +675,8 @@ def configure(cfg, warning=None):
     JUMP_ENABLED = cfg["jump"]["enabled"]
     JUMP_CLIENT = cfg["jump"]["client"]
     JUMP_HELPER = cfg["jump"]["helper"]
+    JUMP_KEYS = goto_keys(cfg["jump"]["prefix"], cfg["jump"]["goto"]) or goto_keys(
+        DEFAULTS["jump"]["prefix"], DEFAULTS["jump"]["goto"])
 
 
 try:
@@ -2340,23 +2368,25 @@ def goto_query(target, entries):
     return None
 
 
-def ghostty_keys_script(tty, query):
+def ghostty_keys_script(tty, query, keys=None):
     """The AppleScript that opens the Goto in the terminal on that tty, searches and jumps.
 
-    ctrl+b // opens the Goto with its search, then the query and Enter, all in ONE burst so
-    the window processes it at once and shows the jump, not the Goto typing. query only
-    holds [a-z0-9:._ -]: nothing to escape."""
-    if not QUERY_CHARS.match(query) or not re.match(r"^/dev/[\w.]+$", tty):
-        raise ValueError("unexpected characters in the query or the tty")
+    keys (the Ghostty text for [jump] prefix and goto, then /) opens the navigator and its
+    search; then the query and Enter, all in ONE burst so the window processes it at once
+    and shows the jump, not the navigator typing. keys, query and tty are checked against
+    closed character sets: nothing to escape, and nothing can leave the text: string."""
+    keys = keys or JUMP_KEYS
+    if not QUERY_CHARS.match(query) or not re.match(r"^/dev/[\w.]+$", tty) or not KEYS_TEXT.fullmatch(keys):
+        raise ValueError("unexpected characters in the keys, the query or the tty")
     return "\n".join([
         'tell application "Ghostty"',
         '  set t to first terminal whose tty is "%s"' % tty,
-        '  perform action "text:\\\\x02//%s\\\\r" on t' % query,
+        '  perform action "text:%s%s\\\\r" on t' % (keys.replace("\\", "\\\\"), query),
         'end tell',
     ])
 
 
-def jump(label, kind, pane, tab, query, rename, old_label, wait=0.15, tty=None, osa=None):
+def jump(label, kind, pane, tab, query, rename, old_label, keys=None, wait=0.15, tty=None, osa=None):
     """Runs on the Mac of the window, while the popup closes.
 
     tty and osa come ready from --jump-server: the window's tty and an osascript already
@@ -2369,7 +2399,7 @@ def jump(label, kind, pane, tab, query, rename, old_label, wait=0.15, tty=None, 
         time.sleep(0.8)  # let the new name reach the window
     tty = tty or local_tui_tty()
     if tty:
-        script = ghostty_keys_script(tty, query)
+        script = ghostty_keys_script(tty, query, keys)
         if osa is not None:
             osa.communicate(script.encode("utf-8"), timeout=10)
         else:
@@ -2392,7 +2422,9 @@ def jump_argv(target, label, entries):
     if rename:
         query = "sbj" + base64.b32encode(os.urandom(5)).decode("ascii").lower().rstrip("=")
     old = next((e["pane_label"] for e in entries if e["machine"] == target["machine"] and e["pane"] == target["pane"]), "")
-    return ["--jump", label, target["kind"], target["pane"], target["tab"], query, "1" if rename else "0", old]
+    # The keys go along: they are the window's herdr keys, set where the popup is opened.
+    return ["--jump", label, target["kind"], target["pane"], target["tab"], query, "1" if rename else "0", old,
+            JUMP_KEYS]
 
 
 def jump_server(stdin=None):
@@ -2411,11 +2443,11 @@ def jump_server(stdin=None):
         args = json.loads(line) if line.strip() else None
     except ValueError:
         args = None
-    if not (isinstance(args, list) and len(args) == 8 and args[0] == "--jump"):
+    if not (isinstance(args, list) and len(args) == 9 and args[0] == "--jump"):
         if osa is not None:
             osa.kill()
         return 0
-    return jump(args[1], args[2], args[3], args[4], args[5], args[6] == "1", args[7],
+    return jump(args[1], args[2], args[3], args[4], args[5], args[6] == "1", args[7], keys=args[8],
                 wait=0.05, tty=tty, osa=osa)
 
 
@@ -2780,8 +2812,8 @@ def main(argv):
             return focus_wait(argv[1], argv[2])
         if argv[:1] == ["--jump-server"]:
             return jump_server()
-        if argv[:1] == ["--jump"] and len(argv) == 8:
-            return jump(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6] == "1", argv[7])
+        if argv[:1] == ["--jump"] and len(argv) == 9:
+            return jump(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6] == "1", argv[7], keys=argv[8])
         if argv[:1] == ["--rows"]:
             try:
                 entries, machines, down = collect(with_remote=True)

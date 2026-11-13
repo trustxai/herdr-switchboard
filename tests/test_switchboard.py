@@ -121,6 +121,8 @@ What it has to get right, and how it fails otherwise:
 40. The selected row reads well: no gutter column, a pointer in the selected row's text colour,
    and only the glyph coloured, so the status word takes the selection's colour. ctrl-t still
    finds the terminals by their glyph.
+41. The keys the jump types come from [jump] prefix and goto, herdr's defaults unless set, and
+   are checked against closed character sets in the config, on the way and in the AppleScript.
 
     python3 tests/test_switchboard.py
 """
@@ -584,7 +586,7 @@ check("goto-unique-id", sb.goto_query({"pane": "w3:p1D"}, ents) == "w3:p1d")
 check("goto-repeated-id", sb.goto_query({"pane": "w1:p1"}, ents) is None)
 check("goto-id-inside-another", sb.goto_query({"pane": "w3:p1"}, ents + [ent("m1", "w3:p1")]) is None)
 check("goto-id-in-a-title", sb.goto_query({"pane": "w3:p1D"}, ents + [ent("", "w9:p2", title="see W3:P1D")]) is None)
-scr = sb.ghostty_keys_script("/dev/ttys000", "w3:p1d")
+scr = sb.ghostty_keys_script("/dev/ttys000", "w3:p1d", "\\x02//")
 check("applescript-one-burst", 'tty is "/dev/ttys000"' in scr and scr.count("perform action") == 1
       and '"text:\\\\x02//w3:p1d\\\\r"' in scr and "delay" not in scr, scr)
 for bad in (("/dev/ttys000", 'x" & do shell script "rm'), ("/dev/tty; rm", "w1:p1"), ("/dev/ttys000", "W1:P1")):
@@ -622,6 +624,7 @@ args = sb.jump_argv({"machine": "m1", "kind": "a", "pane": "w1:p1", "tab": "w1:t
 check("jump-argv-renames-when-repeated", args[6] == "1" and args[5].startswith("sbj")
       and args[:5] == ["--jump", "box1", "a", "w1:p1", "w1:t1"], args)
 check("jump-argv-name-of-that-machine", args[7] == "", args)
+check("jump-argv-carries-the-keys", len(args) == 9 and args[8] == sb.JUMP_KEYS, args)
 popen = []
 orig_popen = sb.subprocess.Popen
 sb.subprocess.Popen = lambda argv, **kw: popen.append((argv, kw))
@@ -760,9 +763,11 @@ sb.jump = lambda *a, **kw: got_jump.append((a, kw)) or 0
 sb.local_tui_tty = lambda ps_text=None: "/dev/ttys000"
 sb.subprocess.Popen = lambda argv, **kw: FakeOsa()
 try:
-    sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", "w1:p1", "1", "logs"]) + "\n"))
+    sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", "w1:p1", "1", "logs", "\\x01//"])
+                                + "\n"))
     check("server-jumps-with-what-is-ready", got_jump and got_jump[0][0] == ("box1", "a", "w1:p1", "w1:t1", "w1:p1", True, "logs")
-          and got_jump[0][1].get("tty") == "/dev/ttys000" and isinstance(got_jump[0][1].get("osa"), FakeOsa), got_jump)
+          and got_jump[0][1].get("tty") == "/dev/ttys000" and isinstance(got_jump[0][1].get("osa"), FakeOsa)
+          and got_jump[0][1].get("keys") == "\\x01//", got_jump)
     got_jump.clear()
     sb.jump_server(_io.StringIO(""))
     check("server-no-line-no-jump", not got_jump and killed, (got_jump, killed))
@@ -2671,6 +2676,31 @@ check("only-the-glyph-is-coloured", rows and all(glyph_only.match(x) for x in ro
 plain_rows = [sb.ANSI.sub("", x) for x in rows]
 check("terminals-still-start-with-their-glyph", sum(1 for x in plain_rows if x.startswith("› ")) == 5,
       [x[:12] for x in plain_rows])
+
+# 41. The jump's keys are configurable and cannot escape the AppleScript string.
+check("jump-keys-default-is-herdrs", sb.DEFAULTS["jump"]["prefix"] == "ctrl+b" and sb.DEFAULTS["jump"]["goto"] == "prefix+g"
+      and sb.JUMP_KEYS == "\\x02g/", sb.JUMP_KEYS)
+check("jump-keys-custom", sb.goto_keys("ctrl+a", "prefix+/") == "\\x01//" and sb.goto_keys("ctrl+z", "prefix+;") == "\\x1a;/")
+for prefix, goto in (("f12", "prefix+g"), ("ctrl+B", "prefix+g"), ("ctrl+b", "g"), ("ctrl+b", "prefix+shift+g"),
+                     ("ctrl+b", 'prefix+"'), ("ctrl+b", "prefix+\\"), ("ctrl+b", "prefix+gg"), ("ctrl+b\n", "prefix+g"),
+                     ("ctrl+b", "prefix+g\n"), ("", "")):
+    check("jump-keys-refused %r" % ((prefix, goto),), sb.goto_keys(prefix, goto) is None)
+cfg, problems = sb.merge_config({"jump": {"prefix": "ctrl+a", "goto": 'prefix+" & do shell script "x'}})
+check("jump-keys-bad-config-is-default", cfg["jump"]["prefix"] == "ctrl+a" and cfg["jump"]["goto"] == "prefix+g"
+      and any("jump.goto" in p for p in problems), (cfg["jump"], problems))
+sb.configure(cfg)
+try:
+    check("jump-keys-from-config", sb.JUMP_KEYS == "\\x01g/", sb.JUMP_KEYS)
+    check("jump-keys-used-in-the-script", '"text:\\\\x01g/w1:p1\\\\r"' in sb.ghostty_keys_script("/dev/ttys000", "w1:p1"))
+finally:
+    sb.configure(sb.load_config()[0])
+    sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
+for bad in ('\\x02g/" & do shell script "touch x', "\\x02g/\\r", "\\x00g/", "\\x1bg/", "x/", "\\x02G/"):
+    try:
+        sb.ghostty_keys_script("/dev/ttys000", "w1:p1", bad)
+        check("applescript-refuses-keys %r" % bad, False)
+    except ValueError:
+        pass
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
