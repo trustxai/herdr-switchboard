@@ -10,7 +10,8 @@ PYTHON ?= python3
 
 PROGRAM := bin/switchboard
 TESTS := tests/test_switchboard.py
-SOURCES := $(wildcard $(PROGRAM) tests/*.py)
+# Named, not globbed: a missing program or test file makes compile and ruff fail.
+SOURCES := $(PROGRAM) $(sort $(TESTS) $(wildcard tests/*.py))
 SCRIPTS := $(wildcard .github/scripts/*.sh)
 
 # ruff, pinned. It runs through uvx when uv is installed, so nothing has to be
@@ -52,41 +53,21 @@ help:
 
 check: test lint secrets
 
-# Guard: bin/switchboard and tests/test_switchboard.py arrive with the port pull
-# request. Until then, and only while NEITHER file exists, the tests are skipped.
-# A program without its test file is a failure, not a skip. Once the port has
-# landed on main, remove the skip branch so a missing test file always fails
-# (and remove the matching `if: hashFiles(...)` guards in .github/workflows/ci.yml).
 test:
-	@if [ -f $(TESTS) ]; then \
-	  $(PYTHON) $(TESTS); \
-	elif [ -f $(PROGRAM) ]; then \
-	  echo "test: $(PROGRAM) exists but $(TESTS) does not: the program has no tests to run" >&2; \
-	  exit 1; \
-	else \
-	  echo "test: SKIPPED, neither $(PROGRAM) nor $(TESTS) exists yet (remove this guard once the port has landed)"; \
-	fi
+	$(PYTHON) $(TESTS)
 
 lint: compile ruff scripts pycache
 
 # Compile in memory with the selected interpreter. Unlike py_compile, this writes
 # no .pyc anywhere, and it rejects syntax that interpreter does not know.
 compile:
-	@if [ -z "$(SOURCES)" ]; then \
-	  echo "compile: nothing to compile yet"; \
-	else \
-	  $(PYTHON) -c 'import sys; [compile(open(p, "rb").read(), p, "exec", dont_inherit=True) for p in sys.argv[1:]]' $(SOURCES) \
-	  && echo "compile: ok with $$($(PYTHON) -c 'import platform; print(platform.python_version())') ($(SOURCES))"; \
-	fi
+	@$(PYTHON) -c 'import sys; [compile(open(p, "rb").read(), p, "exec", dont_inherit=True) for p in sys.argv[1:]]' $(SOURCES) \
+	  && echo "compile: ok with $$($(PYTHON) -c 'import platform; print(platform.python_version())') ($(SOURCES))"
 
 ruff:
 	@if [ -n "$(RUFF)" ]; then \
 	  echo "ruff: $$($(RUFF) --version)"; \
-	  if [ -z "$(SOURCES)" ]; then \
-	    echo "ruff: nothing to lint yet"; \
-	  else \
-	    $(RUFF) check --no-cache --isolated --target-version py39 --select $(RUFF_RULES) $(SOURCES); \
-	  fi; \
+	  $(RUFF) check --no-cache --isolated --target-version py39 --select $(RUFF_RULES) $(SOURCES); \
 	elif [ -n "$(REQUIRE_TOOLS)" ]; then \
 	  echo "ruff: not installed; install uv (https://docs.astral.sh/uv/) or ruff" >&2; exit 1; \
 	else \
