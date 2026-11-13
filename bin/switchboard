@@ -28,6 +28,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -2735,6 +2736,10 @@ def popup(self_cmd, demo=False):
     return 0
 
 
+def _exit_on_signal(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 def main(argv):
     global DEMO, STATE_DIR
     if argv[:1] in (["-h"], ["--help"]):
@@ -2746,6 +2751,11 @@ def main(argv):
     problems = dependency_problems(fzf=False)
     if problems:
         return explain_and_wait(problems)
+    # A popup whose window or session goes away gets SIGHUP (or SIGTERM). By default Python
+    # would die on the spot and leave its temporary directories behind; as an exit, the
+    # cleanup in the finally blocks runs.
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, _exit_on_signal)
     demo = argv[:1] == ["--demo"]
     if demo:
         argv = argv[1:]

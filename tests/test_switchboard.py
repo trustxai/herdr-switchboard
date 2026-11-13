@@ -114,7 +114,8 @@ What it has to get right, and how it fails otherwise:
 37. A hung local herdr cannot freeze anything: the local snapshot has a timeout at open and in
    every refresh, the refresh keeps the last rows, and the popup says what failed.
 38. Closing the popup always removes its run directory, whatever local_seconds is and however
-   slow the local snapshot, and stop wakes the watch loop at once.
+   slow the local snapshot, and also when its terminal goes away (SIGHUP); stop wakes the
+   watch loop at once.
 39. The detached worker checks again what it was handed: a result name that is not a plain
    focus-N-N (such as ../x) or a directory that is not ours and 0700 gets nothing written.
 40. The selected row reads well: no gutter column, a pointer in the selected row's text colour,
@@ -2559,6 +2560,45 @@ rc, took, left = close_popup(1, True)
 check("close-during-a-slow-snapshot-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 4,
       (rc, took, left))
 
+
+# A popup whose terminal goes away (SIGHUP) still removes its directories: the run directory
+# and, in the demo, the temporary state directory.
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = private_tmp(d, "runs")
+        tmpdir = private_tmp(d, "tmp")
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH="/bin/false", SWITCHBOARD_RUN_ROOT=root,
+                              TMPDIR=tmpdir)
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL), "--demo"])
+        import fcntl as _f7
+        import struct as _st7
+        import termios as _tm7
+        _f7.ioctl(fd, _tm7.TIOCSWINSZ, _st7.pack("HHHH", 30, 160, 0, 0))
+        buf, end = b"", _time.time() + 20
+        while _time.time() < end and b"rate-limiter-review" not in buf:
+            r, _, _ = _sel.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    buf += os.read(fd, 65536)
+                except OSError:
+                    break
+        seen_before = (sorted(os.listdir(root)), sorted(os.listdir(tmpdir)))
+        os.close(fd)  # the terminal goes away: the session leader gets SIGHUP
+        done = 0
+        for _ in range(100):
+            done, _status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            _time.sleep(0.05)
+        if not done:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        # The run directory, and at least the demo's state directory (a preview child has its own).
+        check("hangup-was-really-mid-run", len(seen_before[0]) == 1 and len(seen_before[1]) >= 1, seen_before)
+        check("hangup-removes-every-directory", done == pid and os.listdir(root) == [] and os.listdir(tmpdir) == [],
+              (done, os.listdir(root), os.listdir(tmpdir)))
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
     rows_dir = private_tmp(d, "rows")
     saved_every = sb.LOCAL_EVERY
