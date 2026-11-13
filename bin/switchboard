@@ -134,6 +134,7 @@ STRINGS = {
         "select_copied": " copied: %d characters%s · esc goes back ",
         "select_lines": ", %d lines",
         "snapshot_failed": "herdr api snapshot failed (%s). Press Enter to close. ",
+        "remote_focusing": "focusing it on %s…",
         "remote_ready": "ready on %s: switch to that machine to see it · esc closes",
         "remote_failed": "could not focus it on %s · esc closes",
         "config_warning": "config %s: %s (defaults in use)",
@@ -205,6 +206,7 @@ STRINGS = {
         "select_copied": " copiado: %d caracteres%s · esc vuelve ",
         "select_lines": ", %d líneas",
         "snapshot_failed": "falló herdr api snapshot (%s). Enter para cerrar. ",
+        "remote_focusing": "enfocándola en %s…",
         "remote_ready": "lista en %s: pasá a esa máquina para verla · esc cierra",
         "remote_failed": "no se pudo enfocar en %s · esc cierra",
         "config_warning": "config %s: %s (se usan los valores por defecto)",
@@ -861,7 +863,7 @@ def machine_info(machine):
     return _MACHINES.get(machine, {})
 
 
-def herdr_on(machine, args, timeout=None, info=None):
+def herdr_on(machine, args, timeout=None, info=None, need_output=True):
     """herdr on that machine ("" = this one).
 
     For another machine, first an ssh that reuses an open connection (ControlMaster) and
@@ -883,7 +885,7 @@ def herdr_on(machine, args, timeout=None, info=None):
             if argv:
                 r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL, universal_newlines=True, timeout=timeout)
-                if r.returncode == 0 and r.stdout.strip():
+                if r.returncode == 0 and (r.stdout.strip() or not need_output):
                     return r.stdout
         except (OSError, subprocess.SubprocessError):
             pass
@@ -1209,13 +1211,26 @@ class Live:
         return dirty
 
     def consume_acks(self, path):
-        """Apply the tabs `--enter` wrote to `path`, then remove it."""
+        """Apply the tabs `--focus` wrote to `path`.
+
+        The file is first renamed to a private name and only then read: a `--focus` that
+        appends while this runs writes to a new `path`, which the next call picks up.
+        Reading first and removing after would drop that line."""
+        private = "%s.%d.%d" % (path, os.getpid(), threading.get_ident())
         try:
-            with open(path) as f:
-                lines = f.read().splitlines()
-            os.remove(path)
+            os.replace(path, private)
         except OSError:
             return False
+        try:
+            with open(private) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+        finally:
+            try:
+                os.remove(private)
+            except OSError:
+                pass
         dirty = False
         for line in lines:
             try:
@@ -1328,9 +1343,12 @@ def watch(live, sock, rows_file, stop, acks=None):
         if text is None:
             continue
         tmp = rows_file + ".tmp"
-        with open(tmp, "w") as f:
-            f.write(text)
-        os.replace(tmp, rows_file)
+        try:
+            with open(tmp, "w") as f:
+                f.write(text)
+            os.replace(tmp, rows_file)
+        except OSError:  # the popup is closing and its directory is gone
+            continue
         fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
 
 
@@ -1350,23 +1368,58 @@ def action_for(row_id, labels):
     return prefix + ["tab", "focus", target["tab"]]
 
 
-def enter(row_id, run_dir=None):
+FZF_DELIMITERS = ("()", "[]", "{}", "<>", "~~", "!!", "@@", "##", "$$", "%%", "^^", "&&", "**", ";;", "//", "||")
+
+
+def fzf_action(name, arg):
+    """fzf's `name(arg)`, with the first delimiter pair that does not occur in arg (fzf ends
+    the argument at the first closing delimiter). None when every pair occurs."""
+    for d in FZF_DELIMITERS:
+        if d[0] not in arg and d[1] not in arg:
+            return "%s%s%s%s" % (name, d[0], arg, d[1])
+    return None
+
+
+def machine_labels():
+    """{machine id: label}, handed down by the popup so its helpers need not ask herdr."""
+    try:
+        labels = json.loads(os.environ.get("SWITCHBOARD_LABELS") or "{}")
+    except ValueError:
+        return {}
+    return {str(k): clean(v) for k, v in labels.items()} if isinstance(labels, dict) else {}
+
+
+def enter(row_id):
     """fzf's Enter when the cross-machine jump is off (`--enter`, through transform).
 
-    A row of this machine is accepted as usual. A row of another machine is focused there
-    through the API, the popup stays open, and the footer says where the pane is ready."""
+    A row of this machine is accepted as usual. For a row of another machine this only
+    prints fzf actions, at once: the footer says it is being focused, and a background
+    transform (`--focus`) does the slow part, so fzf never waits on the network."""
     target = parse_id(row_id)
     if target is None:
         return 0
     if not target["machine"] or JUMP_ENABLED:
         sys.stdout.write("accept\n")
         return 0
+    label = machine_labels().get(target["machine"]) or target["machine"]
+    self_cmd = " ".join(shlex.quote(x) for x in (sys.executable, os.path.abspath(__file__)))
+    now = fzf_action("change-footer", tr("remote_focusing", label))
+    later = fzf_action("bg-transform-footer", "%s --focus %s" % (self_cmd, shlex.quote(row_id)))
+    sys.stdout.write("+".join(a for a in (now, later) if a) + "\n")
+    return 0
+
+
+def focus_remote(row_id, run_dir=None):
+    """`--focus`: focus a row of another machine through herdr's API, record its tab as seen
+    for the popup, and print the footer text that says how it went."""
+    target = parse_id(row_id)
+    if target is None or not target["machine"]:
+        return 0
+    args = ["agent", "focus", target["pane"]] if target["kind"] == "a" else ["tab", "focus", target["tab"]]
     try:
-        r = subprocess.run([HERDR] + action_for(row_id, {}), stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=REMOTE_TIMEOUT)
-        ok = r.returncode == 0
-    except (OSError, subprocess.SubprocessError):
+        herdr_on(target["machine"], args, REMOTE_TIMEOUT, need_output=False)
+        ok = True
+    except Exception:
         ok = False
     run_dir = run_dir or os.environ.get("SWITCHBOARD_RUN_DIR")
     if run_dir:
@@ -1375,9 +1428,8 @@ def enter(row_id, run_dir=None):
                 f.write(json.dumps([target["machine"], target["tab"]]) + "\n")
         except OSError:
             pass
-    label = machine_info(target["machine"]).get("label") or target["machine"]
-    # The colon form takes the rest of the line, so the text needs no escaping.
-    sys.stdout.write("change-footer:%s\n" % tr("remote_ready" if ok else "remote_failed", label))
+    label = machine_labels().get(target["machine"]) or target["machine"]
+    sys.stdout.write(tr("remote_ready" if ok else "remote_failed", label) + "\n")
     return 0
 
 
@@ -1587,11 +1639,11 @@ def fzf_argv(fzf, self_cmd, sock, remote_enter=False):
         "--bind", "ctrl-/:toggle-preview",
         # Copy: inside a popup herdr hands the whole mouse to the program and never selects,
         # so copying goes through a key and OSC 52.
-        "--bind", "ctrl-y:transform-footer(%s --copy {1})" % self_cmd,
+        "--bind", "ctrl-y:" + fzf_action("transform-footer", self_cmd + " --copy {1}"),
         # Moving clears the "copied: …" of ctrl-y.
         "--bind", "focus:change-footer()",
         # Select with the mouse exactly what you want: a viewer that takes the terminal.
-        "--bind", "ctrl-o:execute(%s --select {1})" % self_cmd,
+        "--bind", "ctrl-o:" + fzf_action("execute", self_cmd + " --select {1}"),
         # Only terminals, or everything again. sh, not $SHELL: in zsh a leading ^ in a
         # pattern is special.
         "--with-shell", "sh -c",
@@ -1604,7 +1656,7 @@ def fzf_argv(fzf, self_cmd, sock, remote_enter=False):
     if remote_enter:
         # With the jump off, Enter on another machine's row focuses it there and keeps the
         # popup open with a footer; rows of this machine are accepted as usual.
-        argv += ["--bind", "enter:transform(%s --enter {1})" % self_cmd]
+        argv += ["--bind", "enter:" + fzf_action("transform", self_cmd + " --enter {1}")]
     return argv
 
 
@@ -2399,13 +2451,17 @@ def popup(self_cmd, demo=False):
     sock, rows_file, acks = os.path.join(tmp, "fzf.sock"), os.path.join(tmp, "rows"), os.path.join(tmp, "acks")
     stop = threading.Event()
     argv = fzf_argv(fzf, self_cmd, sock, remote_enter=remote_enter)
+    labels = {m["id"]: m["label"] for m in machines}
+    watcher = threading.Thread(target=watch, args=(live, sock, rows_file, stop, acks), daemon=True)
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True,
-                                env=dict(os.environ, SWITCHBOARD_RUN_DIR=tmp))
-        threading.Thread(target=watch, args=(live, sock, rows_file, stop, acks), daemon=True).start()
+                                env=dict(os.environ, SWITCHBOARD_RUN_DIR=tmp, SWITCHBOARD_LABELS=json.dumps(labels)))
+        watcher.start()
         out, _ = proc.communicate(first)
     finally:
         stop.set()
+        if watcher.is_alive():
+            watcher.join(2)  # it may be writing the rows file that is about to be removed
         live.consume_acks(acks)  # an Enter on a remote row just before Esc
         shutil.rmtree(tmp, ignore_errors=True)
     if proc.returncode == 2:
@@ -2417,7 +2473,6 @@ def popup(self_cmd, demo=False):
         if link:
             link.close()
         return 0
-    labels = {m["id"]: m["label"] for m in machines}
     row_id = pick.split("\t", 1)[0]
     if demo:
         sys.stdout.write("\n".join(demo_outcome(row_id, labels)) + "\n")
@@ -2476,6 +2531,8 @@ def main(argv):
             return select_view(argv[1] if len(argv) > 1 else "")
         if argv[:1] == ["--enter"]:
             return enter(argv[1] if len(argv) > 1 else "")
+        if argv[:1] == ["--focus"]:
+            return focus_remote(argv[1] if len(argv) > 1 else "")
         if argv[:1] == ["--jump-server"]:
             return jump_server()
         if argv[:1] == ["--jump"] and len(argv) == 8:

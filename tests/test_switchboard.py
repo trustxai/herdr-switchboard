@@ -94,6 +94,9 @@ What it has to get right, and how it fails otherwise:
    break a row are dropped, wrong types do not crash, and the preview keeps colours only.
 30. Every ssh call puts "--" before the destination, and a destination that starts with "-"
    or holds whitespace is refused wherever it comes from (config, Tailscale, a bridge address).
+31. Enter on a remote row never blocks fzf: the footer changes at once and the focus runs in a
+   background transform. An ack written while the popup consumes acks is never lost, and the
+   watch loop survives the popup removing its directory on close.
 
     python3 tests/test_switchboard.py
 """
@@ -1351,30 +1354,37 @@ with tempfile.TemporaryDirectory() as d:
     run_dir = d / "run"
     run_dir.mkdir()
 
-    def run_enter(row, cfg_dir=None):
-        env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=str(run_dir))
+    def run_mode(mode, row, cfg_dir=None):
+        env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=str(run_dir),
+                   SWITCHBOARD_LABELS=json.dumps({"m1": "box1", "m2": "box2"}))
         if cfg_dir:
             env["HERDR_PLUGIN_CONFIG_DIR"] = str(cfg_dir)
-        r = subprocess.run([sys.executable, str(TOOL), "--enter", row], stdin=subprocess.DEVNULL,
+        r = subprocess.run([sys.executable, str(TOOL), mode, row], stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
         return r.stdout.strip()
 
-    out = run_enter("m1|a|w1:p4|w1:t2")
-    check("enter-remote-footer", out.startswith("change-footer:") and "ready on box1" in out, out)
-    check("enter-remote-focuses-through-the-api", log.exists() and "--machine m1 agent focus w1:p4" in log.read_text(),
+    # Enter only prints fzf actions, at once: a footer now, the focus in the background.
+    out = run_mode("--enter", "m1|a|w1:p4|w1:t2")
+    check("enter-remote-footer-now", out.startswith("change-footer(focusing it on box1…)+bg-transform-footer"), out)
+    check("enter-remote-focus-in-background", "--focus 'm1|a|w1:p4|w1:t2'" in out and out.endswith(")"), out)
+    check("enter-remote-calls-no-herdr", not log.exists() or log.read_text() == "", log.read_text() if log.exists() else "")
+    out = run_mode("--focus", "m1|a|w1:p4|w1:t2")
+    check("focus-remote-footer", out == "ready on box1: switch to that machine to see it · esc closes", out)
+    check("focus-remote-through-the-api", log.exists() and "--machine m1 agent focus w1:p4" in log.read_text(),
           log.read_text() if log.exists() else "")
     acks = (run_dir / "acks").read_text().splitlines() if (run_dir / "acks").exists() else []
-    check("enter-remote-acks-the-tab", acks == ['["m1", "w1:t2"]'], acks)
-    out = run_enter("m2|t|w1:p1|w1:t1")
-    check("enter-remote-focus-fails-quietly", out.startswith("change-footer:") and "could not focus" in out, out)
+    check("focus-remote-acks-the-tab", acks == ['["m1", "w1:t2"]'], acks)
+    out = run_mode("--focus", "m2|t|w1:p1|w1:t1")
+    check("focus-remote-fails-quietly", "could not focus it on box2" in out, out)
     log.write_text("")
-    out = run_enter("|a|w1:p1|w1:t1")
+    out = run_mode("--enter", "|a|w1:p1|w1:t1")
     check("enter-local-accepts", out == "accept" and "focus" not in log.read_text(), (out, log.read_text()))
-    check("enter-header-nothing", run_enter("-") == "")
+    check("enter-header-nothing", run_mode("--enter", "-") == "")
+    check("focus-local-row-nothing", run_mode("--focus", "|a|w1:p1|w1:t1") == "" and "focus" not in log.read_text())
     cfg_on = d / "cfg-on"
     cfg_on.mkdir()
     (cfg_on / "config.toml").write_text("[jump]\nenabled = true\n")
-    check("enter-remote-accepts-with-jump-on", run_enter("m1|a|w1:p4|w1:t2", cfg_on) == "accept")
+    check("enter-remote-accepts-with-jump-on", run_mode("--enter", "m1|a|w1:p4|w1:t2", cfg_on) == "accept")
 
     # The popup applies what --enter acknowledged: the done row turns idle.
     sb.STATE_DIR = str(d / "state")
@@ -1864,6 +1874,110 @@ with tempfile.TemporaryDirectory() as d:
         check("ssh-nothing-ran-for-bad-destinations", log.read_text() == "", log.read_text())
     finally:
         sb.SSH, sb.HERDR, sb.JUMP_HELPER = saved
+
+# 31. A remote Enter that never blocks, acks that are never lost, a quiet close.
+check("fzf-action-plain", sb.fzf_action("execute", "a --b {1}") == "execute(a --b {1})")
+check("fzf-action-avoids-its-delimiter", sb.fzf_action("execute", "/opt/my (x)/sb {1}") == "execute[/opt/my (x)/sb {1}]")
+check("fzf-action-none-when-impossible", sb.fzf_action("x", "".join(sb.FZF_DELIMITERS)) is None)
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    sb.STATE_DIR = str(d / "state")
+    m1 = [{"id": "m1", "label": "box1"}]
+    vivid = {"local": snap17(T1, ag17("p1", "working", 1, T1)), "m1": snap17(T1, ag17("p9", "working", 1, T1))}
+    lv = sb.Live(m1, sb.entries_from(vivid["local"], "", "here", 0), fetch=lambda m="", t=None, i=None: vivid[m or "local"],
+                 focus=T1)
+    # A --focus that appends exactly while the file is being removed: its line must survive.
+    acks = d / "acks"
+    acks.write_text(json.dumps(["m1", T1]) + "\n")
+    real_remove = sb.os.remove
+
+    def racing_remove(path):
+        with open(str(acks), "a") as f:
+            f.write(json.dumps(["m1", "w1:t2"]) + "\n")
+        real_remove(path)
+    sb.os.remove = racing_remove
+    try:
+        lv.consume_acks(str(acks))
+    finally:
+        sb.os.remove = real_remove
+    left = acks.read_text().splitlines() if acks.exists() else []
+    check("acks-written-during-consume-survive", left == ['["m1", "w1:t2"]'], left)
+    check("acks-no-private-leftovers", sorted(x.name for x in d.iterdir() if x.name.startswith("acks.")) == [])
+    # watch() keeps quiet when the popup removes its directory under it.
+    errors = []
+    saved_hook = sb.threading.excepthook
+    sb.threading.excepthook = lambda a: errors.append(a.exc_type.__name__)
+    try:
+        gone = d / "gone"
+        gone.mkdir()
+        sock = str(d / "q.sock")
+        FakeFzf(sock)
+        stop = _threading.Event()
+        lv.changed()
+        t = _threading.Thread(target=sb.watch, args=(lv, sock, str(gone / "rows"), stop, None))
+        t.start()
+        shutil.rmtree(str(gone))
+        vivid["local"] = snap17(T1, ag17("p1", "blocked", 7, T1))
+        _time.sleep(0.4)
+        stop.set()
+        t.join(3)
+    finally:
+        sb.threading.excepthook = saved_hook
+    check("watch-survives-a-removed-directory", not errors and not t.is_alive(), errors)
+    sb.STATE_DIR = STATE
+
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        (d / "local.json").write_text(json.dumps({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)])}}))
+        (d / "m1.json").write_text(json.dumps({"result": {"snapshot": snap([pane("w1:p7")],
+                                                                          [agent("w1:p7", "blocked", 5, title="remote-task")])}}))
+        (d / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
+        fh = executable(d / "herdr", '#!/bin/sh\necho "$*" >> "%(d)s/log"\ncase "$*" in\n'
+                                     '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                                     '  "api snapshot") cat "%(d)s/local.json" ;;\n'
+                                     '  "--machine m1 api snapshot") cat "%(d)s/m1.json" ;;\n'
+                                     '  "--machine m1 agent focus"*) sleep 2 ;;\n'
+                                     '  *"pane read"*) echo "pane text" ;;\n'
+                                     '  *) exit 0 ;;\nesac\n' % {"d": d})
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), HERDR_PLUGIN_STATE_DIR=str(d / "state"))
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+        import fcntl as _f3
+        import struct as _st3
+        import termios as _tm3
+        _f3.ioctl(fd, _tm3.TIOCSWINSZ, _st3.pack("HHHH", 40, 180, 0, 0))
+        buf, marks, rc, end = b"", {}, None, _time.time() + 25
+        while _time.time() < end:
+            r, _, _ = _sel.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    _, status = os.waitpid(pid, 0)
+                    rc = os.waitstatus_to_exitcode(status)
+                    break
+                buf += chunk
+            plain = sb.ANSI.sub("", buf.decode("utf-8", "replace"))
+            if "enter" not in marks and "remote-task" in plain:
+                _time.sleep(0.5)
+                os.write(fd, b"\r")
+                marks["enter"] = _time.time()
+            if "enter" in marks and "focusing" not in marks and "focusing it on box1" in plain:
+                marks["focusing"] = _time.time()
+            if "focusing" in marks and "ready" not in marks and "ready on box1" in plain:
+                marks["ready"] = _time.time()
+                os.write(fd, b"\x1b")
+        if rc is None:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        check("enter-pty-footer-at-once", "focusing" in marks and marks["focusing"] - marks["enter"] < 1.5, marks)
+        check("enter-pty-focus-arrives-later", "ready" in marks and marks["ready"] - marks["enter"] >= 1.5, marks)
+        check("enter-pty-popup-stays-then-esc", rc == 0, rc)
+        check("enter-pty-focused-through-herdr", "--machine m1 agent focus w1:p7" in (d / "log").read_text())
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0] and sb._SSH_DIR[0].startswith(_tmp_root),
