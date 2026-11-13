@@ -111,6 +111,8 @@ What it has to get right, and how it fails otherwise:
    nothing.
 36. --focus-wait waits as long as the worker can take (ssh, then herdr --machine, each with the
    remote timeout), so the footer never says it failed before a slow focus lands.
+37. A hung local herdr cannot freeze anything: the local snapshot has a timeout at open and in
+   every refresh, the refresh keeps the last rows, and the popup says what failed.
 
     python3 tests/test_switchboard.py
 """
@@ -2409,6 +2411,37 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         f.write("ready on box1: late but fine\n")
     out, _ = waiter.communicate(timeout=10)
     check("focus-wait-outlasts-a-double-timeout", out.strip() == "ready on box1: late but fine", out)
+
+# 37. A hung local herdr.
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    slow = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n  "api snapshot") sleep 6 ;;\n'
+                                   '  "machine list --json") echo "[]" ;;\nesac\n')
+    saved = (sb.HERDR, sb.LOCAL_TIMEOUT)
+    sb.HERDR, sb.LOCAL_TIMEOUT = str(slow), 1.0
+    try:
+        lv = sb.Live([], sb.entries_from(snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="kept-row")]), "", "here", 0),
+                     fetch=sb.snapshot, cache=False)
+        t0 = _time.time()
+        lv.refresh_local()
+        took = _time.time() - t0
+        check("local-refresh-has-a-timeout", took < 3 and "kept-row" in lv.text(), took)
+        t0 = _time.time()
+        try:
+            sb.snapshot()
+            check("local-snapshot-times-out", False)
+        except Exception:
+            check("local-snapshot-times-out", _time.time() - t0 < 3, _time.time() - t0)
+    finally:
+        sb.HERDR, sb.LOCAL_TIMEOUT = saved
+    fzf_ok = executable(d / "fzf", '#!/bin/sh\nif [ "$1" = --version ]; then echo "0.74.0 (test)"; exit 0; fi\nexit 1\n')
+    env = dict(os.environ, HERDR_BIN_PATH=str(slow), SWITCHBOARD_FZF=str(fzf_ok), SWITCHBOARD_LOCAL_TIMEOUT="1")
+    t0 = _time.time()
+    r = subprocess.run([sys.executable, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
+    took = _time.time() - t0
+    check("popup-hung-herdr-says-so", r.returncode == 1 and "herdr api snapshot failed" in r.stdout and took < 4,
+          (r.returncode, took, r.stdout[-200:]))
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]

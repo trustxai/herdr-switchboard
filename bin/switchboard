@@ -609,6 +609,7 @@ CONFIG = copymod.deepcopy(DEFAULTS)
 CONFIG_WARNING = None
 LOCAL_LABEL = ""
 LOCAL_EVERY = REMOTE_EVERY = REMOTE_TIMEOUT = 0.0
+LOCAL_TIMEOUT = 5.0  # seconds for a read of this machine's herdr, as for the other local reads
 CACHE_MAX_AGE = 1800
 REMOTE_HERDR = DEFAULT_REMOTE_HERDR
 COLORS = dict(DEFAULTS["colors"])
@@ -622,7 +623,7 @@ def configure(cfg, warning=None):
     """Turn a loaded config into the module settings. SWITCHBOARD_* variables win over the
     file (the tests use them)."""
     global CONFIG, CONFIG_WARNING, LANG, LOCAL_LABEL, LOCAL_EVERY, REMOTE_EVERY, REMOTE_TIMEOUT
-    global CACHE_MAX_AGE, REMOTE_HERDR, COLORS, JUMP_ENABLED, JUMP_CLIENT, JUMP_HELPER
+    global CACHE_MAX_AGE, REMOTE_HERDR, COLORS, JUMP_ENABLED, JUMP_CLIENT, JUMP_HELPER, LOCAL_TIMEOUT
     CONFIG, CONFIG_WARNING = cfg, warning
     LANG = cfg["lang"]
     LOCAL_LABEL = cfg["local_label"]
@@ -630,6 +631,7 @@ def configure(cfg, warning=None):
     LOCAL_EVERY = _env_float("SWITCHBOARD_LOCAL_EVERY", refresh["local_seconds"])
     REMOTE_EVERY = _env_float("SWITCHBOARD_REMOTE_EVERY", refresh["remote_seconds"])
     REMOTE_TIMEOUT = _env_float("SWITCHBOARD_REMOTE_TIMEOUT", refresh["remote_timeout"])
+    LOCAL_TIMEOUT = _env_float("SWITCHBOARD_LOCAL_TIMEOUT", 5.0)
     CACHE_MAX_AGE = refresh["cache_max_age"]
     REMOTE_HERDR = os.environ.get("SWITCHBOARD_REMOTE_HERDR") or cfg["remote"]["herdr"]
     COLORS = dict(cfg["colors"])
@@ -900,7 +902,10 @@ def herdr_on(machine, args, timeout=None, info=None, need_output=True):
 def snapshot(machine=LOCAL, timeout=None, info=None):
     """The snapshot object of `herdr api snapshot` on that machine. Anything that is not an
     object holding a snapshot object raises ValueError, which every caller treats as a
-    failed read."""
+    failed read. It never waits forever: by default the local timeout here and the remote
+    one for another machine, so a hung herdr cannot freeze the popup or its refresh loop."""
+    if timeout is None:
+        timeout = REMOTE_TIMEOUT if machine else LOCAL_TIMEOUT
     data = json.loads(herdr_on(machine, ["api", "snapshot"], timeout, info))
     result = data.get("result") if isinstance(data, dict) else None
     snap = result.get("snapshot") if isinstance(result, dict) else None
