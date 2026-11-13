@@ -120,8 +120,13 @@ sys.dont_write_bytecode = True
 
 # Nothing of the user's leaks in: no config, no state, no overrides, no colours.
 _tmp_root = tempfile.mkdtemp(prefix="switchboard-test-")
+# The runtime directory holds ssh control sockets, and the program refuses one whose socket
+# path would pass macOS's 104-byte limit. macOS's own temporary directory is long, so the
+# runtime root is a short private directory under /tmp, removed at the end like the rest.
+_run_root = tempfile.mkdtemp(prefix="sbt-", dir="/tmp")
 import atexit as _atexit
 _atexit.register(shutil.rmtree, _tmp_root, True)
+_atexit.register(shutil.rmtree, _run_root, True)
 for _k in list(os.environ):
     if _k.startswith("SWITCHBOARD_") or _k.startswith("HERDR_"):
         del os.environ[_k]
@@ -131,12 +136,11 @@ os.environ.update(NO_COLOR="1", PYTHONDONTWRITEBYTECODE="1",
                   HOME=os.path.join(_tmp_root, "home"),
                   XDG_CONFIG_HOME=os.path.join(_tmp_root, "xdg-config"),
                   XDG_STATE_HOME=os.path.join(_tmp_root, "xdg-state"),
-                  XDG_RUNTIME_DIR=os.path.join(_tmp_root, "run"),
+                  XDG_RUNTIME_DIR=_run_root,
                   HERDR_PLUGIN_CONFIG_DIR=os.path.join(_tmp_root, "config"),
                   HERDR_PLUGIN_STATE_DIR=os.path.join(_tmp_root, "state"))
 os.makedirs(os.environ["HOME"])
-os.makedirs(os.environ["XDG_RUNTIME_DIR"], mode=0o700)
-os.chmod(os.environ["XDG_RUNTIME_DIR"], 0o700)
+os.chmod(_run_root, 0o700)
 
 loader = importlib.machinery.SourceFileLoader("switchboard", str(TOOL))
 spec = importlib.util.spec_from_loader("switchboard", loader)
@@ -1980,8 +1984,8 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
         check("enter-pty-focused-through-herdr", "--machine m1 agent focus w1:p7" in (d / "log").read_text())
 
 sb.ssh_mux()
-check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0] and sb._SSH_DIR[0].startswith(_tmp_root),
-      sb._SSH_DIR)
+check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
+      and sb._SSH_DIR[0] == os.path.join(_run_root, "switchboard"), sb._SSH_DIR)
 
 if FAILS:
     print("FAIL %d:\n  " % len(FAILS) + "\n  ".join(str(f) for f in FAILS))
