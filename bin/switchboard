@@ -135,6 +135,10 @@ STRINGS = {
         "select_lines": ", %d lines",
         "snapshot_failed": "herdr api snapshot failed (%s). Press Enter to close. ",
         "rows_failed": "herdr api snapshot failed: %s",
+        "snapshot_timeout": "herdr did not answer api snapshot within %s s. If this machine is that slow, raise"
+                            " [refresh] local_timeout in %s. Press Enter to close. ",
+        "rows_timeout": "herdr did not answer api snapshot within %s s. If this machine is that slow, raise"
+                        " [refresh] local_timeout in %s.",
         "remote_focusing": "focusing it on %s…",
         "remote_ready": "ready on %s: switch to that machine to see it · esc closes",
         "remote_failed": "could not focus it on %s · esc closes",
@@ -208,6 +212,10 @@ STRINGS = {
         "select_lines": ", %d líneas",
         "snapshot_failed": "falló herdr api snapshot (%s). Enter para cerrar. ",
         "rows_failed": "falló herdr api snapshot: %s",
+        "snapshot_timeout": "herdr no contestó api snapshot en %s s. Si esta máquina es así de lenta, subí"
+                            " [refresh] local_timeout en %s. Enter para cerrar. ",
+        "rows_timeout": "herdr no contestó api snapshot en %s s. Si esta máquina es así de lenta, subí"
+                        " [refresh] local_timeout en %s.",
         "remote_focusing": "enfocándola en %s…",
         "remote_ready": "lista en %s: pasá a esa máquina para verla · esc cierra",
         "remote_failed": "no se pudo enfocar en %s · esc cierra",
@@ -278,6 +286,7 @@ DEFAULTS = {
         "local_seconds": 1.0,
         "remote_seconds": 3.0,
         "remote_timeout": 8.0,
+        "local_timeout": 5.0,
         "cache_max_age": 1800.0,
     },
     # Names of the terminal's own ANSI palette, so the default looks right on any theme.
@@ -304,6 +313,7 @@ NUMBER_RANGES = {
     ("refresh", "local_seconds"): (0.2, 60.0),
     ("refresh", "remote_seconds"): (0.5, 600.0),
     ("refresh", "remote_timeout"): (1.0, 120.0),
+    ("refresh", "local_timeout"): (1.0, 120.0),
     ("refresh", "cache_max_age"): (0.0, 86400.0),
 }
 # Exactly the colour values fzf accepts: -1 (terminal default), 0 to 255, #rrggbb, and the
@@ -609,7 +619,7 @@ CONFIG = copymod.deepcopy(DEFAULTS)
 CONFIG_WARNING = None
 LOCAL_LABEL = ""
 LOCAL_EVERY = REMOTE_EVERY = REMOTE_TIMEOUT = 0.0
-LOCAL_TIMEOUT = 5.0  # seconds for a read of this machine's herdr, as for the other local reads
+LOCAL_TIMEOUT = 5.0  # seconds for a snapshot of this machine's herdr ([refresh] local_timeout)
 CACHE_MAX_AGE = 1800
 REMOTE_HERDR = DEFAULT_REMOTE_HERDR
 COLORS = dict(DEFAULTS["colors"])
@@ -631,7 +641,7 @@ def configure(cfg, warning=None):
     LOCAL_EVERY = _env_float("SWITCHBOARD_LOCAL_EVERY", refresh["local_seconds"])
     REMOTE_EVERY = _env_float("SWITCHBOARD_REMOTE_EVERY", refresh["remote_seconds"])
     REMOTE_TIMEOUT = _env_float("SWITCHBOARD_REMOTE_TIMEOUT", refresh["remote_timeout"])
-    LOCAL_TIMEOUT = _env_float("SWITCHBOARD_LOCAL_TIMEOUT", 5.0)
+    LOCAL_TIMEOUT = _env_float("SWITCHBOARD_LOCAL_TIMEOUT", refresh["local_timeout"])
     CACHE_MAX_AGE = refresh["cache_max_age"]
     REMOTE_HERDR = os.environ.get("SWITCHBOARD_REMOTE_HERDR") or cfg["remote"]["herdr"]
     COLORS = dict(cfg["colors"])
@@ -2645,7 +2655,10 @@ def popup(self_cmd, demo=False):
         entries = entries_from(snap, LOCAL, local_label(), 0)
     except Exception as exc:
         try:
-            input(tr("snapshot_failed", clean(str(exc))))
+            if isinstance(exc, subprocess.TimeoutExpired):
+                input(tr("snapshot_timeout", "%g" % LOCAL_TIMEOUT, config_path()))
+            else:
+                input(tr("snapshot_failed", clean(str(exc))))
         except (EOFError, KeyboardInterrupt):
             pass
         return 1
@@ -2756,7 +2769,10 @@ def main(argv):
             try:
                 entries, machines, down = collect(with_remote=True)
             except Exception as exc:  # the local herdr did not answer with a snapshot
-                sys.stderr.write(tr("rows_failed", clean(str(exc))) + "\n")
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    sys.stderr.write(tr("rows_timeout", "%g" % LOCAL_TIMEOUT, config_path()) + "\n")
+                else:
+                    sys.stderr.write(tr("rows_failed", clean(str(exc))) + "\n")
                 return 1
             sys.stdout.write(render(entries, machines, down=down))
             return 0

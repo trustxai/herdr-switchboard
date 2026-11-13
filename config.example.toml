@@ -26,6 +26,9 @@ local_seconds = 1
 remote_seconds = 3
 # Seconds before a saved machine that does not answer is shown as offline. 1 to 120.
 remote_timeout = 8
+# Seconds to wait for this machine's own herdr snapshot, at open and on every refresh.
+# Raise it if the popup says herdr did not answer in time. 1 to 120.
+local_timeout = 5
 # Seconds the last snapshot of a saved machine stays usable: it is shown the moment the
 # popup opens, marked with its age, until the fresh one arrives. Older ones are not shown.
 # 0 to 86400; 0 turns the cached view off.

@@ -2456,8 +2456,34 @@ with tempfile.TemporaryDirectory() as d:
     r = subprocess.run([sys.executable, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
     took = _time.time() - t0
-    check("popup-hung-herdr-says-so", r.returncode == 1 and "herdr api snapshot failed" in r.stdout and took < 4,
+    cfg_path = os.path.join(os.environ["HERDR_PLUGIN_CONFIG_DIR"], "config.toml")
+    check("popup-hung-herdr-says-what-to-raise", r.returncode == 1 and "within 1 s" in r.stdout
+          and "[refresh] local_timeout" in r.stdout and cfg_path in r.stdout and took < 4,
+          (r.returncode, took, r.stdout[-300:]))
+    # The option itself, from a config file and without the test override.
+    cfg_dir = d / "cfg-timeout"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.toml").write_text("[refresh]\nlocal_timeout = 1\n")
+    env = dict(os.environ, HERDR_BIN_PATH=str(slow), SWITCHBOARD_FZF=str(fzf_ok), HERDR_PLUGIN_CONFIG_DIR=str(cfg_dir))
+    t0 = _time.time()
+    r = subprocess.run([sys.executable, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
+    took = _time.time() - t0
+    check("local-timeout-option-applies", r.returncode == 1 and "within 1 s" in r.stdout and took < 4,
           (r.returncode, took, r.stdout[-200:]))
+    r = subprocess.run([sys.executable, str(TOOL), "--rows"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
+    check("rows-timeout-says-what-to-raise", r.returncode == 1 and "[refresh] local_timeout" in r.stderr
+          and "Traceback" not in r.stderr, (r.returncode, r.stderr[-200:]))
+    (cfg_dir / "config.toml").write_text("lang = \"es\"\n[refresh]\nlocal_timeout = 1\n")
+    r = subprocess.run([sys.executable, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
+    check("local-timeout-message-in-spanish", "no contestó api snapshot en 1 s" in r.stdout, r.stdout[-200:])
+cfg, warn = sb.merge_config({"refresh": {"local_timeout": 30}})
+check("local-timeout-in-range", cfg["refresh"]["local_timeout"] == 30.0 and not warn, (cfg["refresh"], warn))
+for bad in (0.5, 121, "fast"):
+    cfg, warn = sb.merge_config({"refresh": {"local_timeout": bad}})
+    check("local-timeout-out-of-range %r" % (bad,), cfg["refresh"]["local_timeout"] == 5.0 and warn, (cfg["refresh"], warn))
 
 # 38. Closing always removes the run directory.
 def close_popup(local_seconds, slow):
