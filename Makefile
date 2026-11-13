@@ -34,6 +34,10 @@ REQUIRE_TOOLS ?=
 # Neither the tests nor the linters may leave bytecode in the tree.
 export PYTHONDONTWRITEBYTECODE := 1
 
+# The __pycache__ directories of the tree, as `make lint` checks them and
+# `make clean` removes them: the same scope for both, .git and a local .venv aside.
+FIND_PYCACHE := find . -path ./.git -prune -o -path ./.venv -prune -o -name __pycache__ -type d
+
 .DEFAULT_GOAL := help
 .PHONY: help check test lint compile ruff scripts pycache secrets clean
 
@@ -49,14 +53,18 @@ help:
 check: test lint secrets
 
 # Guard: bin/switchboard and tests/test_switchboard.py arrive with the port pull
-# request. Once that has landed on main, remove the if/else below so that a
-# missing test file fails instead of being skipped (and remove the matching
-# `if: hashFiles(...)` guards in .github/workflows/ci.yml).
+# request. Until then, and only while NEITHER file exists, the tests are skipped.
+# A program without its test file is a failure, not a skip. Once the port has
+# landed on main, remove the skip branch so a missing test file always fails
+# (and remove the matching `if: hashFiles(...)` guards in .github/workflows/ci.yml).
 test:
-	@if [ ! -f $(TESTS) ]; then \
-	  echo "test: SKIPPED, $(TESTS) does not exist yet (remove this guard once the port has landed)"; \
-	else \
+	@if [ -f $(TESTS) ]; then \
 	  $(PYTHON) $(TESTS); \
+	elif [ -f $(PROGRAM) ]; then \
+	  echo "test: $(PROGRAM) exists but $(TESTS) does not: the program has no tests to run" >&2; \
+	  exit 1; \
+	else \
+	  echo "test: SKIPPED, neither $(PROGRAM) nor $(TESTS) exists yet (remove this guard once the port has landed)"; \
 	fi
 
 lint: compile ruff scripts pycache
@@ -90,7 +98,7 @@ scripts:
 	echo "scripts: shell syntax ok ($(SCRIPTS))"
 
 pycache:
-	@found=$$(find . -path ./.git -prune -o -path ./.venv -prune -o -name __pycache__ -print); \
+	@found=$$($(FIND_PYCACHE) -print); \
 	if [ -n "$$found" ]; then \
 	  echo "pycache: bytecode left in the tree:" >&2; echo "$$found" >&2; \
 	  echo "pycache: run 'make clean'; tests must not write bytecode (PYTHONDONTWRITEBYTECODE=1)" >&2; \
@@ -111,5 +119,5 @@ secrets:
 	fi
 
 clean:
-	@find . -path ./.git -prune -o -name __pycache__ -type d -prune -exec rm -rf {} +
+	@$(FIND_PYCACHE) -prune -exec rm -rf {} +
 	@rm -rf .ruff_cache
