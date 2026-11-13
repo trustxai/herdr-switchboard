@@ -71,6 +71,8 @@ What it has to get right, and how it fails otherwise:
 20. Language: English by default, Spanish with lang = "es", one table with the same keys
    and placeholders in both, and no literal text handed to print or input.
 21. Colours: the default uses the terminal's ANSI palette; the example theme still works.
+22. Dependencies: a missing or old fzf, or an old Python, gives a message with the version
+   found and how to install, and a non-zero exit.
     python3 tests/test_switchboard.py
 """
 import ast
@@ -1155,6 +1157,49 @@ themed = sb.fzf_colors(tcfg["colors"])
 check("example-theme-still-works", not tproblems and "bg+:#bd93f9" in themed and "fg+:#282a36:bold" in themed
       and "border:#6272a4" in themed, (tproblems, themed))
 check("fzf-extra-appended", sb.fzf_colors(dict(sb.DEFAULTS["colors"], fzf="info:8")).endswith(",info:8"))
+
+# 22. Dependencies.
+check("deps-ok", sb.dependency_problems(python=(3, 9, 0), fzf=False) == [])
+p38 = sb.dependency_problems(python=(3, 8, 10), fzf=False, platform="linux", executable="/usr/bin/python3")
+check("deps-old-python", len(p38) == 2 and "3.8.10" in p38[0] and "3.9" in p38[0] and "package manager" in p38[1], p38)
+check("deps-old-python-macos", "xcode-select" in sb.dependency_problems(python=(3, 8, 2), fzf=False, platform="darwin")[1])
+with tempfile.TemporaryDirectory() as d:
+    old = executable(os.path.join(d, "fzf-old"), "#!/bin/sh\necho '0.44.1 (debian)'\n")
+    new = executable(os.path.join(d, "fzf-new"), "#!/bin/sh\necho '0.74.2 (brew)'\n")
+    edge = executable(os.path.join(d, "fzf-edge"), "#!/bin/sh\necho '0.71.0 (abc)'\n")
+    quiet = executable(os.path.join(d, "fzf-quiet"), "#!/bin/sh\nexit 1\n")
+    po = sb.dependency_problems(python=(3, 12, 0), fzf=str(old), platform="linux")
+    check("deps-old-fzf", len(po) == 2 and "0.44.1" in po[0] and "0.71" in po[0] and "releases" in po[1], po)
+    check("deps-old-fzf-macos", "brew install fzf" in sb.dependency_problems(python=(3, 12, 0), fzf=str(old),
+                                                                             platform="darwin")[1])
+    check("deps-new-fzf", sb.dependency_problems(python=(3, 12, 0), fzf=str(new)) == [])
+    check("deps-fzf-exactly-the-minimum", sb.dependency_problems(python=(3, 12, 0), fzf=str(edge)) == [])
+    pm = sb.dependency_problems(python=(3, 12, 0), fzf=None, platform="linux")
+    check("deps-missing-fzf", pm and "not found" in pm[0], pm)
+    check("deps-silent-fzf-is-missing", "not found" in sb.dependency_problems(python=(3, 12, 0), fzf=str(quiet))[0])
+    # End to end: the popup refuses to start, says why, waits, and exits non-zero.
+    for name, fzf_path, want in (("old", str(old), "0.44.1"), ("missing", "", "not found")):
+        env = dict(os.environ, SWITCHBOARD_FZF=fzf_path, HERDR_BIN_PATH="/bin/false")
+        r = subprocess.run([sys.executable, str(TOOL), "--demo"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
+        check("deps-e2e-%s-fzf" % name, r.returncode != 0 and want in r.stdout and "0.71" in r.stdout
+              and "Press Enter" in r.stdout, (r.returncode, r.stdout, r.stderr[-300:]))
+# An old Python, simulated: the version check runs before anything else.
+code = ("import runpy, sys; sys.version_info = (3, 8, 10, 'final', 0); sys.argv = ['switchboard', '--rows'];"
+        " runpy.run_path(%r, run_name='__main__')" % str(TOOL))
+r = subprocess.run([sys.executable, "-c", code], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                   stderr=subprocess.PIPE, universal_newlines=True, env=dict(os.environ, HERDR_BIN_PATH="/bin/false"),
+                   timeout=20)
+check("deps-e2e-old-python", r.returncode != 0 and "Python 3.9" in r.stdout and "3.8.10" in r.stdout,
+      (r.returncode, r.stdout, r.stderr[-300:]))
+# And a real one, when the machine has it (SWITCHBOARD_TEST_OLD_PYTHON or python3.8 on PATH).
+old_py = os.environ.get("SWITCHBOARD_TEST_OLD_PYTHON") or shutil.which("python3.8")
+if old_py:
+    r = subprocess.run([old_py, str(TOOL), "--rows"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=dict(os.environ, HERDR_BIN_PATH="/bin/false"),
+                       timeout=20)
+    check("deps-e2e-real-old-python", r.returncode != 0 and "Python 3.9" in r.stdout and "found Python 3." in r.stdout,
+          (old_py, r.returncode, r.stdout, r.stderr[-300:]))
 
 
 if FAILS:
