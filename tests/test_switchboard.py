@@ -115,6 +115,8 @@ What it has to get right, and how it fails otherwise:
    every refresh, the refresh keeps the last rows, and the popup says what failed.
 38. Closing the popup always removes its run directory, whatever local_seconds is and however
    slow the local snapshot, and stop wakes the watch loop at once.
+39. The detached worker checks again what it was handed: a result name that is not a plain
+   focus-N-N (such as ../x) or a directory that is not ours and 0700 gets nothing written.
 
     python3 tests/test_switchboard.py
 """
@@ -2541,6 +2543,34 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         check("stop-wakes-the-watch-loop", not t.is_alive() and _time.time() - t0 < 1, _time.time() - t0)
     finally:
         sb.LOCAL_EVERY = saved_every
+
+# 39. The worker re-checks the name and the directory it inherits.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    (pathlib.Path(d) / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
+    fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%s/machines.json" ;;\n'
+                                             '  *) exit 0 ;;\nesac\n' % d)
+    parent = private_tmp(d, "parent")
+
+    def run_worker(dir_path, name):
+        fd = os.open(dir_path, os.O_RDONLY)
+        try:
+            env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_FD=str(fd))
+            subprocess.run([sys.executable, str(TOOL), "--focus", "m1|a|w1:p1|w1:t1", name], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, pass_fds=(fd,), timeout=30)
+        finally:
+            os.close(fd)
+
+    run_dir = private_tmp(parent, "run")
+    run_worker(run_dir, "focus-1-1")
+    check("worker-writes-a-valid-result", sorted(os.listdir(run_dir)) == ["focus-1-1"], os.listdir(run_dir))
+    run_worker(run_dir, "../escape")
+    check("worker-refuses-a-name-that-climbs-out", sorted(os.listdir(parent)) == ["run"]
+          and sorted(os.listdir(run_dir)) == ["focus-1-1"], (os.listdir(parent), os.listdir(run_dir)))
+    loose = os.path.join(parent, "loose")
+    os.mkdir(loose)
+    os.chmod(loose, 0o755)
+    run_worker(loose, "focus-2-2")
+    check("worker-refuses-a-directory-that-is-not-private", os.listdir(loose) == [], os.listdir(loose))
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
