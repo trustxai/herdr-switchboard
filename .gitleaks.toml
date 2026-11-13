@@ -1,0 +1,18 @@
+# gitleaks configuration for herdr-switchboard.
+#
+# CI scans the whole git history on every pull request and push to main
+# (`make secrets`, .github/workflows/ci.yml); the pre-commit hook scans what is
+# staged. Both use gitleaks' built-in rules through this file.
+#
+# Every tracked file is scanned. There are no path exemptions on purpose: a path
+# allowlist is a permanent blind spot, because a secret added to that file later
+# would be invisible to both gates.
+#
+# If a real false positive ever appears, add an [[allowlists]] block below with a
+# regex that matches that exact string and a comment saying why it is not a
+# secret. Inline `gitleaks:allow` comments are ignored by `make secrets`.
+
+title = "herdr-switchboard"
+
+[extend]
+useDefault = true

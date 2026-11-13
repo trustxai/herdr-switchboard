@@ -1,0 +1,18 @@
+# Keeps the SHA-pinned GitHub Actions current: Dependabot rewrites the SHA and
+# the version comment next to it. The fzf and gitleaks binaries pinned in
+# .github/scripts/install-pinned.sh, the uv version in ci.yml and the pre-commit
+# revisions are not covered and are bumped by hand.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Let a release age a week before proposing it.
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci

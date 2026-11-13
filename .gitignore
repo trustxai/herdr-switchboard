@@ -1,0 +1,23 @@
+# Python bytecode (the tests and `make lint` must not write any)
+__pycache__/
+*.py[oc]
+
+# Local tooling
+.venv/
+.ruff_cache/
+.env
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local agent state and orchestration, never published
+.memory/
+.loop/
+loop.config.json
+.claude/settings.local.json
+.claude/worktrees/
+.playwright-mcp/
+.automode_decisions.jsonl
