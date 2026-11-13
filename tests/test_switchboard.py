@@ -1682,6 +1682,8 @@ SAME = [
     ("# a\x1cb\n", None),
     ("x = 1 # a\x7fb\n", None),
     ("lang = \"es\"\rlocal_label = \"x\"\n", None),
+    ("[jump]\nenabled = true\r", None),
+    ("[jump]\nenabled = true\r\n", {"jump": {"enabled": True}}),
     (" lang = \"es\"\n", None),
     ("lang = \"es\" \n", None),
     ("[jump] enabled = true\n", None),

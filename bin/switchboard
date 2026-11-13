@@ -451,8 +451,11 @@ def parse_toml_subset(text):
     could then turn on an option that tomllib ignores. Whitespace is space and tab only."""
     root, declared = {}, set()
     table = root
-    for n, line in enumerate(text.split("\n"), 1):
-        if line.endswith("\r"):
+    lines = text.split("\n")
+    for n, line in enumerate(lines, 1):
+        # Only a \r that a \n follows ends a line; a stray one (say, at the end of the file)
+        # is a control character, as in tomllib.
+        if n < len(lines) and line.endswith("\r"):
             line = line[:-1]
         s = line.strip(" \t")
         if not s:
