@@ -134,6 +134,7 @@ STRINGS = {
         "select_copied": " copied: %d characters%s · esc goes back ",
         "select_lines": ", %d lines",
         "snapshot_failed": "herdr api snapshot failed (%s). Press Enter to close. ",
+        "rows_failed": "herdr api snapshot failed: %s",
         "remote_focusing": "focusing it on %s…",
         "remote_ready": "ready on %s: switch to that machine to see it · esc closes",
         "remote_failed": "could not focus it on %s · esc closes",
@@ -206,6 +207,7 @@ STRINGS = {
         "select_copied": " copiado: %d caracteres%s · esc vuelve ",
         "select_lines": ", %d líneas",
         "snapshot_failed": "falló herdr api snapshot (%s). Enter para cerrar. ",
+        "rows_failed": "falló herdr api snapshot: %s",
         "remote_focusing": "enfocándola en %s…",
         "remote_ready": "lista en %s: pasá a esa máquina para verla · esc cierra",
         "remote_failed": "no se pudo enfocar en %s · esc cierra",
@@ -893,7 +895,21 @@ def herdr_on(machine, args, timeout=None, info=None, need_output=True):
 
 
 def snapshot(machine=LOCAL, timeout=None, info=None):
-    return json.loads(herdr_on(machine, ["api", "snapshot"], timeout, info))["result"]["snapshot"]
+    """The snapshot object of `herdr api snapshot` on that machine. Anything that is not an
+    object holding a snapshot object raises ValueError, which every caller treats as a
+    failed read."""
+    data = json.loads(herdr_on(machine, ["api", "snapshot"], timeout, info))
+    result = data.get("result") if isinstance(data, dict) else None
+    snap = result.get("snapshot") if isinstance(result, dict) else None
+    if not isinstance(snap, dict):
+        raise ValueError("herdr api snapshot: not a snapshot")
+    return snap
+
+
+def focused_tab(snap):
+    """The focused tab of a snapshot, when it is a string; else None."""
+    tab = snap.get("focused_tab_id") if isinstance(snap, dict) else None
+    return tab if isinstance(tab, str) else None
 
 
 def saved_machines():
@@ -1102,13 +1118,13 @@ def collect(with_remote):
     recency = Recency()
     snap = snapshot()
     entries = entries_from(snap, LOCAL, local_label(), 0)
-    recency.observe(LOCAL, entries, focus=snap.get("focused_tab_id"), here=True)
+    recency.observe(LOCAL, entries, focus=focused_tab(snap), here=True)
     results, focus, down = {}, {}, []
 
     def fetch(i, m):
         try:
             s = snapshot(m["id"], REMOTE_TIMEOUT, m)
-            results[i], focus[i] = entries_from(s, m["id"], m["label"], i + 1), s.get("focused_tab_id")
+            results[i], focus[i] = entries_from(s, m["id"], m["label"], i + 1), focused_tab(s)
         except Exception:
             results[i] = None
 
@@ -1173,23 +1189,27 @@ class Live:
     def refresh_local(self):
         try:
             snap = self.fetch()
+            if not isinstance(snap, dict):
+                raise ValueError("not a snapshot")
             entries = entries_from(snap, LOCAL, local_label(), 0)
         except Exception:
-            return
-        self.recency.observe(LOCAL, entries, focus=snap.get("focused_tab_id"), here=True)
+            return  # keep the rows of the last good read
+        self.recency.observe(LOCAL, entries, focus=focused_tab(snap), here=True)
         with self.lock:
             self.local = entries
 
     def refresh_remote(self, i, m):
         try:
             snap = self.fetch(m["id"], REMOTE_TIMEOUT, m)
+            if not isinstance(snap, dict):
+                raise ValueError("not a snapshot")
             entries = entries_from(snap, m["id"], m["label"], i + 1)
-        except Exception:
+        except Exception:  # a malformed answer counts as no answer
             snap = entries = None
         if snap is not None and self.cache:
             save_cache(m["id"], snap)
         if entries is not None:
-            self.recency.observe(m["id"], entries, focus=snap.get("focused_tab_id"))
+            self.recency.observe(m["id"], entries, focus=focused_tab(snap))
         with self.lock:
             if entries is not None:
                 self.remote[m["id"]] = entries
@@ -1323,11 +1343,30 @@ def watch(live, sock, rows_file, stop, acks=None):
     # When a machine answers, reload at once instead of on the next local tick.
     kick = threading.Event()
 
+    # No pass of either loop may end its thread: a dead thread would freeze the list
+    # without a word, so whatever one pass hits, the next one runs. That includes the rows
+    # file vanishing while the popup closes and removes its directory.
     def remote_loop(i, m):
         while not stop.is_set():
-            live.refresh_remote(i, m)
+            try:
+                live.refresh_remote(i, m)
+            except Exception:
+                pass
             kick.set()
             stop.wait(REMOTE_EVERY)
+
+    def local_pass():
+        live.refresh_local()
+        if acks:
+            live.consume_acks(acks)
+        text = live.changed()
+        if text is None:
+            return
+        tmp = rows_file + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, rows_file)
+        fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
 
     for i, m in enumerate(live.machines):
         threading.Thread(target=remote_loop, args=(i, m), daemon=True).start()
@@ -1336,20 +1375,10 @@ def watch(live, sock, rows_file, stop, acks=None):
         kick.clear()
         if stop.is_set():
             break
-        live.refresh_local()
-        if acks:
-            live.consume_acks(acks)
-        text = live.changed()
-        if text is None:
-            continue
-        tmp = rows_file + ".tmp"
         try:
-            with open(tmp, "w") as f:
-                f.write(text)
-            os.replace(tmp, rows_file)
-        except OSError:  # the popup is closing and its directory is gone
+            local_pass()
+        except Exception:
             continue
-        fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
 
 
 # --- actions ----------------------------------------------------------------------------
@@ -2470,11 +2499,11 @@ def popup(self_cmd, demo=False):
         entries = entries_from(snap, LOCAL, local_label(), 0)
     except Exception as exc:
         try:
-            input(tr("snapshot_failed", exc))
+            input(tr("snapshot_failed", clean(str(exc))))
         except (EOFError, KeyboardInterrupt):
             pass
         return 1
-    live = Live(machines, entries, focus=snap.get("focused_tab_id"))
+    live = Live(machines, entries, focus=focused_tab(snap))
     first = live.changed()
     open_link, remote_enter = enter_mode(machines, demo)
     link = JumpLink().start() if open_link else None
@@ -2574,7 +2603,11 @@ def main(argv):
         if argv[:1] == ["--jump"] and len(argv) == 8:
             return jump(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6] == "1", argv[7])
         if argv[:1] == ["--rows"]:
-            entries, machines, down = collect(with_remote=True)
+            try:
+                entries, machines, down = collect(with_remote=True)
+            except Exception as exc:  # the local herdr did not answer with a snapshot
+                sys.stderr.write(tr("rows_failed", clean(str(exc))) + "\n")
+                return 1
             sys.stdout.write(render(entries, machines, down=down))
             return 0
         return popup(self_cmd, demo=demo)

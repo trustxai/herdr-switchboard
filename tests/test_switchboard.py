@@ -99,6 +99,9 @@ What it has to get right, and how it fails otherwise:
    watch loop survives the popup removing its directory on close.
 32. A focus already asked for finishes even when the popup closes right after Enter, and the
    tab still counts as seen.
+33. No malformed snapshot, of any type at any level, can kill a thread or print a traceback:
+   snapshot() refuses it, the refresh paths treat it as no answer, --rows and the popup say
+   what failed, and neither watch loop can die.
 
     python3 tests/test_switchboard.py
 """
@@ -2051,6 +2054,120 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
         except (OSError, ValueError, KeyError) as exc:
             ledger = repr(exc)
         check("close-after-enter-ack-kept", isinstance(ledger, list) and ledger[3] == 5, ledger)
+
+# 33. Malformed snapshots everywhere.
+BAD_SNAPSHOTS = ['{"result":{"snapshot":[]}}', "[]", '{"result":[]}', '"x"', '{"result":{"snapshot":"x"}}', "null",
+                 '{"result":{"snapshot":null}}', "not json", "{}"]
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    out_file = d / "out.json"
+    fh = executable(d / "herdr", '#!/bin/sh\ncat "%s"\n' % out_file)
+    saved_herdr = sb.HERDR
+    sb.HERDR = str(fh)
+    try:
+        for raw in BAD_SNAPSHOTS:
+            out_file.write_text(raw)
+            try:
+                sb.snapshot()
+                check("snapshot-refuses %r" % raw, False)
+            except ValueError:
+                pass
+            except Exception as exc:
+                check("snapshot-refuses-with-valueerror %r" % raw, False, repr(exc))
+        out_file.write_text(json.dumps({"result": {"snapshot": {"focused_tab_id": ["x"], "panes": "x", "agents": {}}}}))
+        odd = sb.snapshot()
+        check("snapshot-odd-fields-survive", sb.focused_tab(odd) is None and sb.entries_from(odd) == [], odd)
+    finally:
+        sb.HERDR = saved_herdr
+check("focused-tab-only-a-string", sb.focused_tab({"focused_tab_id": "w1:t1"}) == "w1:t1"
+      and sb.focused_tab({"focused_tab_id": 3}) is None and sb.focused_tab([]) is None)
+
+# The two refresh paths take any value from fetch without raising, and a bad value is no answer.
+good_local = snap([pane("w1:p1")], [agent("w1:p1", "working", 1, title="here-ok")])
+good_remote = snap([pane("w1:p2")], [agent("w1:p2", "idle", 1, title="there-ok")])
+feed = {"local": good_local, "m1": good_remote}
+
+
+def fetch33(machine="", timeout=None, info=None):
+    v = feed[machine or "local"]
+    if isinstance(v, BaseException):
+        raise v
+    return v
+
+
+lv = sb.Live([{"id": "m1", "label": "box1"}], sb.entries_from(good_local, "", "here", 0), fetch=fetch33, cache=False)
+lv.refresh_remote(0, {"id": "m1", "label": "box1"})
+for bad in ([], "x", None, 7, b"x", TypeError("odd"), KeyError("odd")):
+    feed["local"], feed["m1"] = bad, bad
+    try:
+        lv.refresh_local()
+        lv.refresh_remote(0, {"id": "m1", "label": "box1"})
+        text = lv.text()
+        check("refresh-bad-value-keeps-last-rows %r" % (bad,), "here-ok" in text and "there-ok" in text, text)
+    except Exception as exc:
+        check("refresh-never-raises %r" % (bad,), False, repr(exc))
+lv2 = sb.Live([{"id": "m1", "label": "box1"}], [], fetch=lambda m="", t=None, i=None: [], cache=False)
+lv2.refresh_remote(0, {"id": "m1", "label": "box1"})
+check("refresh-malformed-first-answer-is-offline", "box1 offline" in lv2.text(), lv2.text())
+
+# Neither watch loop can die, whatever a pass hits.
+errors = []
+saved_hook = sb.threading.excepthook
+sb.threading.excepthook = lambda a: errors.append(a.exc_type.__name__)
+try:
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        sock = os.path.join(d, "x.sock")
+        FakeFzf(sock)
+        feed["local"], feed["m1"] = good_local, good_remote
+        lv3 = sb.Live([{"id": "m1", "label": "box1"}], sb.entries_from(good_local, "", "here", 0), fetch=fetch33,
+                      cache=False)
+        calls33 = {"remote": 0, "local": 0}
+
+        def broken_remote(i, m):
+            calls33["remote"] += 1
+            raise RuntimeError("remote pass")
+
+        def broken_changed():
+            calls33["local"] += 1
+            raise AttributeError("local pass")
+        lv3.refresh_remote = broken_remote
+        lv3.changed = broken_changed
+        stop = _threading.Event()
+        t = _threading.Thread(target=sb.watch, args=(lv3, sock, os.path.join(d, "rows"), stop, None))
+        t.start()
+        _time.sleep(0.5)
+        alive = t.is_alive()
+        stop.set()
+        t.join(3)
+    check("watch-loops-survive-any-error", not errors and alive and calls33["remote"] > 2 and calls33["local"] > 2,
+          (errors, alive, calls33))
+finally:
+    sb.threading.excepthook = saved_hook
+
+# End to end: a malformed remote is offline in --rows, a malformed local is a message, never a traceback.
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    (d / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
+    (d / "local.json").write_text(json.dumps({"result": {"snapshot": good_local}}))
+    (d / "bad.json").write_text('{"result":{"snapshot":[]}}')
+    fh = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                                 '  "api snapshot") cat "%(d)s/${LOCAL_FILE:-local.json}" ;;\n'
+                                 '  "--machine m1 api snapshot") cat "%(d)s/bad.json" ;;\n  *) exit 2 ;;\nesac\n' % {"d": d})
+    env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_REMOTE_TIMEOUT="2")
+    r = subprocess.run([sys.executable, str(TOOL), "--rows"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
+    check("rows-malformed-remote-is-offline", r.returncode == 0 and "box1 offline" in r.stdout and not r.stderr,
+          (r.returncode, r.stdout[:200], r.stderr[-300:]))
+    r = subprocess.run([sys.executable, str(TOOL), "--rows"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=dict(env, LOCAL_FILE="bad.json"), timeout=30)
+    check("rows-malformed-local-is-a-message", r.returncode == 1 and "herdr api snapshot failed" in r.stderr
+          and "Traceback" not in r.stderr, (r.returncode, r.stderr[-300:]))
+    fzf_ok = executable(d / "fzf", '#!/bin/sh\nif [ "$1" = --version ]; then echo "0.74.0 (test)"; exit 0; fi\nexit 1\n')
+    r = subprocess.run([sys.executable, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True,
+                       env=dict(env, LOCAL_FILE="bad.json", SWITCHBOARD_FZF=str(fzf_ok)), timeout=30)
+    check("popup-malformed-local-is-a-message", r.returncode == 1 and "herdr api snapshot failed" in r.stdout
+          and "Traceback" not in r.stderr, (r.returncode, r.stdout[-200:], r.stderr[-300:]))
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
