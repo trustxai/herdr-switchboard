@@ -817,10 +817,12 @@ def format_row(e):
     # Most agents are claude: the kind is shown only when it is something else.
     kind = e["agent"] if e["agent"] not in ("", "claude") else ""
     tail = "  ".join(x for x in (kind, e["cwd"]) if x)
-    # No fixed colours in the text: fzf paints the selected row, and a fixed grey there
-    # would not read. What is dimmed uses only the dim attribute.
+    # No fixed colours in the text: fzf paints the selected row, and a fixed colour there
+    # would not read on its background. Only the glyph carries the status colour; the word
+    # takes the row's colour, so it stays legible when selected. Dimmed text uses only the
+    # dim attribute.
     cols = [
-        "%s%s %s%s" % (color, glyph, pad(tr("st_" + e["status"]), 8), OFF),
+        "%s%s%s %s" % (color, glyph, OFF, pad(tr("st_" + e["status"]), 8)),
         pad(e["machine_label"], MACHINE_WIDTH),
         pad(e["ws_label"], 15),
         # An unnamed tab shows its number dimmed: it is the one on the tab bar.
@@ -1754,7 +1756,9 @@ def fzf_colors(colors=None):
     spec = [
         "fg:-1", "bg:-1", "hl:" + c["accent"], "fg+:%s:bold" % c["selected_fg"],
         "bg+:" + c["selected_bg"], "hl+:%s:bold:underline" % c["selected_fg"], "gutter:-1",
-        "pointer:" + c["accent"], "prompt:" + c["accent"], "spinner:" + c["accent"],
+        # The pointer sits on the selected row's background, so it takes that row's text
+        # colour: in the accent it would vanish into a background of the same colour.
+        "pointer:" + c["selected_fg"], "prompt:" + c["accent"], "spinner:" + c["accent"],
         "label:" + c["accent"], "border:" + c["muted"], "info:" + c["muted"],
         "header:" + c["muted"], "scrollbar:" + c["muted"],
     ]
@@ -1767,6 +1771,9 @@ def fzf_argv(fzf, self_cmd, sock, remote_enter=False):
         # No padding: every column lost here breaks a preview line.
         "--layout", "reverse", "--height", "100%", "--border", "none",
         "--prompt", "❯ ", "--pointer", "▌", "--highlight-line", "--info", "inline-right",
+        # A blank gutter: fzf 0.66+ draws it as a ▌ on every row, a column of half blocks
+        # that also hides the pointer. --gutter exists since 0.66, below the 0.71 minimum.
+        "--gutter", " ",
         "--no-multi", "--cycle", "--scrollbar", "│",
         # With a query, score ties keep the priority order.
         "--tiebreak", "index",

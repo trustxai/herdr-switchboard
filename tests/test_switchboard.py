@@ -117,6 +117,9 @@ What it has to get right, and how it fails otherwise:
    slow the local snapshot, and stop wakes the watch loop at once.
 39. The detached worker checks again what it was handed: a result name that is not a plain
    focus-N-N (such as ../x) or a directory that is not ours and 0700 gets nothing written.
+40. The selected row reads well: no gutter column, a pointer in the selected row's text colour,
+   and only the glyph coloured, so the status word takes the selection's colour. ctrl-t still
+   finds the terminals by their glyph.
 
     python3 tests/test_switchboard.py
 """
@@ -1353,6 +1356,10 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
         return buf, None, demo_missing(buf) if missing is None else missing
     screen, rc, missing = run_demo(b"\x1b")
     check("demo-pty-renders", missing == [], missing)
+    # fzf 0.66+ draws its gutter as a ▌ on every row; with a blank gutter only the pointer of
+    # the selected row is one (a few redraws), against one per visible row without it.
+    halves = screen.decode("utf-8", "replace").count("\u258c")
+    check("demo-pty-no-gutter-column", 0 < halves < 10, halves)
     check("demo-pty-esc-exits-clean", rc == 0, rc)
     screen, rc, missing = run_demo(b"\r")
     plain = sb.ANSI.sub("", screen.decode("utf-8", "replace"))
@@ -2597,6 +2604,23 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     os.chmod(loose, 0o755)
     run_worker(loose, "focus-2-2")
     check("worker-refuses-a-directory-that-is-not-private", os.listdir(loose) == [], os.listdir(loose))
+
+# 40. A readable selected row.
+argv = sb.fzf_argv("fzf", "self", "/tmp/s.sock")
+check("blank-gutter", "--gutter" in argv and argv[argv.index("--gutter") + 1] == " ", argv)
+colors = dict(kv.split(":", 1) for kv in sb.fzf_colors(sb.DEFAULTS["colors"]).split(","))
+check("pointer-in-the-selected-text-colour", colors.get("pointer") == sb.DEFAULTS["colors"]["selected_fg"], colors)
+env = dict(os.environ, HERDR_BIN_PATH="/bin/false")
+del env["NO_COLOR"]
+r = subprocess.run([sys.executable, str(TOOL), "--demo", "--rows"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                   universal_newlines=True, env=env, timeout=20)
+rows = [l.split("\t", 1)[1] for l in r.stdout.splitlines()[1:] if "\t" in l]
+glyph_only = re.compile(r"^\x1b\[[0-9;]+m[●○·›]\x1b\[0m (blocked|done|working|idle|unknown|shell) ")
+check("only-the-glyph-is-coloured", rows and all(glyph_only.match(x) for x in rows),
+      [x[:40] for x in rows if not glyph_only.match(x)][:3])
+plain_rows = [sb.ANSI.sub("", x) for x in rows]
+check("terminals-still-start-with-their-glyph", sum(1 for x in plain_rows if x.startswith("› ")) == 5,
+      [x[:12] for x in plain_rows])
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]

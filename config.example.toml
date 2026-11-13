@@ -39,8 +39,8 @@ cache_max_age = 1800
 # black, red, green, yellow, blue, magenta, cyan, white, their bright- forms (bright-black,
 # bright-red, ...), and gray or grey for bright-black. Also a number from 0 to 255, "#rrggbb",
 # or -1 for the terminal default. Any other value is reported and replaced by the default.
-accent = "magenta"          # matches, pointer, prompt
-selected_fg = "black"       # text of the selected row
+accent = "magenta"          # matches, prompt
+selected_fg = "black"       # text and pointer of the selected row
 selected_bg = "magenta"     # background of the selected row
 muted = "bright-black"      # header, borders, info
 # Extra fzf --color entries, appended last, for anything the keys above do not cover,
