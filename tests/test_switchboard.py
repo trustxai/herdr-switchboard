@@ -75,6 +75,9 @@ What it has to get right, and how it fails otherwise:
    found and how to install, and a non-zero exit.
 23. Demo: the fixtures load and cover the promised day, --demo never touches herdr, ssh or
    the state directory, and the fixtures carry nothing personal.
+24. The jump is opt-in: off by default, Enter on a remote row then focuses it through the
+   API and keeps the popup open with a footer; the client, Tailscale and the helper are
+   optional, and anything missing falls back without an error.
     python3 tests/test_switchboard.py
 """
 import ast
@@ -1304,6 +1307,138 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
           in plain, (rc, plain[-400:]))
 else:
     print("note: no fzf %s or newer here; the demo was not run in a terminal" % sb.version_text(sb.MIN_FZF))
+
+# 24. The jump is opt-in.
+check("jump-off-by-default", sb.DEFAULTS["jump"]["enabled"] is False and sb.JUMP_ENABLED is False)
+check("enter-mode-off", sb.enter_mode([{"id": "m1"}]) == (False, True))
+check("enter-mode-no-machines", sb.enter_mode([]) == (False, False))
+check("enter-mode-demo", sb.enter_mode([{"id": "m1"}], demo=True) == (False, False))
+sb.JUMP_ENABLED = True
+try:
+    check("enter-mode-on", sb.enter_mode([{"id": "m1"}]) == (True, False))
+finally:
+    sb.JUMP_ENABLED = False
+argv = sb.fzf_argv("fzf", "self", "/tmp/s.sock", remote_enter=True)
+check("enter-bound-when-off", "enter:transform(self --enter {1})" in argv, argv)
+check("enter-not-bound-by-default", not any(a.startswith("enter:") for a in sb.fzf_argv("fzf", "self", "/tmp/s.sock")))
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    (d / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
+    log = d / "log"
+    fh = executable(d / "herdr", '#!/bin/sh\necho "$*" >> "%(d)s/log"\ncase "$*" in\n'
+                                 '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                                 '  "--machine m2 "*) exit 1 ;;\n  *) exit 0 ;;\nesac\n' % {"d": d})
+    run_dir = d / "run"
+    run_dir.mkdir()
+
+    def run_enter(row, cfg_dir=None):
+        env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=str(run_dir))
+        if cfg_dir:
+            env["HERDR_PLUGIN_CONFIG_DIR"] = str(cfg_dir)
+        r = subprocess.run([sys.executable, str(TOOL), "--enter", row], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
+        return r.stdout.strip()
+
+    out = run_enter("m1|a|w1:p4|w1:t2")
+    check("enter-remote-footer", out.startswith("change-footer:") and "ready on box1" in out, out)
+    check("enter-remote-focuses-through-the-api", log.exists() and "--machine m1 agent focus w1:p4" in log.read_text(),
+          log.read_text() if log.exists() else "")
+    acks = (run_dir / "acks").read_text().splitlines() if (run_dir / "acks").exists() else []
+    check("enter-remote-acks-the-tab", acks == ['["m1", "w1:t2"]'], acks)
+    out = run_enter("m2|t|w1:p1|w1:t1")
+    check("enter-remote-focus-fails-quietly", out.startswith("change-footer:") and "could not focus" in out, out)
+    log.write_text("")
+    out = run_enter("|a|w1:p1|w1:t1")
+    check("enter-local-accepts", out == "accept" and "focus" not in log.read_text(), (out, log.read_text()))
+    check("enter-header-nothing", run_enter("-") == "")
+    cfg_on = d / "cfg-on"
+    cfg_on.mkdir()
+    (cfg_on / "config.toml").write_text("[jump]\nenabled = true\n")
+    check("enter-remote-accepts-with-jump-on", run_enter("m1|a|w1:p4|w1:t2", cfg_on) == "accept")
+
+    # The popup applies what --enter acknowledged: the done row turns idle.
+    sb.STATE_DIR = str(d / "state")
+    m1 = [{"id": "m1", "label": "box1"}]
+    vivid = {"local": snap17(T1, ag17("p1", "working", 1, T1)), "m1": snap17(T1, ag17("p9", "working", 1, T1))}
+    lv = sb.Live(m1, sb.entries_from(vivid["local"], "", "here", 0), fetch=lambda m="", t=None, i=None: vivid[m or "local"],
+                 focus=T1)
+    lv.refresh_remote(0, m1[0])
+    vivid["m1"] = snap17(T1, ag17("p9", "idle", 2, T1, 2))
+    lv.refresh_remote(0, m1[0])
+    check("acks-before", "● done" in lv.text())
+    ack_file = d / "acks-live"
+    ack_file.write_text(json.dumps(["m1", T1]) + "\nnot json\n")
+    check("acks-consumed", lv.consume_acks(str(ack_file)) is True and not ack_file.exists())
+    check("acks-clear-done", "● done" not in lv.text(), lv.text())
+    check("acks-missing-file-is-fine", lv.consume_acks(str(ack_file)) is False)
+
+    # And while the popup is open, the watch loop applies them and reloads fzf.
+    vivid["m1"] = snap17(T1, ag17("p9", "working", 3, T1))
+    lv.refresh_remote(0, m1[0])
+    vivid["m1"] = snap17(T1, ag17("p9", "idle", 4, T1, 4))
+    lv.refresh_remote(0, m1[0])
+    lv.changed()  # the loops re-read the same data from here on: only the ack can change the rows
+    check("acks-watch-before", "● done" in lv.text())
+    sock = os.path.join(str(d), "w.sock")
+    fz = FakeFzf(sock, position=0)
+    stop = _threading.Event()
+    _threading.Thread(target=sb.watch, args=(lv, sock, str(d / "rows"), stop, str(ack_file)), daemon=True).start()
+    _time.sleep(0.3)
+    ack_file.write_text(json.dumps(["m1", T1]) + "\n")
+    _time.sleep(0.5)
+    stop.set()
+    check("acks-watch-applies-and-reloads", not ack_file.exists() and "● done" not in lv.text()
+          and any(b"reload-sync" in r for r in fz.reqs), (ack_file.exists(), lv.text()[:300]))
+    sb.STATE_DIR = STATE
+
+check("client-from-config", sb.find_client(configured="mac9") == ("ssh", "mac9"))
+check("client-local-from-config", sb.find_client(configured="local") == ("local", None))
+saved_ts = sb.TAILSCALE
+sb.TAILSCALE = ("/nonexistent/tailscale",)
+try:
+    check("no-tailscale-no-hosts", sb.tailnet_hosts() == {})
+    check("no-tailscale-asks-over-ssh", sb.find_client([(1, "addr-1")], None, "", platform="linux", configured="",
+                                                       is_mac=lambda h: h == "addr-1") == ("ssh", "addr-1"))
+    check("no-tailscale-not-a-mac", sb.find_client([(1, "addr-1")], None, "", platform="linux", configured="",
+                                                   is_mac=lambda h: False) is None)
+finally:
+    sb.TAILSCALE = saved_ts
+check("plugin-root-parsed", sb.plugin_root_from(json.dumps({"result": {"plugins": [
+    {"plugin_id": "other.plugin", "plugin_root": "/opt/other"},
+    {"plugin_id": "trustxai.switchboard", "plugin_root": "/opt/plugins/sb"}]}})) == "/opt/plugins/sb")
+check("plugin-root-absent", sb.plugin_root_from('{"result": {"plugins": []}}') is None and sb.plugin_root_from("") is None)
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    listing = json.dumps({"result": {"plugins": [{"plugin_id": "trustxai.switchboard", "plugin_root": "/opt/p/sb dir"}]}})
+    fs_ok = executable(d / "ssh-ok", "#!/bin/sh\necho '%s'\n" % listing)
+    fs_none = executable(d / "ssh-none", "#!/bin/sh\nexit 255\n")
+    saved_ssh, saved_helper = sb.SSH, sb.JUMP_HELPER
+    try:
+        sb.SSH = str(fs_ok)
+        check("helper-discovered", sb.resolve_helper("mac1") == "python3 '/opt/p/sb dir/bin/switchboard'",
+              sb.resolve_helper("mac1"))
+        sb.JUMP_HELPER = "python3 /srv/sb/bin/switchboard"
+        check("helper-from-config", sb.resolve_helper("mac1") == "python3 /srv/sb/bin/switchboard")
+        sb.JUMP_HELPER = ""
+        sb.SSH = str(fs_none)
+        check("helper-unknown", sb.resolve_helper("mac1") is None)
+        spawned = []
+        orig_popen = sb.subprocess.Popen
+        sb.subprocess.Popen = lambda argv, **kw: spawned.append(argv) or orig_popen(argv, **kw)
+        try:
+            link = sb.JumpLink(find=lambda: ("ssh", "mac1")).start()
+            sent = link.send(["--jump"] * 8, timeout=5)
+            launched = sb.launch_jump(["--jump"] * 8, ("ssh", "mac1"))
+        finally:
+            sb.subprocess.Popen = orig_popen
+        jumps = [a for a in spawned if "--jump" in a[-1]]
+        lookups = [a for a in spawned if a[-1].endswith("plugin list --json")]
+        check("link-without-helper-does-not-connect", sent is False and not jumps and lookups, spawned)
+        check("launch-without-helper-falls-back", launched is False and not jumps, spawned)
+    finally:
+        sb.SSH, sb.JUMP_HELPER = saved_ssh, saved_helper
+check("no-fixed-helper-path", "REMOTE_SELF" not in SOURCE and "~/.local/bin/switchboard" not in SOURCE
+      and "~/.local/bin/herdr" not in SOURCE)
 
 
 if FAILS:
