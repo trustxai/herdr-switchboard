@@ -1676,7 +1676,9 @@ with tempfile.TemporaryDirectory() as d:
             check("config-bad-value-warns %r (tomllib=%s)" % (text[:40], use), bool(warn) and "\n" not in warn, warn)
             # The built-in parser rejects arrays as a whole; tomllib reads them and the key is refused.
             if use or "[" not in text.split("=")[-1]:
-                check("config-warning-names-the-key %r (tomllib=%s)" % (text[:40], use), key in (warn or ""), warn)
+                # Only after the path: the path itself could contain a short key by chance.
+                after_path = (warn or "").split(str(path), 1)[-1]
+                check("config-warning-names-the-key %r (tomllib=%s)" % (text[:40], use), key in after_path, warn)
         env = dict(os.environ, HERDR_PLUGIN_CONFIG_DIR=str(d / ("dir%d" % i)))
         os.makedirs(env["HERDR_PLUGIN_CONFIG_DIR"])
         (pathlib.Path(env["HERDR_PLUGIN_CONFIG_DIR"]) / "config.toml").write_bytes(text.encode())
@@ -2122,8 +2124,9 @@ check("focused-tab-only-a-string", sb.focused_tab({"focused_tab_id": "w1:t1"}) =
       and sb.focused_tab({"focused_tab_id": 3}) is None and sb.focused_tab([]) is None)
 
 # The two refresh paths take any value from fetch without raising, and a bad value is no answer.
-good_local = snap([pane("w1:p1")], [agent("w1:p1", "working", 1, title="here-ok")])
-good_remote = snap([pane("w1:p2")], [agent("w1:p2", "idle", 1, title="there-ok")])
+# Neither title may contain the other, or one half of the check could never fail.
+good_local = snap([pane("w1:p1")], [agent("w1:p1", "working", 1, title="alpha-local")])
+good_remote = snap([pane("w1:p2")], [agent("w1:p2", "idle", 1, title="omega-remote")])
 feed = {"local": good_local, "m1": good_remote}
 
 
@@ -2142,7 +2145,7 @@ for bad in ([], "x", None, 7, b"x", TypeError("odd"), KeyError("odd")):
         lv.refresh_local()
         lv.refresh_remote(0, {"id": "m1", "label": "box1"})
         text = lv.text()
-        check("refresh-bad-value-keeps-last-rows %r" % (bad,), "here-ok" in text and "there-ok" in text, text)
+        check("refresh-bad-value-keeps-last-rows %r" % (bad,), "alpha-local" in text and "omega-remote" in text, text)
     except Exception as exc:
         check("refresh-never-raises %r" % (bad,), False, repr(exc))
 lv2 = sb.Live([{"id": "m1", "label": "box1"}], [], fetch=lambda m="", t=None, i=None: [], cache=False)
