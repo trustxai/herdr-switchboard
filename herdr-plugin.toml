@@ -1,0 +1,40 @@
+# Switchboard: every herdr agent, on every saved machine, in one popup ordered by priority.
+#
+# The pane runs bin/switchboard (Python 3.9+, standard library only) on top of fzf 0.71+.
+# The `open` action opens that pane; bind it to a key in herdr's config.toml:
+#
+#   [[keys.command]]
+#   key = "prefix+space"
+#   type = "plugin_action"
+#   command = "trustxai.switchboard.open"
+#   description = "switchboard"
+#
+# The key runs on the server of the machine the window is showing, so install the plugin on
+# every machine you open it from. Listing the agents of other saved machines needs nothing
+# installed on them.
+
+id = "trustxai.switchboard"
+name = "Switchboard"
+version = "0.1.0"
+min_herdr_version = "0.9.5"
+description = "Every agent on every saved machine in one popup, ordered by priority, with live preview."
+platforms = ["linux", "macos"]
+
+# A session-modal popup over the current layout. Commands are argv arrays run without a
+# shell, so the program path is built from HERDR_PLUGIN_ROOT inside `sh -c`: it works
+# whatever the working directory and whether or not the file kept its executable bit.
+[[panes]]
+id = "switchboard"
+title = "Switchboard"
+platforms = ["linux", "macos"]
+placement = "popup"
+width = "96%"
+height = "85%"
+command = ["sh", "-c", "exec python3 \"${HERDR_PLUGIN_ROOT:-.}/bin/switchboard\""]
+
+[[actions]]
+id = "open"
+title = "Open Switchboard"
+description = "Open the Switchboard popup."
+platforms = ["linux", "macos"]
+command = ["sh", "-c", "exec \"${HERDR_BIN_PATH:-herdr}\" plugin pane open --plugin \"${HERDR_PLUGIN_ID:-trustxai.switchboard}\" --entrypoint switchboard"]

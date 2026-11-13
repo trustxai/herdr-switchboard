@@ -78,6 +78,8 @@ What it has to get right, and how it fails otherwise:
 24. The jump is opt-in: off by default, Enter on a remote row then focuses it through the
    API and keeps the popup open with a footer; the client, Tailscale and the helper are
    optional, and anything missing falls back without an error.
+25. The manifest: the declared contract, and its pane and action commands actually work.
+
     python3 tests/test_switchboard.py
 """
 import ast
@@ -1440,6 +1442,71 @@ with tempfile.TemporaryDirectory() as d:
 check("no-fixed-helper-path", "REMOTE_SELF" not in SOURCE and "~/.local/bin/switchboard" not in SOURCE
       and "~/.local/bin/herdr" not in SOURCE)
 
+# 25. The manifest, and the program file itself.
+MANIFEST = (ROOT / "herdr-plugin.toml").read_text()
+if HAVE_TOMLLIB:
+    man = sb.tomllib.loads(MANIFEST)
+    check("manifest-metadata", man.get("id") == "trustxai.switchboard" and man.get("name")
+          and man.get("version") == "0.1.0" and man.get("min_herdr_version") == "0.9.5"
+          and man.get("platforms") == ["linux", "macos"] and man.get("description"), man)
+    panes = man.get("panes") or []
+    actions = man.get("actions") or []
+    check("manifest-one-popup-pane", len(panes) == 1 and panes[0].get("placement") == "popup"
+          and str(panes[0].get("width", "")).endswith("%") and str(panes[0].get("height", "")).endswith("%"), panes)
+    check("manifest-open-action", [a.get("id") for a in actions] == ["open"], actions)
+    with tempfile.TemporaryDirectory() as d:
+        log = os.path.join(d, "log")
+        fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\necho "$*" > "%s"\n' % log)
+        env = dict(os.environ, HERDR_BIN_PATH=str(fh), HERDR_PLUGIN_ID="trustxai.switchboard")
+        subprocess.run(actions[0]["command"], cwd=str(ROOT), env=env, stdin=subprocess.DEVNULL, timeout=20)
+        got = open(log).read().strip() if os.path.exists(log) else ""
+        check("manifest-action-opens-the-pane",
+              got == "plugin pane open --plugin trustxai.switchboard --entrypoint %s" % panes[0]["id"], got)
+        # The pane command reaches the program from any directory (here it stops at the fzf check).
+        # python3 is this interpreter: a version-manager shim on PATH would need the real HOME.
+        env = dict(os.environ, HERDR_PLUGIN_ROOT=str(ROOT), SWITCHBOARD_FZF="", HERDR_BIN_PATH="/bin/false",
+                   PATH=os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", ""))
+        r = subprocess.run(panes[0]["command"], cwd=d, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           universal_newlines=True, timeout=20)
+        check("manifest-pane-runs-the-program", r.returncode != 0 and "fzf" in r.stdout, r.stdout[-200:])
+else:
+    for line in ('id = "trustxai.switchboard"', 'version = "0.1.0"', 'min_herdr_version = "0.9.5"',
+                 'platforms = ["linux", "macos"]', 'placement = "popup"', 'id = "open"', "[[panes]]", "[[actions]]"):
+        check("manifest-has %s" % line, line in MANIFEST)
+check("program-executable", os.access(str(TOOL), os.X_OK) and SOURCE.startswith("#!/usr/bin/env python3\n"))
+std = set(getattr(sys, "stdlib_module_names", ())) or {
+    "base64", "copy", "glob", "json", "os", "re", "select", "shlex", "shutil", "socket", "subprocess", "sys",
+    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty"}
+imported = set()
+for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+        imported |= set(a.name.split(".")[0] for a in node.names)
+    elif isinstance(node, ast.ImportFrom):
+        imported.add((node.module or "").split(".")[0])
+check("program-stdlib-only", imported <= std, sorted(imported - std))
+try:
+    ast.parse(SOURCE, feature_version=(3, 9))
+except SyntaxError as exc:
+    check("program-python-3.9-syntax", False, exc)
+# Nothing personal in what ships: no addresses, no e-mail, no home directory of a person.
+leaks = []
+for path in [TOOL, ROOT / "herdr-plugin.toml", ROOT / "config.example.toml", pathlib.Path(__file__)] + \
+        sorted((ROOT / "demo").rglob("*")):
+    if not path.is_file():
+        continue
+    text = path.read_text()
+    for pat in (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", r"[\w.+-]+@[\w-]+\.[A-Za-z]{2,}", r"\b[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){5,7}\b"):
+        leaks += ["%s: %s" % (path.name, m) for m in re.findall(pat, text)]
+    for user in re.findall(r"/(?:home|Users)/([A-Za-z0-9._-]+)", text):
+        if user not in ("linuxbrew", "someone", "x"):
+            leaks.append("%s: home of %s" % (path.name, user))
+check("nothing-personal", not leaks, leaks)
+demo_text = (ROOT / "demo" / "fixtures.json").read_text()
+names = set(re.findall(r'"(?:local|label|machine)": "([^"]+)"', demo_text))
+check("demo-only-generic-machine-names", names <= {"laptop", "workstation", "server", "api", "web", "infra", "docs",
+                                                   "checkout", "e2e", "guides", "release", "auth", "rate-limit",
+                                                   "orders", "cache", "landing", "k8s", "terraform", "monitoring",
+                                                   "logs", "load-test", "db", "2", "4"}, names)
 
 if FAILS:
     print("FAIL %d:\n  " % len(FAILS) + "\n  ".join(str(f) for f in FAILS))
