@@ -19,6 +19,6 @@ trim_trailing_whitespace = false
 indent_style = tab
 
 [LICENSE]
-# The verbatim Apache License 2.0 text: never reformat it.
+# The verbatim Apache License 2.0 text: never reformat it. It has no trailing
+# whitespace and ends with a newline, so the [*] newline rule already fits it.
 trim_trailing_whitespace = false
-insert_final_newline = false

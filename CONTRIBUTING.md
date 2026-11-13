@@ -80,8 +80,30 @@ issue reports: describe your setup with those names, not your own.
 
 ## Releases
 
-Versioning is manual. A release bumps `version` in `herdr-plugin.toml`, moves the `Unreleased`
-entries of `CHANGELOG.md` under the new version with its date, and is tagged `vX.Y.Z` on `main`.
+Versioning is manual and nothing runs on a tag: no workflow builds or publishes anything. A
+release of version `X.Y.Z` is these steps, in this order:
+
+1. Open a pull request against `main` that:
+   - sets `version = "X.Y.Z"` in `herdr-plugin.toml`;
+   - in `CHANGELOG.md`, renames `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, dated the day
+     you will tag, and adds a new, empty `## [Unreleased]` above it;
+   - updates the links at the bottom of `CHANGELOG.md`: `[Unreleased]` compares
+     `vX.Y.Z...HEAD`, and a new `[X.Y.Z]` line points to `releases/tag/vX.Y.Z`.
+2. Merge it and wait for CI on `main` to pass.
+3. Tag that merge commit and push the tag:
+
+   ```sh
+   git switch main && git pull --ff-only
+   git tag -a vX.Y.Z -m "vX.Y.Z"
+   git push origin vX.Y.Z
+   ```
+
+4. Create the GitHub release from the tag (`gh release create vX.Y.Z --verify-tag --title vX.Y.Z`)
+   and paste that version's `CHANGELOG.md` section as its notes.
+
+The first release is the exception to step 1: `herdr-plugin.toml` already says `0.1.0` and its
+`CHANGELOG.md` entry is already written, so its pull request only changes the date of
+`## [0.1.0]` to the day of the tag.
 
 The tools CI downloads are pinned by hand: fzf and gitleaks in
 `.github/scripts/install-pinned.sh` (version and SHA-256 of each archive), uv in
