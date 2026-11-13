@@ -878,12 +878,13 @@ def herdr_on(machine, args, timeout=None, info=None):
         session = info.get("session") or "default"
         remote = REMOTE_HERDR + ("" if session == "default" else " --session " + shlex.quote(session))
         remote += " " + " ".join(shlex.quote(a) for a in args)
+        argv = ssh_argv(target, remote)
         try:
-            r = subprocess.run([SSH] + SSH_OPTS + ssh_mux() + [target, remote], stdin=subprocess.DEVNULL,
-                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                               universal_newlines=True, timeout=timeout)
-            if r.returncode == 0 and r.stdout.strip():
-                return r.stdout
+            if argv:
+                r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, universal_newlines=True, timeout=timeout)
+                if r.returncode == 0 and r.stdout.strip():
+                    return r.stdout
         except (OSError, subprocess.SubprocessError):
             pass
     return herdr(["--machine", machine] + args, timeout)
@@ -1854,6 +1855,22 @@ def find_ssh_control_dir(env=None, tmp="/tmp"):
 _SSH_DIR = []  # the directory found once per process: [path or None]
 
 
+def valid_host(host):
+    """A destination ssh will not mistake for an option: no leading "-", no whitespace or
+    control characters. Detected destinations (a Tailscale host name, the address of an
+    incoming connection) and configured ones all pass through here."""
+    return isinstance(host, str) and bool(host) and not host.startswith("-") \
+        and re.search(r"[\s\x00-\x1f\x7f]", host) is None
+
+
+def ssh_argv(host, command, mux=True):
+    """The ssh command line for running `command` on `host`, or None when the destination
+    is not valid. "--" ends ssh's options, so the destination is never read as one."""
+    if not valid_host(host):
+        return None
+    return [SSH] + SSH_OPTS + (ssh_mux() if mux else []) + ["--", host, command]
+
+
 def ssh_mux():
     """Options that share one ssh connection per host (ControlMaster), or none at all when
     no safe directory for the control sockets exists."""
@@ -1923,7 +1940,8 @@ def tailnet_hosts():
 
 def answers_as_mac(host):
     """True when `host` takes a non-interactive ssh and runs macOS."""
-    return run_out([SSH] + SSH_OPTS + [host, "uname -s"], timeout=8).strip() == "Darwin"
+    argv = ssh_argv(host, "uname -s", mux=False)
+    return bool(argv) and run_out(argv, timeout=8).strip() == "Darwin"
 
 
 def local_tui_tty(ps_text=None):
@@ -1940,8 +1958,8 @@ def local_tui_tty(ps_text=None):
 
 def idle_seconds(host):
     """How long since the Mac was last touched (HIDIdleTime). host None is this machine."""
-    argv = ["ioreg", "-c", "IOHIDSystem"]
-    out = run_out(([SSH] + SSH_OPTS + [host, "ioreg -c IOHIDSystem"]) if host else argv, timeout=6)
+    argv = ssh_argv(host, "ioreg -c IOHIDSystem", mux=False) if host else ["ioreg", "-c", "IOHIDSystem"]
+    out = run_out(argv, timeout=6) if argv else ""
     m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
     return int(m.group(1)) / 1e9 if m else float("inf")
 
@@ -1957,7 +1975,9 @@ def find_client(bridges=None, hosts=None, local_tty=None, idle=idle_seconds, pla
     is the one you are typing on."""
     configured = JUMP_CLIENT if configured is None else configured
     if configured:
-        return ("local", None) if configured == "local" else ("ssh", configured)
+        if configured == "local":
+            return ("local", None)
+        return ("ssh", configured) if valid_host(configured) else None
     bridges = client_bridges() if bridges is None else bridges
     candidates = []
     if platform == "darwin" and (local_tty if local_tty is not None else local_tui_tty()):
@@ -1968,9 +1988,9 @@ def find_client(bridges=None, hosts=None, local_tty=None, idle=idle_seconds, pla
         for _, addr in bridges:
             if addr in hosts:
                 name, os_name = hosts[addr]
-                if name and os_name.lower() == "macos" and name not in candidates:
+                if valid_host(name) and os_name.lower() == "macos" and name not in candidates:
                     candidates.append(name)
-            elif addr not in candidates and is_mac(addr):
+            elif valid_host(addr) and addr not in candidates and is_mac(addr):
                 candidates.append(addr)
     if not candidates:
         return None
@@ -2005,8 +2025,8 @@ def resolve_helper(host):
     or linked the plugin. No location is assumed."""
     if JUMP_HELPER:
         return JUMP_HELPER
-    out = run_out([SSH] + SSH_OPTS + ssh_mux() + [host, REMOTE_HERDR + " plugin list --json"], timeout=10)
-    root = plugin_root_from(out)
+    argv = ssh_argv(host, REMOTE_HERDR + " plugin list --json")
+    root = plugin_root_from(run_out(argv, timeout=10)) if argv else None
     if not root:
         return None
     return "python3 " + shlex.quote(root.rstrip("/") + "/bin/switchboard")
@@ -2148,7 +2168,9 @@ class JumpLink:
                     helper = self.helper(self.client[1])
                     if not helper:
                         return  # nothing to run there: the API focus is all there is
-                    argv = [SSH] + SSH_OPTS + ssh_mux() + [self.client[1], helper + " --jump-server"]
+                    argv = ssh_argv(self.client[1], helper + " --jump-server")
+                    if not argv:
+                        return
                 self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                                              stderr=subprocess.DEVNULL, start_new_session=True)
         except Exception:
@@ -2185,7 +2207,9 @@ def launch_jump(args, client, helper=None):
         helper = helper or resolve_helper(client[1])
         if not helper:
             return False
-        argv = [SSH] + SSH_OPTS + ssh_mux() + [client[1], helper + " " + " ".join(shlex.quote(a) for a in args)]
+        argv = ssh_argv(client[1], helper + " " + " ".join(shlex.quote(a) for a in args))
+        if not argv:
+            return False
     subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
     return True

@@ -92,6 +92,8 @@ What it has to get right, and how it fails otherwise:
 29. Snapshot text is untrusted: a newline in a title cannot fabricate a row, escape sequences
    and control characters never reach fzf or the header, ids that could pass for options or
    break a row are dropped, wrong types do not crash, and the preview keeps colours only.
+30. Every ssh call puts "--" before the destination, and a destination that starts with "-"
+   or holds whitespace is refused wherever it comes from (config, Tailscale, a bridge address).
 
     python3 tests/test_switchboard.py
 """
@@ -1810,6 +1812,58 @@ try:
     check("jump-dash-label-as-is", ["--machine", "box1", "pane", "rename", "w1:p1", "-logs"] in calls, calls)
 finally:
     sb.run_out, sb.local_tui_tty, sb.time.sleep, sb.local_label = orig
+
+# 30. ssh destinations.
+argv = sb.ssh_argv("mac1", "uname -s", mux=False)
+check("ssh-double-dash-before-host", argv and argv[-3:] == ["--", "mac1", "uname -s"], argv)
+for bad in ("-oProxyCommand=touch /tmp/x", "-x", "", "mac 1", "mac1\n", "mac\x001", None, ["mac1"]):
+    check("ssh-destination-refused %r" % (bad,), sb.ssh_argv(bad, "cmd") is None and not sb.valid_host(bad))
+check("only-ssh-argv-builds-ssh-commands", SOURCE.count("[SSH]") == 1, SOURCE.count("[SSH]"))
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    log = d / "ssh-log"
+    fs = executable(d / "ssh", '#!/bin/sh\nprintf "%%s\\037" "$@" >> "%s"\nprintf "\\n" >> "%s"\n'
+                               'case "$*" in *"plugin list"*) echo \'{"result":{"plugins":[]}}\' ;; esac\nexit 0\n'
+                    % (log, log))
+    fh = executable(d / "herdr", '#!/bin/sh\necho "$*" >> "%s/herdr-log"\necho "{\\"result\\":{\\"snapshot\\":{}}}"\n' % d)
+    saved = (sb.SSH, sb.HERDR, sb.JUMP_HELPER)
+    sb.SSH, sb.HERDR, sb.JUMP_HELPER = str(fs), str(fh), ""
+    try:
+        sb.herdr_on("m1", ["api", "snapshot"], 5, {"id": "m1", "target": "mac1"})
+        sb.answers_as_mac("mac1")
+        sb.idle_seconds("mac1")
+        sb.resolve_helper("mac1")
+        link = sb.JumpLink(find=lambda: ("ssh", "mac1"), helper=lambda h: "sb-helper").start()
+        link.send(["--jump"] * 8)
+        link.proc.wait(5)
+        orig_popen = sb.subprocess.Popen
+        sb.subprocess.Popen = lambda argv, **kw: orig_popen(argv, **kw).wait() and None
+        try:
+            sb.launch_jump(["--jump"] * 8, ("ssh", "mac1"), helper="sb-helper")
+        finally:
+            sb.subprocess.Popen = orig_popen
+        calls = [l.rstrip("\x1f").split("\x1f") for l in log.read_text().splitlines() if l]
+        check("ssh-all-six-call-kinds-logged", len(calls) == 6, calls)
+        check("ssh-every-call-double-dash", calls and all(c[c.index("mac1") - 1] == "--" for c in calls), calls)
+        log.write_text("")
+        # Malicious destinations: never handed to ssh.
+        got = sb.herdr_on("m1", ["api", "snapshot"], 5, {"id": "m1", "target": "-oProxyCommand=touch x"})
+        check("ssh-dash-target-falls-back-to-machine", "--machine m1 api snapshot" in (d / "herdr-log").read_text(), got)
+        probed = []
+        check("ssh-dash-configured-client-refused", sb.find_client(configured="-oProxyCommand=x") is None)
+        check("ssh-dash-tailscale-name-refused", sb.find_client([(1, "addr-1")], {"addr-1": ("-evil", "macOS")}, "",
+                                                                platform="linux", configured="") is None)
+        check("ssh-dash-bridge-address-not-probed", sb.find_client([(1, "-addr")], {}, "", platform="linux", configured="",
+                                                                   is_mac=lambda h: probed.append(h) or True) is None
+              and not probed, probed)
+        check("ssh-dash-everywhere-refused", sb.answers_as_mac("-x") is False and sb.idle_seconds("-x") == float("inf")
+              and sb.resolve_helper("-x") is None
+              and sb.launch_jump(["--jump"] * 8, ("ssh", "-x"), helper="sb-helper") is False)
+        dash_link = sb.JumpLink(find=lambda: ("ssh", "-x"), helper=lambda h: "sb-helper").start()
+        check("ssh-dash-link-does-not-connect", dash_link.send(["--jump"] * 8, timeout=5) is False)
+        check("ssh-nothing-ran-for-bad-destinations", log.read_text() == "", log.read_text())
+    finally:
+        sb.SSH, sb.HERDR, sb.JUMP_HELPER = saved
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0] and sb._SSH_DIR[0].startswith(_tmp_root),
