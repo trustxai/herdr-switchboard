@@ -2230,16 +2230,26 @@ def viewer_alive_after(chunks, gap):
         import termios as _tm5
         _f5.ioctl(fd, _tm5.TIOCSWINSZ, _st5.pack("HHHH", 10, 40, 0, 0))
 
-        def drain(sec):
+        seen = [b""]
+
+        def drain(sec, until=None):
             end = _time.time() + sec
             while _time.time() < end:
                 r, _, _ = _sel.select([fd], [], [], 0.02)
                 if r:
                     try:
-                        os.read(fd, 65536)
+                        seen[0] += os.read(fd, 65536)
                     except OSError:
                         return
-        drain(1.0)
+                if until and until in seen[0]:
+                    return
+        # Keys only after the viewer's first frame: it switches the terminal to raw mode just
+        # before drawing it, and raw mode (TCSAFLUSH) throws away anything typed earlier.
+        drain(15.0, until=b"\x1b[?1049h")
+        if b"\x1b[?1049h" not in seen[0]:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+            return None
         for i, chunk in enumerate(chunks):
             if i:
                 _time.sleep(gap)
@@ -2257,8 +2267,8 @@ def viewer_alive_after(chunks, gap):
         return alive
 
 
-check("viewer-split-arrow-keeps-it-open", viewer_alive_after([b"\x1b", b"[A"], 0.02))
-check("viewer-lone-esc-closes-it", not viewer_alive_after([b"\x1b"], 0))
+check("viewer-split-arrow-keeps-it-open", viewer_alive_after([b"\x1b", b"[A"], 0.02) is True)
+check("viewer-lone-esc-closes-it", viewer_alive_after([b"\x1b"], 0) is False)
 
 # 35. The run directory: descriptors, not names.
 def private_tmp(base, name):
