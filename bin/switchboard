@@ -1436,51 +1436,43 @@ def record_ack(target, run_dir=None):
 def enter(row_id, run_dir=None):
     """fzf's Enter when the cross-machine jump is off (`--enter`, through transform).
 
-    A row of this machine is accepted as usual. For a row of another machine this only
-    prints fzf actions, at once: the footer says it is being focused, and a background
-    transform (`--focus`) does the slow part, so fzf never waits on the network. The tab
-    is recorded as seen right here, before fzf handles another key, so an Esc that follows
-    cannot lose it."""
+    A row of this machine is accepted as usual. For a row of another machine, everything
+    that must survive an Esc happens here, before fzf handles another key: the tab is
+    recorded as seen, and a worker that does the focus is started in its own session, so
+    neither fzf exiting nor the popup closing can stop it. Then it prints fzf actions at
+    once: a footer saying the pane is being focused, and a background transform
+    (`--focus-wait`) that shows the worker's result when it arrives. fzf never waits on the
+    network, and killing the waiter loses nothing."""
     target = parse_id(row_id)
     if target is None:
         return 0
     if not target["machine"] or JUMP_ENABLED:
         sys.stdout.write("accept\n")
         return 0
+    run_dir = run_dir or os.environ.get("SWITCHBOARD_RUN_DIR") or ""
     record_ack(target, run_dir)
-    label = machine_labels().get(target["machine"]) or target["machine"]
-    self_cmd = " ".join(shlex.quote(x) for x in (sys.executable, os.path.abspath(__file__)))
-    now = fzf_action("change-footer", tr("remote_focusing", label))
-    later = fzf_action("bg-transform-footer", "%s --focus %s" % (self_cmd, shlex.quote(row_id)))
-    sys.stdout.write("+".join(a for a in (now, later) if a) + "\n")
-    return 0
-
-
-def focus_remote(row_id):
-    """`--focus`, fzf's background transform: hand the focus to a worker in its own session
-    and print the footer text the worker returns.
-
-    fzf stops its background transforms when it exits, so an Esc right after Enter would
-    kill a focus done in this process. The worker is detached (its own session, stdin from
-    /dev/null): it finishes the focus even if this process and the popup are gone."""
-    target = parse_id(row_id)
-    if target is None or not target["machine"]:
-        return 0
+    result = os.path.join(run_dir, "focus-%d-%d" % (os.getpid(), int(time.time() * 1000))) if run_dir else ""
+    me = [sys.executable, os.path.abspath(__file__)]
     try:
-        worker = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--focus-now", row_id],
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                  universal_newlines=True, start_new_session=True)
-        out, _ = worker.communicate()
-    except (OSError, subprocess.SubprocessError):
-        out = ""
+        subprocess.Popen(me + ["--focus", row_id] + ([result] if result else []), stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        pass
     label = machine_labels().get(target["machine"]) or target["machine"]
-    sys.stdout.write((out.strip() or tr("remote_failed", label)) + "\n")
+    actions = [fzf_action("change-footer", tr("remote_focusing", label))]
+    if result:
+        self_cmd = " ".join(shlex.quote(x) for x in me)
+        actions.append(fzf_action("bg-transform-footer", "%s --focus-wait %s %s"
+                                  % (self_cmd, shlex.quote(result), shlex.quote(row_id))))
+    sys.stdout.write("+".join(a for a in actions if a) + "\n")
     return 0
 
 
-def focus_now(row_id):
-    """`--focus-now`, the detached worker: focus the row's pane (or tab) on its machine
-    through herdr's API, and print how it went."""
+def focus_remote(row_id, result=None):
+    """`--focus ROW [RESULT]`, the detached worker: focus the row's pane (or tab) on its
+    machine through herdr's API. The footer text that says how it went goes to the RESULT
+    file when one is given (written whole, then renamed into place), else to stdout. If the
+    popup is gone by then, the focus has happened all the same."""
     target = parse_id(row_id)
     if target is None or not target["machine"]:
         return 0
@@ -1491,11 +1483,37 @@ def focus_now(row_id):
     except Exception:
         ok = False
     label = machine_labels().get(target["machine"]) or target["machine"]
+    text = tr("remote_ready" if ok else "remote_failed", label) + "\n"
     try:
-        sys.stdout.write(tr("remote_ready" if ok else "remote_failed", label) + "\n")
-        sys.stdout.flush()
-    except (BrokenPipeError, OSError):  # the popup is gone; the focus is done all the same
+        if result:
+            with open(result + ".tmp", "w") as f:
+                f.write(text)
+            os.replace(result + ".tmp", result)
+        else:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+    except OSError:  # the popup and its directory are gone
         pass
+    return 0
+
+
+def focus_wait(result, row_id):
+    """`--focus-wait RESULT ROW`, fzf's background transform: wait for the worker's result
+    and print it as the new footer. It gives up a little after the remote timeout."""
+    target = parse_id(row_id)
+    label = (machine_labels().get(target["machine"]) or target["machine"]) if target else ""
+    deadline = time.time() + REMOTE_TIMEOUT + 3
+    while time.time() < deadline:
+        try:
+            with open(result) as f:
+                text = f.read().strip()
+            if text:
+                sys.stdout.write(text + "\n")
+                return 0
+        except OSError:
+            pass
+        time.sleep(0.05)
+    sys.stdout.write(tr("remote_failed", label) + "\n")
     return 0
 
 
@@ -2600,9 +2618,9 @@ def main(argv):
         if argv[:1] == ["--enter"]:
             return enter(argv[1] if len(argv) > 1 else "")
         if argv[:1] == ["--focus"]:
-            return focus_remote(argv[1] if len(argv) > 1 else "")
-        if argv[:1] == ["--focus-now"]:
-            return focus_now(argv[1] if len(argv) > 1 else "")
+            return focus_remote(argv[1] if len(argv) > 1 else "", argv[2] if len(argv) > 2 else None)
+        if argv[:1] == ["--focus-wait"] and len(argv) == 3:
+            return focus_wait(argv[1], argv[2])
         if argv[:1] == ["--jump-server"]:
             return jump_server()
         if argv[:1] == ["--jump"] and len(argv) == 8:

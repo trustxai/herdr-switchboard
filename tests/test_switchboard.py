@@ -1361,32 +1361,51 @@ with tempfile.TemporaryDirectory() as d:
     log = d / "log"
     fh = executable(d / "herdr", '#!/bin/sh\necho "$*" >> "%(d)s/log"\ncase "$*" in\n'
                                  '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
-                                 '  "--machine m2 "*) exit 1 ;;\n  *) exit 0 ;;\nesac\n' % {"d": d})
+                                 '  "--machine m2 "*) exit 1 ;;\n'
+                                 '  "--machine m1 agent focus"*) sleep 1.5 ;;\n  *) exit 0 ;;\nesac\n' % {"d": d})
     run_dir = d / "run"
     run_dir.mkdir()
 
-    def run_mode(mode, row, cfg_dir=None):
+    def run_mode(mode, *args, **kw):
         env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=str(run_dir),
-                   SWITCHBOARD_LABELS=json.dumps({"m1": "box1", "m2": "box2"}))
-        if cfg_dir:
-            env["HERDR_PLUGIN_CONFIG_DIR"] = str(cfg_dir)
-        r = subprocess.run([sys.executable, str(TOOL), mode, row], stdin=subprocess.DEVNULL,
+                   SWITCHBOARD_LABELS=json.dumps({"m1": "box1", "m2": "box2"}),
+                   SWITCHBOARD_REMOTE_TIMEOUT=kw.get("timeout", "8"))
+        if kw.get("cfg_dir"):
+            env["HERDR_PLUGIN_CONFIG_DIR"] = str(kw["cfg_dir"])
+        r = subprocess.run([sys.executable, str(TOOL), mode] + list(args), stdin=subprocess.DEVNULL,
                            stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
         return r.stdout.strip()
 
-    # Enter only prints fzf actions, at once: a footer now, the focus in the background.
+    def wait_for(path, seconds=6.0):
+        end = _time.time() + seconds
+        while _time.time() < end:
+            if os.path.exists(path) and open(path).read().strip():
+                return open(path).read().strip()
+            _time.sleep(0.05)
+        return None
+
+    # Enter returns at once although the focus takes 1.5 s: it records the ack, starts a
+    # detached worker and prints a footer now plus a background wait for the result.
+    t0 = _time.time()
     out = run_mode("--enter", "m1|a|w1:p4|w1:t2")
+    took = _time.time() - t0
+    check("enter-remote-returns-at-once", took < 1.2, took)
     check("enter-remote-footer-now", out.startswith("change-footer(focusing it on box1…)+bg-transform-footer"), out)
-    check("enter-remote-focus-in-background", "--focus 'm1|a|w1:p4|w1:t2'" in out and out.endswith(")"), out)
-    check("enter-remote-calls-no-herdr", not log.exists() or log.read_text() == "", log.read_text() if log.exists() else "")
+    m = re.search(r"--focus-wait (\S+) 'm1\|a\|w1:p4\|w1:t2'\)$", out)
+    check("enter-remote-waits-in-background", m is not None, out)
     acks = (run_dir / "acks").read_text().splitlines() if (run_dir / "acks").exists() else []
     check("enter-remote-acks-the-tab-at-once", acks == ['["m1", "w1:t2"]'], acks)
-    out = run_mode("--focus", "m1|a|w1:p4|w1:t2")
-    check("focus-remote-footer", out == "ready on box1: switch to that machine to see it · esc closes", out)
-    check("focus-remote-through-the-api", log.exists() and "--machine m1 agent focus w1:p4" in log.read_text(),
+    result = m.group(1) if m else ""
+    check("enter-remote-result-in-the-run-dir", result.startswith(str(run_dir) + os.sep), result)
+    got = wait_for(result) if result else None
+    check("enter-worker-delivers-the-result", got == "ready on box1: switch to that machine to see it · esc closes", got)
+    check("enter-worker-focused-through-the-api", log.exists() and "--machine m1 agent focus w1:p4" in log.read_text(),
           log.read_text() if log.exists() else "")
+    check("focus-wait-shows-the-result", result and run_mode("--focus-wait", result, "m1|a|w1:p4|w1:t2") == got)
+    check("focus-wait-gives-up", "could not focus it on box2" in run_mode("--focus-wait", str(run_dir / "never"),
+                                                                       "m2|t|w1:p1|w1:t1", timeout="1"))
     acks = (run_dir / "acks").read_text().splitlines() if (run_dir / "acks").exists() else []
-    check("focus-remote-does-not-ack-again", acks == ['["m1", "w1:t2"]'], acks)
+    check("worker-does-not-ack-again", acks == ['["m1", "w1:t2"]'], acks)
     out = run_mode("--focus", "m2|t|w1:p1|w1:t1")
     check("focus-remote-fails-quietly", "could not focus it on box2" in out, out)
     log.write_text("")
@@ -1397,7 +1416,7 @@ with tempfile.TemporaryDirectory() as d:
     cfg_on = d / "cfg-on"
     cfg_on.mkdir()
     (cfg_on / "config.toml").write_text("[jump]\nenabled = true\n")
-    check("enter-remote-accepts-with-jump-on", run_mode("--enter", "m1|a|w1:p4|w1:t2", cfg_on) == "accept")
+    check("enter-remote-accepts-with-jump-on", run_mode("--enter", "m1|a|w1:p4|w1:t2", cfg_dir=cfg_on) == "accept")
 
     # The popup applies what --enter acknowledged: the done row turns idle.
     sb.STATE_DIR = str(d / "state")
