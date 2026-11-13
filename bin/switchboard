@@ -28,6 +28,7 @@ import select
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -1691,16 +1692,62 @@ OSASCRIPT = os.environ.get("SWITCHBOARD_OSASCRIPT", "osascript")
 SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
 
 
-def ssh_mux():
-    """Options that reuse one ssh connection per host. The control sockets live in a
-    private directory under /tmp: a unix socket path is limited to about 104 bytes on
-    macOS, which rules out the long per-user temporary directory there."""
-    d = "/tmp/switchboard-%d" % os.getuid()
+# ssh appends "/ssh-" and a 40-character hash to the directory, and a unix socket path is
+# limited to 104 bytes on macOS. That rules out macOS's long per-user temporary directory.
+SOCKET_DIR_MAX = 58
+
+
+def private_dir(path):
+    """Create `path` (mode 0700) when missing, and say whether it is safe to hold ssh control
+    sockets: a real directory, not a symlink, owned by this user, with no access for group
+    or others. A directory someone else created first at the same path fails, so nobody
+    can plant a control socket for this user's connections."""
     try:
-        os.makedirs(d, mode=0o700, exist_ok=True)
-    except OSError:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
         pass
-    return ["-o", "ControlMaster=auto", "-o", "ControlPath=%s/ssh-%%C" % d, "-o", "ControlPersist=600"]
+    except OSError:
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
+
+
+def find_ssh_control_dir(env=None, tmp="/tmp"):
+    """The directory for ssh control sockets, or None (then connections are not shared).
+
+    $XDG_RUNTIME_DIR/switchboard first, when that runtime directory belongs to this user and
+    nobody else can write to it; then /tmp/switchboard-<uid>. Each is checked before use."""
+    env = os.environ if env is None else env
+    candidates = []
+    runtime = env.get("XDG_RUNTIME_DIR") or ""
+    if os.path.isabs(runtime):
+        try:
+            st = os.lstat(runtime)
+            if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022:
+                candidates.append(os.path.join(runtime, "switchboard"))
+        except OSError:
+            pass
+    candidates.append(os.path.join(tmp, "switchboard-%d" % os.getuid()))
+    for d in candidates:
+        if len(d) <= SOCKET_DIR_MAX and private_dir(d):
+            return d
+    return None
+
+
+_SSH_DIR = []  # the directory found once per process: [path or None]
+
+
+def ssh_mux():
+    """Options that share one ssh connection per host (ControlMaster), or none at all when
+    no safe directory for the control sockets exists."""
+    if not _SSH_DIR:
+        _SSH_DIR.append(find_ssh_control_dir())
+    if not _SSH_DIR[0]:
+        return []
+    return ["-o", "ControlMaster=auto", "-o", "ControlPath=%s/ssh-%%C" % _SSH_DIR[0], "-o", "ControlPersist=600"]
 
 
 def run_out(argv, timeout=5):

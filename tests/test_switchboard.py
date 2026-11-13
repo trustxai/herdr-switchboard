@@ -79,6 +79,9 @@ What it has to get right, and how it fails otherwise:
    API and keeps the popup open with a footer; the client, Tailscale and the helper are
    optional, and anything missing falls back without an error.
 25. The manifest: the declared contract, and its pane and action commands actually work.
+26. ssh control sockets go only in a directory that is provably this user's: a directory
+   someone else created first, a symlink, or one open to group or others is refused, and
+   with no safe directory connections are simply not shared.
 
     python3 tests/test_switchboard.py
 """
@@ -1476,7 +1479,7 @@ else:
 check("program-executable", os.access(str(TOOL), os.X_OK) and SOURCE.startswith("#!/usr/bin/env python3\n"))
 std = set(getattr(sys, "stdlib_module_names", ())) or {
     "base64", "copy", "glob", "json", "os", "re", "select", "shlex", "shutil", "socket", "subprocess", "sys",
-    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty"}
+    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty", "stat"}
 imported = set()
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):
@@ -1507,6 +1510,66 @@ check("demo-only-generic-machine-names", names <= {"laptop", "workstation", "ser
                                                    "checkout", "e2e", "guides", "release", "auth", "rate-limit",
                                                    "orders", "cache", "landing", "k8s", "terraform", "monitoring",
                                                    "logs", "load-test", "db", "2", "4"}, names)
+
+# 26. The ssh control sockets go only in a directory that is provably this user's.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    fresh = os.path.join(d, "fresh")
+    check("ctl-dir-created-private", sb.private_dir(fresh) and stat.S_IMODE(os.lstat(fresh).st_mode) == 0o700)
+    check("ctl-dir-reused", sb.private_dir(fresh))
+    loose = os.path.join(d, "loose")
+    os.mkdir(loose)
+    os.chmod(loose, 0o755)
+    check("ctl-dir-preexisting-open-mode-refused", sb.private_dir(loose) is False)
+    shared = os.path.join(d, "shared")
+    os.mkdir(shared)
+    os.chmod(shared, 0o770)
+    check("ctl-dir-group-access-refused", sb.private_dir(shared) is False)
+    target = os.path.join(d, "target")
+    os.mkdir(target, 0o700)
+    link = os.path.join(d, "link")
+    os.symlink(target, link)
+    check("ctl-dir-symlink-refused", sb.private_dir(link) is False)
+    afile = os.path.join(d, "file")
+    open(afile, "w").close()
+    check("ctl-dir-file-refused", sb.private_dir(afile) is False)
+    real_getuid = sb.os.getuid
+    sb.os.getuid = lambda: real_getuid() + 1
+    try:
+        check("ctl-dir-other-owner-refused", sb.private_dir(fresh) is False)
+    finally:
+        sb.os.getuid = real_getuid
+
+    # Where: the user's runtime directory first, then the shared temporary directory.
+    uid = os.getuid()
+    runtime = os.path.join(d, "run")
+    os.mkdir(runtime, 0o700)
+    tmp_ok = os.path.join(d, "t1")
+    os.mkdir(tmp_ok)
+    got = sb.find_ssh_control_dir({"XDG_RUNTIME_DIR": runtime}, tmp=tmp_ok)
+    check("ctl-dir-prefers-runtime", got == os.path.join(runtime, "switchboard"), got)
+    os.chmod(runtime, 0o777)
+    got = sb.find_ssh_control_dir({"XDG_RUNTIME_DIR": runtime}, tmp=tmp_ok)
+    check("ctl-dir-open-runtime-skipped", got == os.path.join(tmp_ok, "switchboard-%d" % uid), got)
+    got = sb.find_ssh_control_dir({"XDG_RUNTIME_DIR": os.path.join(d, "x" * 80)}, tmp=tmp_ok)
+    check("ctl-dir-too-long-skipped", got == os.path.join(tmp_ok, "switchboard-%d" % uid), got)
+    tmp_bad = os.path.join(d, "t2")
+    os.mkdir(tmp_bad)
+    os.mkdir(os.path.join(tmp_bad, "switchboard-%d" % uid), 0o755)
+    os.chmod(os.path.join(tmp_bad, "switchboard-%d" % uid), 0o755)
+    check("ctl-dir-planted-refused", sb.find_ssh_control_dir({}, tmp=tmp_bad) is None)
+    tmp_link = os.path.join(d, "t3")
+    os.mkdir(tmp_link)
+    os.symlink(target, os.path.join(tmp_link, "switchboard-%d" % uid))
+    check("ctl-dir-planted-symlink-refused", sb.find_ssh_control_dir({}, tmp=tmp_link) is None)
+    saved_dir = list(sb._SSH_DIR)
+    try:
+        sb._SSH_DIR[:] = [None]
+        check("no-safe-dir-no-sharing", sb.ssh_mux() == [])
+        sb._SSH_DIR[:] = [fresh]
+        mux = sb.ssh_mux()
+        check("safe-dir-shares", "ControlMaster=auto" in mux and "ControlPath=%s/ssh-%%C" % fresh in mux, mux)
+    finally:
+        sb._SSH_DIR[:] = saved_dir
 
 if FAILS:
     print("FAIL %d:\n  " % len(FAILS) + "\n  ".join(str(f) for f in FAILS))
