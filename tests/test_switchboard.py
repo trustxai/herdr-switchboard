@@ -63,6 +63,14 @@ What it has to get right, and how it fails otherwise:
    what the server turned from done to idle, and what finished outside the active tab and
    is already idle. An idle that closed no work never becomes done. The first time a
    machine is seen everything counts as seen, and so does a file from before the count.
+18. Config: the file location, the built-in TOML subset parser against tomllib, defaults
+   for a missing file, defaults plus one warning for a broken one, per-key type checks,
+   and config.example.toml documenting every option.
+19. State and binary: the snapshot cache and the recency ledger under
+   HERDR_PLUGIN_STATE_DIR or the XDG fallback; herdr from HERDR_BIN_PATH or PATH.
+20. Language: English by default, Spanish with lang = "es", one table with the same keys
+   and placeholders in both, and no literal text handed to print or input.
+21. Colours: the default uses the terminal's ANSI palette; the example theme still works.
     python3 tests/test_switchboard.py
 """
 import ast
@@ -953,6 +961,200 @@ with tempfile.TemporaryDirectory() as d:
     sb.STATE_DIR = STATE
 
 check("done-enter-acks", "live.recency.ack_tab(target[\"machine\"], target[\"tab\"], live.entries())" in SOURCE)
+
+# 18. Config.
+check("config-path-plugin-dir", sb.config_path({"HERDR_PLUGIN_CONFIG_DIR": "/x"}) == "/x/config.toml")
+check("config-path-xdg", sb.config_path({"XDG_CONFIG_HOME": "/y", "HOME": "/h"}) == "/y/herdr-switchboard/config.toml")
+check("config-path-home", sb.config_path({"HOME": "/h"}) == "/h/.config/herdr-switchboard/config.toml")
+
+SAMPLE = r'''
+# a comment
+lang = "es"   # trailing comment
+local_label = 'my box'
+
+[refresh]
+local_seconds = 2
+remote_seconds = 4.5
+remote_timeout = 1_0
+cache_max_age = 600
+
+[colors]
+accent = "#bd93f9"
+"selected_bg" = "blue"
+fzf = "info:8"
+
+[remote]
+herdr = "PATH=\"/opt/x/bin:$PATH\" herdr --flag \u00e9\t"
+
+[jump]
+enabled = true
+client = "mac1"
+helper = "python3 /opt/sb/bin/switchboard"
+'''
+WANT = {"lang": "es", "local_label": "my box",
+        "refresh": {"local_seconds": 2, "remote_seconds": 4.5, "remote_timeout": 10, "cache_max_age": 600},
+        "colors": {"accent": "#bd93f9", "selected_bg": "blue", "fzf": "info:8"},
+        "remote": {"herdr": 'PATH="/opt/x/bin:$PATH" herdr --flag \u00e9\t'},
+        "jump": {"enabled": True, "client": "mac1", "helper": "python3 /opt/sb/bin/switchboard"}}
+builtin = sb.toml_loads(SAMPLE, use_tomllib=False)
+check("parser-builtin-reads-the-sample", builtin == WANT, builtin)
+HAVE_TOMLLIB = sb.tomllib is not None
+if HAVE_TOMLLIB:
+    check("parser-matches-tomllib", sb.toml_loads(SAMPLE, use_tomllib=True) == builtin)
+else:
+    print("note: no tomllib on Python %d.%d; only the built-in parser was compared" % sys.version_info[:2])
+BROKEN = ['lang = "es', "a = 1\na = 2", "[x]\n[x]", "= 1", "a = ", "a = 1 2", 'a = "x\\q"',
+          "[x\nb = 1", "a = tru", "a = 01", 'a = "\x01"']
+for text in BROKEN:
+    for use in ([False, True] if HAVE_TOMLLIB else [False]):
+        try:
+            sb.toml_loads(text, use_tomllib=use)
+            check("parser-rejects %r (tomllib=%s)" % (text, use), False)
+        except ValueError:
+            pass
+for text in ("a = [1, 2]", "a = {b = 1}", '[[x]]\na = 1', 'a = """x"""', "a.b = 1"):
+    try:
+        sb.toml_loads(text, use_tomllib=False)
+        check("parser-builtin-rejects-unsupported %r" % text, False)
+    except ValueError:
+        pass
+
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    cfg, warn = sb.load_config(str(d / "missing.toml"))
+    check("config-missing-is-defaults", cfg == sb.DEFAULTS and warn is None, (cfg, warn))
+    (d / "sample.toml").write_text(SAMPLE)
+    for use in ([False, True] if HAVE_TOMLLIB else [False]):
+        cfg, warn = sb.load_config(str(d / "sample.toml"), use_tomllib=use)
+        check("config-sample-loads (tomllib=%s)" % use, warn is None and cfg["lang"] == "es"
+              and cfg["refresh"]["remote_timeout"] == 10.0 and cfg["jump"]["enabled"] is True
+              and cfg["colors"]["muted"] == "bright-black", (cfg, warn))
+    (d / "broken.toml").write_text('lang = "es\n[refresh\n')
+    for use in ([False, True] if HAVE_TOMLLIB else [False]):
+        cfg, warn = sb.load_config(str(d / "broken.toml"), use_tomllib=use)
+        check("config-broken-defaults-and-warning (tomllib=%s)" % use,
+              cfg == sb.DEFAULTS and warn and "broken.toml" in warn and "\n" not in warn, (cfg, warn))
+    (d / "types.toml").write_text('bogus = 1\n[refresh]\nlocal_seconds = "fast"\nremote_seconds = -1\n'
+                                  '[jump]\nenabled = "yes"\n[colors]\naccent = "red,blue"\n')
+    cfg, warn = sb.load_config(str(d / "types.toml"), use_tomllib=False)
+    check("config-bad-types-keep-defaults", cfg == sb.DEFAULTS, cfg)
+    check("config-bad-types-warn", warn and all(w in warn for w in ("bogus", "refresh.local_seconds",
+                                                                      "refresh.remote_seconds", "jump.enabled",
+                                                                      "colors.accent")), warn)
+    (d / "table.toml").write_text("refresh = 3\nlang = \"fr\"\n")
+    cfg, warn = sb.load_config(str(d / "table.toml"), use_tomllib=False)
+    check("config-not-a-table-and-bad-lang", cfg == sb.DEFAULTS and "[refresh]" in warn and "lang" in warn, warn)
+
+    # End to end: a broken config never stops the tool, and says so in the header.
+    cdir = d / "cfg"
+    cdir.mkdir()
+    (cdir / "config.toml").write_text("lang = \n")
+    env = dict(os.environ, HERDR_PLUGIN_CONFIG_DIR=str(cdir), HERDR_BIN_PATH="/bin/false")
+    r = subprocess.run([sys.executable, str(TOOL), "--demo", "--rows"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
+    head = r.stdout.splitlines()[0] if r.stdout else ""
+    check("config-broken-e2e", r.returncode == 0 and "config.toml" in head and "defaults in use" in head
+          and "18 agents" in head, (r.returncode, head, r.stderr[-300:]))
+
+# The example documents every option, with the defaults, and loads cleanly both ways.
+EXAMPLE = (ROOT / "config.example.toml").read_text()
+for use in ([False, True] if HAVE_TOMLLIB else [False]):
+    raw = sb.toml_loads(EXAMPLE, use_tomllib=use)
+    missing = [k for k, v in sb.DEFAULTS.items() if k not in raw] + \
+        ["%s.%s" % (k, s) for k, v in sb.DEFAULTS.items() if isinstance(v, dict)
+         for s in v if s not in raw.get(k, {})]
+    check("example-documents-every-option (tomllib=%s)" % use, not missing, missing)
+    cfg, problems = sb.merge_config(raw)
+    check("example-is-the-defaults (tomllib=%s)" % use, cfg == sb.DEFAULTS and not problems, (cfg, problems))
+
+# Environment overrides win over the file.
+os.environ["SWITCHBOARD_REMOTE_TIMEOUT"] = "2.5"
+sb.configure(sb.merge_config({"refresh": {"remote_timeout": 9}})[0])
+check("env-override-wins", sb.REMOTE_TIMEOUT == 2.5, sb.REMOTE_TIMEOUT)
+del os.environ["SWITCHBOARD_REMOTE_TIMEOUT"]
+sb.configure(sb.merge_config({"refresh": {"remote_timeout": 9}})[0])
+check("config-value-applies", sb.REMOTE_TIMEOUT == 9.0, sb.REMOTE_TIMEOUT)
+sb.configure(sb.load_config()[0])
+sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
+
+# 19. State and the herdr binary.
+check("state-plugin-dir", sb.state_dir({"HERDR_PLUGIN_STATE_DIR": "/s"}) == "/s")
+check("state-xdg", sb.state_dir({"XDG_STATE_HOME": "/x", "HOME": "/h"}) == "/x/herdr-switchboard")
+check("state-home", sb.state_dir({"HOME": "/h"}) == "/h/.local/state/herdr-switchboard")
+check("herdr-from-env", sb.find_herdr({"HERDR_BIN_PATH": "/opt/h/herdr", "PATH": "/usr/bin"}) == "/opt/h/herdr")
+with tempfile.TemporaryDirectory() as d:
+    h = executable(os.path.join(d, "herdr"), "#!/bin/sh\nexit 0\n")
+    check("herdr-from-path", sb.find_herdr({"PATH": d}) == str(h), sb.find_herdr({"PATH": d}))
+    check("herdr-fallback-name", sb.find_herdr({"PATH": os.path.join(d, "none")}) == "herdr")
+
+    # End to end: --rows writes the ledger under HERDR_PLUGIN_STATE_DIR, else under XDG.
+    snapfile = os.path.join(d, "snap.json")
+    with open(snapfile, "w") as f:
+        json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)])}}, f)
+    fh = executable(os.path.join(d, "fake-herdr"),
+                    '#!/bin/sh\ncase "$*" in\n  "api snapshot") cat "%s" ;;\n  "machine list --json") echo "[]" ;;\n'
+                    '  *) exit 2 ;;\nesac\n' % snapfile)
+    sdir, home_dir, xdg = os.path.join(d, "plugin-state"), os.path.join(d, "home"), os.path.join(d, "xdg")
+    env = dict(os.environ, HERDR_BIN_PATH=str(fh), HERDR_PLUGIN_STATE_DIR=sdir, HOME=home_dir)
+    subprocess.run([sys.executable, str(TOOL), "--rows"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   env=env, timeout=20)
+    check("state-in-plugin-dir", os.path.exists(os.path.join(sdir, "recency.json")) and not os.path.exists(home_dir))
+    env = dict(os.environ, HERDR_BIN_PATH=str(fh), XDG_STATE_HOME=xdg, HOME=home_dir)
+    del env["HERDR_PLUGIN_STATE_DIR"]
+    subprocess.run([sys.executable, str(TOOL), "--rows"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   env=env, timeout=20)
+    check("state-xdg-fallback", os.path.exists(os.path.join(xdg, "herdr-switchboard", "recency.json")))
+sb.STATE_DIR = STATE
+sb.save_cache("box1", {"x": 1})
+check("cache-under-state", os.path.exists(os.path.join(STATE, "snapshots", "box1.json")))
+
+# 20. Language.
+en, es = sb.STRINGS["en"], sb.STRINGS["es"]
+check("strings-same-keys", set(en) == set(es), sorted(set(en) ^ set(es)))
+ph = re.compile(r"%[sd]")
+bad_ph = [k for k in en if k in es and ph.findall(en[k]) != ph.findall(es[k])]
+check("strings-same-placeholders", not bad_ph, bad_ph)
+used = set(k for k in re.findall(r'\btr\(\s*"([a-z_]+)"', SOURCE) if not k.endswith("_")) | \
+    set("st_" + s for s in list(sb.PRIORITY) + ["shell"])
+check("strings-every-used-key-exists", used <= set(en), sorted(used - set(en)))
+check("default-language-english", sb.LANG == "en" and "agents" in sb.header([], [], [], []))
+e_es = sb.entries_from(snap([pane("a")], [agent("a", "blocked", 1)]), "m1", "box1", 1)
+sb.configure(sb.merge_config({"lang": "es"})[0])
+try:
+    h = sb.header(e_es, [], [], ["box2"])
+    check("spanish-header", "1 agentes" in h and "se actualiza solo" in h and "box2 sin conexión" in h, h)
+    check("spanish-offline-row", "sin conexión" in sb.down_row("box2"))
+    check("spanish-copy-text", sb.tr("copied", "x", 3).startswith("copiado"))
+finally:
+    sb.configure(sb.load_config()[0])
+    sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
+check("back-to-english", "1 agents" in sb.header(e_es, [], [], []))
+with tempfile.TemporaryDirectory() as d:
+    (pathlib.Path(d) / "config.toml").write_text('lang = "es"\n')
+    r = subprocess.run([sys.executable, str(TOOL), "--help"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       universal_newlines=True, env=dict(os.environ, HERDR_PLUGIN_CONFIG_DIR=d), timeout=20)
+    check("spanish-from-the-config-file", "todos los agentes" in r.stdout, r.stdout[:200])
+# No literal text handed to print() or input(): it all comes from the table.
+literal_out = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("print", "input") and node.args:
+        a0 = node.args[0]
+        if isinstance(a0, ast.Constant) and isinstance(a0.value, str) or isinstance(a0, ast.JoinedStr) \
+                or isinstance(a0, ast.BinOp) and isinstance(a0.left, ast.Constant):
+            literal_out.append(node.lineno)
+check("no-literal-text-to-the-user", not literal_out, literal_out)
+
+# 21. Colours.
+default_colors = sb.fzf_colors(sb.DEFAULTS["colors"])
+check("default-colors-ansi-only", "#" not in default_colors and "bg+:magenta" in default_colors, default_colors)
+theme = "[colors]\n" + "\n".join(l[2:] for l in EXAMPLE.splitlines()
+                                  if re.match(r"^# (accent|selected_fg|selected_bg|muted) = ", l))
+tcfg, tproblems = sb.merge_config(sb.toml_loads(theme, use_tomllib=False))
+check("example-theme-has-four-keys", theme.count(" = ") == 4, theme)
+themed = sb.fzf_colors(tcfg["colors"])
+check("example-theme-still-works", not tproblems and "bg+:#bd93f9" in themed and "fg+:#282a36:bold" in themed
+      and "border:#6272a4" in themed, (tproblems, themed))
+check("fzf-extra-appended", sb.fzf_colors(dict(sb.DEFAULTS["colors"], fzf="info:8")).endswith(",info:8"))
 
 
 if FAILS:
