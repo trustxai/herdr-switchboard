@@ -1,0 +1,961 @@
+#!/usr/bin/env python3
+"""Tests for bin/switchboard. Standard library only; prints "ok" or the failures.
+
+What it has to get right, and how it fails otherwise:
+
+1. The order is herdr's native agent panel with agent_panel_sort = "priority": blocked,
+   done, working, idle, unknown, and inside a status the most recent change first.
+   unknown never rises above idle, and a terminal without an agent never goes before an
+   agent.
+2. With the same status and no recorded changes, this machine goes before a remote one.
+   With recorded changes, block 16 decides.
+3. Enter on an agent is `agent focus`; on a terminal, `tab focus`. On another machine,
+   the same focus with `--machine` (never a remote id against the local server: pane ids
+   repeat across machines). The header and an offline machine do nothing.
+4. Paths: the local home and a remote one (/home/x, /Users/x, /root) become ~;
+   /homeless and /rootfs do not.
+5. Columns are machine > workspace > tab > pane, as in herdr's Goto: an unnamed tab ("1")
+   leaves the column empty unless the number was set by hand; the pane shows its name (from
+   `pane rename` or the agent) or else its agent's title (never the shell's "user@host:~");
+   in a split tab, with its number first.
+6. The machine is always shown; the agent kind only when it is not claude. The selected
+   row has a background.
+7. End to end with a fake herdr: a machine that does not answer in time shows as offline
+   and does not take the list down; a disabled machine is never asked.
+8. The preview loses the agent's input box and status bar, and nothing else: a table with
+   separators, an old box higher up or an indented text stay.
+9. Live: no change, no reload; a change makes fzf reload the rows already written. A remote
+   machine that stops answering keeps its last rows. With the cursor on the first row it
+   stays there; further down, track-current keeps it on the same agent. The GET to fzf has
+   no Content-Length (fzf rejects it even when 0).
+10. Copy: from the Claude Code transcript when the session is on this machine (without the
+   screen's line breaks); else the last "● …" block of the screen that is not a tool call;
+   else what is visible. Never the transcript for another machine. ctrl-t toggles between
+   only terminals and everything.
+11. Jump to another machine: the window is found through remote-client-bridge processes
+   (not the outgoing ssh the window itself opens) and only a Mac qualifies; with several,
+   the one touched last. The Goto query is the pane id only if no other row of any machine
+   contains it; otherwise a temporary name. The AppleScript only carries [a-z0-9:._-].
+   Order: rename, keys, restore the name, API focus.
+12. Select (ctrl-o): long lines wrap at the width without losing text, a column lands on
+   its character with wide characters, the text between two points is the same dragging
+   forward or back, and on release exactly that is copied over OSC 52 (in a pty, with a
+   real SGR 1006 drag).
+13. The fast jump: the connection to the window's Mac opens with the popup (ssh with
+   ControlMaster) and Enter sends one JSON line; on the other side --jump-server already has
+   the tty and an osascript running. No line (Esc, or a row of this machine) exits without
+   jumping. The query tries the title before renaming.
+14. No child reads the popup's terminal: every subprocess.run/Popen call states its stdin.
+15. Another machine, fast: herdr_on goes over ssh reusing the connection (with --session
+   when it is not the default) and falls back to `herdr --machine` when ssh fails or there
+   is no target. On open, the last snapshot of each machine shows at once with its age in
+   the header and is replaced when the fresh one arrives; a cache older than the limit is
+   not shown.
+16. Inside a status machines interleave: first the agent whose change was seen last,
+   whatever machine (like the native client), not all of one machine and then the other.
+   Re-reading without a seq change moves nothing, and the status still decides. The order
+   survives between openings; what changed while closed rises on open, interleaved across
+   machines. The cache is not a read, and an agent that left is removed only from its own
+   machine (pane ids repeat across machines).
+17. `done` is "finished and not seen", and the tool keeps that count itself. Stays done:
+   what finished in the active tab of another machine, or in the tab you were on and left.
+   Counts as seen: what is in front of you when the popup opens, what you pick with Enter,
+   what the server turned from done to idle, and what finished outside the active tab and
+   is already idle. An idle that closed no work never becomes done. The first time a
+   machine is seen everything counts as seen, and so does a file from before the count.
+    python3 tests/test_switchboard.py
+"""
+import ast
+import base64
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+TOOL = ROOT / "bin" / "switchboard"
+sys.dont_write_bytecode = True
+
+# Nothing of the user's leaks in: no config, no state, no overrides, no colours.
+_tmp_root = tempfile.mkdtemp(prefix="switchboard-test-")
+import atexit as _atexit
+_atexit.register(shutil.rmtree, _tmp_root, True)
+for _k in list(os.environ):
+    if _k.startswith("SWITCHBOARD_") or _k.startswith("HERDR_"):
+        del os.environ[_k]
+# HOME and the XDG directories too: even a regression that ignores the plugin directories
+# must not write into the real home.
+os.environ.update(NO_COLOR="1", PYTHONDONTWRITEBYTECODE="1",
+                  HOME=os.path.join(_tmp_root, "home"),
+                  XDG_CONFIG_HOME=os.path.join(_tmp_root, "xdg-config"),
+                  XDG_STATE_HOME=os.path.join(_tmp_root, "xdg-state"),
+                  HERDR_PLUGIN_CONFIG_DIR=os.path.join(_tmp_root, "config"),
+                  HERDR_PLUGIN_STATE_DIR=os.path.join(_tmp_root, "state"))
+os.makedirs(os.environ["HOME"])
+
+loader = importlib.machinery.SourceFileLoader("switchboard", str(TOOL))
+spec = importlib.util.spec_from_loader("switchboard", loader)
+sb = importlib.util.module_from_spec(spec)
+loader.exec_module(sb)
+STATE = os.environ["HERDR_PLUGIN_STATE_DIR"]
+SOURCE = TOOL.read_text()
+
+FAILS = []
+
+
+def check(name, cond, detail=""):
+    if not cond:
+        FAILS.append("%s %s" % (name, detail))
+
+
+def executable(path, text):
+    path = pathlib.Path(path)
+    path.write_text(text)
+    path.chmod(path.stat().st_mode | stat.S_IEXEC)
+    return path
+
+
+def snap(panes, agents, ws=None, tabs=None):
+    return {
+        "workspaces": ws or [{"workspace_id": "w1", "label": "Repo", "number": 1}],
+        "tabs": tabs or [{"tab_id": "w1:t1", "label": "1", "number": 1, "workspace_id": "w1"}],
+        "panes": panes,
+        "agents": agents,
+    }
+
+
+def pane(pid, tab="w1:t1", title="", cwd="/tmp"):
+    return {"pane_id": pid, "tab_id": tab, "workspace_id": "w1",
+            "terminal_title_stripped": title, "cwd": cwd}
+
+
+def agent(pid, status, seq, title="", tab="w1:t1"):
+    return dict(pane(pid, tab, title), agent="claude", agent_status=status, state_change_seq=seq)
+
+
+def order(entries):
+    return [e["pane"] for e in sorted(entries, key=sb.sort_key)]
+
+
+# 1. Priority.
+s = snap(
+    panes=[pane(p) for p in ("idle", "unk", "blk", "done", "wrk", "sh", "idle2")],
+    agents=[agent("idle", "idle", 10), agent("unk", "unknown", 99), agent("blk", "blocked", 1),
+            agent("done", "done", 5), agent("wrk", "working", 7), agent("idle2", "idle", 20)],
+)
+got = order(sb.entries_from(s))
+check("priority", got == ["blk", "done", "wrk", "idle2", "idle", "unk", "sh"], got)
+check("unknown-stays-below-idle", got.index("unk") > got.index("idle"), got)
+check("terminal-last", got[-1] == "sh", got)
+weird = sb.entries_from(snap([pane("x")], [agent("x", "strange", 1)]))
+check("unknown-status-is-unknown", weird[0]["status"] == "unknown", weird[0]["status"])
+
+# 2. No history: local before remote with the same status; a remote blocked still beats a
+# local done.
+local = sb.entries_from(snap([pane("L")], [agent("L", "done", 1)]))
+remote = sb.entries_from(snap([pane("R"), pane("RB")], [agent("R", "done", 999), agent("RB", "blocked", 1)]),
+                         "m1", "box1", 1)
+got = order(local + remote)
+check("no-history-local-first", got == ["RB", "L", "R"], got)
+term = sb.entries_from(snap([pane("T")], []))
+runk = sb.entries_from(snap([pane("RU")], [agent("RU", "unknown", 0)]), "m1", "box1", 1)
+got = order(term + runk)
+check("local-terminal-after-remote-agent", got == ["RU", "T"], got)
+
+# 3. Actions.
+labels = {"m1": "box1"}
+check("enter-agent", sb.action_for(sb.make_id("", "a", "w1:p2", "w1:t1"), labels) == ["agent", "focus", "w1:p2"])
+check("enter-terminal", sb.action_for(sb.make_id("", "t", "w1:p3", "w1:t4"), labels) == ["tab", "focus", "w1:t4"])
+rem = sb.action_for(sb.make_id("m1", "a", "w1:p2", "w1:t1"), labels) or []
+check("enter-remote-focuses-on-its-machine", rem == ["--machine", "m1", "agent", "focus", "w1:p2"], rem)
+remt = sb.action_for(sb.make_id("m1", "t", "w1:p3", "w1:t4"), labels) or []
+check("enter-remote-terminal", remt == ["--machine", "m1", "tab", "focus", "w1:t4"], remt)
+check("enter-remote-no-notification", "notification" not in rem + remt)
+check("enter-header", sb.action_for("-", labels) is None)
+check("enter-broken-id", sb.action_for("m1|x|w1:p2|w1:t1", labels) is None)
+
+# 4. Paths.
+home = os.path.expanduser("~")
+check("tilde-local", sb.tilde(home + "/src/x", remote=False) == "~/src/x")
+check("tilde-remote-linux", sb.tilde("/home/someone/src/x", remote=True) == "~/src/x")
+check("tilde-remote-mac", sb.tilde("/Users/someone", remote=True) == "~")
+check("tilde-not-homeless", sb.tilde("/homeless/x", remote=True) == "/homeless/x")
+check("tilde-root", sb.tilde("/root/x", remote=True) == "~/x")
+check("tilde-not-rootfs", sb.tilde("/rootfs/x", remote=True) == "/rootfs/x")
+check("tilde-local-not-a-prefix", sb.tilde(home + "x/y", remote=False) == home + "x/y")
+
+# 5. Columns: status, machine, workspace, tab, pane and the dimmed tail.
+WIDTHS = (10, sb.MACHINE_WIDTH, 15, 26, 42)
+
+
+def cols(e):
+    row = sb.format_row(e).split("\t", 1)[1]
+    out, pos = [], 0
+    for w in WIDTHS:
+        out.append(row[pos:pos + w].strip())
+        pos += w + 1
+    return out + [row[pos:].strip()]
+
+
+def tab(label, custom=False):
+    return [{"tab_id": "w1:t1", "label": label, "number": 1, "custom_label": custom}]
+
+
+e = sb.entries_from(snap([pane("a")], [agent("a", "idle", 1, title="fix-login")]))[0]
+c = cols(e)
+check("unnamed-tab-shows-its-number", c[3] == "1" and c[4] == "fix-login" and c[5] == "/tmp", c)
+c = cols(sb.entries_from(snap([pane("a")], [agent("a", "idle", 1, title="fix-login")], tabs=tab("Login")))[0])
+check("named-tab", c[3] == "Login" and c[4] == "fix-login", c)
+c = cols(sb.entries_from(snap([pane("a")], [agent("a", "idle", 1)], tabs=tab("2", custom=True)))[0])
+check("numeric-tab-set-by-hand", c[3] == "2", c)
+
+split = snap([pane("p1"), dict(pane("p2"), label="logs"), pane("p3")],
+             [agent("p1", "idle", 1, title="t1"), dict(agent("p3", "idle", 1), name="rev")], tabs=tab("B"))
+c1, c2, c3 = [cols(x) for x in sb.entries_from(split)]
+check("pane-number-and-title", c1[4] == "1 · t1", c1)
+check("pane-with-label", c2[4] == "2 · logs", c2)
+check("pane-agent-name", c3[4] == "3 · rev", c3)
+c = cols(sb.entries_from(snap([pane("solo")], [agent("solo", "idle", 1)], tabs=tab("B")))[0])
+check("single-pane-no-number", c[4] == "", c)
+c = cols(sb.entries_from(snap([pane("a")], [agent("a", "idle", 1, title="Login")], tabs=tab("Login")))[0])
+check("title-equal-to-tab-not-repeated", c[4] == "" and c[5] == "/tmp", c)
+c = cols(sb.entries_from(snap([pane("s", title="me@box1:~/x")], [], tabs=tab("B")))[0])
+check("shell-title-is-not-a-name", c[4] == "", c)
+c = cols(sb.entries_from(snap([pane("s1", title="me@box1:~/x"), pane("s2", title="btop")], [], tabs=tab("B")))[0])
+check("shell-in-split-only-number", c[4] == "1", c)
+c = cols(sb.entries_from(snap([pane("a")], [agent("a", "idle", 1)]), "m1", "workstation", 1)[0])
+check("long-machine-name-fits", c[1] == "workstation", c)
+
+# 6. The machine always; the agent kind only when it is not claude.
+e3 = sb.entries_from(snap([pane("a")], [agent("a", "idle", 1)]), "", "here", 0)[0]
+check("machine-column-always", cols(e3)[1] == "here" and "here" in sb.render([e3], []))
+check("claude-not-shown", "claude" not in cols(e3)[5], cols(e3))
+cx = sb.entries_from(snap([pane("a")], [dict(agent("a", "idle", 1), agent="codex")]))[0]
+check("other-kind-shown", "codex" in cols(cx)[5], cols(cx))
+
+argv = sb.fzf_argv("fzf", "x", "/tmp/s.sock")
+colors = dict(kv.split(":", 1) for kv in argv[argv.index("--color") + 1].split(","))
+check("selected-row-has-background", colors.get("bg+") not in (None, "-1"), colors)
+
+# 8. The preview without the agent's input box and status bar.
+BOX = ["agent text", "last paragraph", "",
+       "\x1b[2m" + "─" * 40 + " my-session ─\x1b[0m", "❯ \x1b[2mhalf typed\x1b[0m", "─" * 50,
+       "  box1 | model | repo | ctx 15%", "  ⏵⏵ auto mode on"]
+t = sb.trim_footer("\n".join(BOX))
+check("trims-box", sb.ANSI.sub("", t).rstrip().endswith("last paragraph") and "auto mode" not in t, repr(t[-60:]))
+hint = BOX[:2] + [" " * 60 + "new task? /clear to save 128k tokens"] + BOX[3:]
+check("trims-right-aligned-hint", "new task" not in sb.trim_footer("\n".join(hint)))
+table = ["| a | b |", "─" * 30, "| 1 | 2 |", "─" * 30, "end"]
+check("table-untouched", sb.trim_footer("\n".join(table)) == "\n".join(table))
+plain = "one\ntwo\nthree"
+check("no-box-untouched", sb.trim_footer(plain) == plain)
+far = BOX[3:6] + ["line %d" % i for i in range(30)]
+check("old-box-higher-up-untouched", sb.trim_footer("\n".join(far)) == "\n".join(far))
+check("normal-indent-stays", "  - (c) an item" in sb.trim_footer("\n".join(["  - (c) an item"] + BOX[3:])))
+
+# 7. End to end, with a fake herdr.
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    (d / "local.json").write_text(json.dumps({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "working", 3)])}}))
+    (d / "m1.json").write_text(json.dumps({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "blocked", 2)])}}))
+    (d / "machines.json").write_text(json.dumps([
+        {"id": "m1", "label": "alive", "enabled": True},
+        {"id": "m2", "label": "hung", "enabled": True},
+        {"id": "m3", "label": "disabled", "enabled": False},
+    ]))
+    fake = executable(d / "herdr",
+                      "#!/bin/sh\n"
+                      'case "$*" in\n'
+                      '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                      '  "--machine m1 api snapshot") cat "%(d)s/m1.json" ;;\n'
+                      '  "--machine m2 api snapshot") sleep 5 ;;\n'
+                      '  "--machine m3 api snapshot") echo "must not be asked" >&2; exit 9 ;;\n'
+                      '  "api snapshot") cat "%(d)s/local.json" ;;\n'
+                      "  *) exit 2 ;;\n"
+                      "esac\n" % {"d": d})
+    env = dict(os.environ, HERDR_BIN_PATH=str(fake), SWITCHBOARD_REMOTE_TIMEOUT="1", SWITCHBOARD_LABEL="here")
+    r = subprocess.run([sys.executable, str(TOOL), "--rows"], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
+    lines = r.stdout.splitlines()
+    visible = [l.split("\t", 1)[1] for l in lines[1:]]
+    check("e2e-rc", r.returncode == 0, r.stderr)
+    check("e2e-header", lines and "2 agents" in lines[0] and "hung offline" in lines[0], lines[:1])
+    check("e2e-remote-blocked-first", visible and re.match(r"● blocked\s+alive", visible[0]), visible)
+    check("e2e-offline-last", visible and "hung" in visible[-1] and "offline" in visible[-1], visible)
+    check("e2e-disabled-not-asked", "disabled" not in r.stdout and "must not" not in r.stderr)
+
+# 9. Live.
+import socket as _socket
+import threading as _threading
+import time as _time
+
+data = {"local": snap([pane("w1:p1")], [agent("w1:p1", "working", 1)]),
+        "m1": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)])}
+
+
+def fake_fetch(machine="", timeout=None, info=None):
+    v = data[machine or "local"]
+    if v is None:
+        raise RuntimeError("down")
+    return v
+
+
+machines = [{"id": "m1", "label": "other"}]
+live = sb.Live(machines, sb.entries_from(fake_fetch(), "", "here", 0), fetch=fake_fetch)
+first = live.changed()
+check("live-loading", "loading other" in first, first.splitlines()[0])
+check("live-no-change", live.changed() is None)
+live.refresh_remote(0, machines[0])
+check("live-remote-arrives", "other" in (live.changed() or "").split("\n", 1)[1])
+data["m1"] = None
+live.refresh_remote(0, machines[0])
+check("live-down-keeps-rows", live.changed() is None and "offline" not in live.text())
+live2 = sb.Live(machines, [], fetch=fake_fetch, cache=False)
+live2.refresh_remote(0, machines[0])
+check("live-never-answered", "other offline" in live2.text())
+data["local"] = snap([pane("w1:p1")], [agent("w1:p1", "done", 2)])
+live.refresh_local()
+t = live.changed() or ""
+check("live-status-change", "● done" in t, t[:200])
+
+check("reload-top-no-track", not sb.reload_action("/tmp/r", 0).startswith("track-current"))
+check("reload-unknown-no-track", not sb.reload_action("/tmp/r", None).startswith("track-current"))
+check("reload-lower-tracks", sb.reload_action("/tmp/r", 3).startswith("track-current+reload-sync(cat /tmp/r)"))
+
+
+class FakeFzf:
+    """A fzf --listen on a unix socket: records each request and answers like fzf."""
+
+    def __init__(self, path, position=0):
+        self.reqs, self.position = [], position
+        self.srv = _socket.socket(_socket.AF_UNIX)
+        self.srv.bind(path)
+        self.srv.listen(8)
+        _threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while True:
+            try:
+                c, _ = self.srv.accept()
+            except OSError:
+                return
+            raw = c.recv(65536)
+            self.reqs.append(raw)
+            if raw.startswith(b"GET") and b"Content-Length" in raw:
+                body = b"invalid content length\n"
+            elif raw.startswith(b"GET"):
+                body = json.dumps({"position": self.position}).encode()
+            else:
+                body = b""
+            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+            c.close()
+
+
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    sock = os.path.join(d, "f.sock")
+    fz = FakeFzf(sock, position=2)
+    check("http-get-position", sb.fzf_position(sock) == 2)
+    check("http-get-no-content-length", fz.reqs and b"Content-Length" not in fz.reqs[-1], fz.reqs[-1:])
+    check("http-post", sb.fzf_request(sock, "POST", b"reload(x)") is not None
+          and fz.reqs[-1].endswith(b"\r\n\r\nreload(x)") and b"Content-Length: 9" in fz.reqs[-1])
+    check("http-no-fzf", sb.fzf_position(os.path.join(d, "missing.sock")) is None)
+
+    # watch() end to end: a change sends a reload, no change sends nothing.
+    sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
+    data.update(local=snap([pane("w1:p1")], [agent("w1:p1", "working", 1)]),
+                m1=snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)]))
+    lv = sb.Live(machines, sb.entries_from(fake_fetch(), "", "here", 0), fetch=fake_fetch)
+    lv.changed()
+    rows_file, stop = os.path.join(d, "rows"), _threading.Event()
+    _threading.Thread(target=sb.watch, args=(lv, sock, rows_file, stop), daemon=True).start()
+    _time.sleep(0.5)
+    posts = [r for r in fz.reqs if r.startswith(b"POST") and b"reload-sync" in r]
+    check("watch-reloads-when-remote-arrives", len(posts) == 1, len(posts))
+    check("watch-tracks-when-lower", posts and b"track-current+reload-sync(cat " in posts[-1])
+    check("watch-rows-are-live-text", os.path.exists(rows_file) and open(rows_file).read() == lv.text())
+    _time.sleep(0.3)
+    check("watch-no-change-no-reload", len([r for r in fz.reqs if b"reload-sync" in r]) == 1)
+    data["local"] = snap([pane("w1:p1")], [agent("w1:p1", "done", 2)])
+    _time.sleep(0.4)
+    check("watch-reloads-on-change", len([r for r in fz.reqs if b"reload-sync" in r]) == 2)
+    stop.set()
+    # With a slow local tick (5 s), a machine arriving still reloads at once.
+    _time.sleep(0.2)
+    sb.LOCAL_EVERY, sb.REMOTE_EVERY = 5.0, 5.0
+    data["m1"] = snap([pane("w1:p9")], [agent("w1:p9", "blocked", 9)])
+    lv2 = sb.Live(machines, sb.entries_from(fake_fetch(), "", "here", 0), fetch=fake_fetch, cache=False)
+    lv2.changed()
+    before = len([r for r in fz.reqs if b"reload-sync" in r])
+    stop2 = _threading.Event()
+    _threading.Thread(target=sb.watch, args=(lv2, sock, os.path.join(d, "rows2"), stop2), daemon=True).start()
+    _time.sleep(0.6)
+    check("watch-remote-reloads-now", len([r for r in fz.reqs if b"reload-sync" in r]) > before)
+    stop2.set()
+    sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
+
+# 10. Copy and terminals.
+argv = sb.fzf_argv("fzf", "self", "/tmp/s.sock")
+joined = " ".join(argv)
+check("preview-half", "down,50%" in joined, joined)
+check("ctrl-y-copies", "ctrl-y:transform-footer(self --copy {1})" in argv, argv)
+check("ctrl-t-terminals", any(a.startswith("ctrl-t:transform-query:") for a in argv))
+check("posix-shell", "--with-shell" in argv and argv[argv.index("--with-shell") + 1] == "sh -c")
+for q, want in (("", "^› "), ("api", "^› "), ("^› ", ""), ("^› docs", "")):
+    out = subprocess.run(["sh", "-c", sb.TOGGLE_TERMINALS], env=dict(os.environ, FZF_QUERY=q),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, universal_newlines=True).stdout
+    check("toggle-terminals %r" % q, out == want, repr(out))
+check("terminal-glyph-own", sb.MARK["shell"][1] != sb.MARK["unknown"][1])
+check("footer-cleared-on-move", "focus:change-footer()" in argv and not any("prefix+w" in a for a in argv), argv)
+
+with tempfile.TemporaryDirectory() as d:
+    tr_path = os.path.join(d, "t.jsonl")
+
+    def entry(mid, kind, text="", side=False, typ="assistant"):
+        c = {"type": kind, "text": text} if kind == "text" else {"type": kind}
+        return json.dumps({"type": typ, "isSidechain": side, "message": {"id": mid, "content": [c]}})
+    with open(tr_path, "w") as f:
+        f.write("\n".join(["{broken", entry("m1", "text", "old"), entry("m2", "text", "first part"),
+                           entry("m2", "tool_use"), entry("m2", "text", "second part"),
+                           entry("m3", "text", "from a subagent", side=True),
+                           entry("m4", "thinking"), entry("u", "text", "from the user", typ="user")]) + "\n")
+    got = sb.last_reply_from_transcript(tr_path)
+    check("transcript-last-reply", got == "first part\n\nsecond part", repr(got))
+    check("transcript-missing", sb.last_reply_from_transcript(os.path.join(d, "no")) is None)
+    raw = open(tr_path, "rb").read()
+    tail = len(raw) - raw.index(entry("m2", "text", "second part").encode()) + 10  # 10 bytes into the line before
+    got = sb.last_reply_from_transcript(tr_path, tail_bytes=tail)
+    check("transcript-from-the-middle", got == "second part", repr(got))
+
+screen = "\n".join(["● An old reply", "", "● New reply, line 1", "  line 2", "  - an item", "",
+                    "● Bash(ls)", "  ⎿  output", "", "✻ Baked for 3m", "※ recap: something"])
+got = sb.last_reply_from_screen(screen)
+check("screen-skips-tool", got == "New reply, line 1\nline 2\n- an item", repr(got))
+check("screen-no-block", sb.last_reply_from_screen("just\ntext") is None)
+check("osc52", sb.osc52("hola ñ") == "\x1b]52;c;aG9sYSDDsQ==\x07", repr(sb.osc52("hola ñ")))
+
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    sid = "0123abcd-0000-4000-8000-000000000001"
+    (d / ".claude" / "projects" / "-repo").mkdir(parents=True)
+    (d / ".claude" / "projects" / "-repo" / (sid + ".jsonl")).write_text(
+        json.dumps({"type": "assistant", "message": {"id": "m", "content": [{"type": "text", "text": "from the transcript"}]}}) + "\n")
+    a1 = dict(agent("w1:p1", "done", 1), agent_session={"value": sid})
+    (d / "snap.json").write_text(json.dumps({"result": {"snapshot": snap([pane("w1:p1")], [a1])}}))
+    (d / "screen.txt").write_text("● from the screen\n\n✻ Baked for 1m\n")
+    fake = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n  "api snapshot") cat "%(d)s/snap.json" ;;\n'
+                                   '  *"pane read"*) echo "$*" >> "%(d)s/reads"; cat "%(d)s/screen.txt" ;;\n  *) exit 2 ;;\nesac\n' % {"d": d})
+    tty = d / "tty"
+
+    def run_copy(row):
+        env = dict(os.environ, HOME=str(d), HERDR_BIN_PATH=str(fake), SWITCHBOARD_TTY=str(tty))
+        r = subprocess.run([sys.executable, str(TOOL), "--copy", row], stdout=subprocess.PIPE,
+                           universal_newlines=True, env=env, timeout=20)
+        raw = tty.read_text() if tty.exists() else ""
+        return r.stdout.strip(), (base64.b64decode(raw.split(";")[2].rstrip("\x07")).decode() if raw else "")
+
+    out, txt = run_copy(sb.make_id("", "a", "w1:p1", "w1:t1"))
+    check("copy-local-from-transcript", txt == "from the transcript" and "last reply" in out, (out, txt))
+    out, txt = run_copy(sb.make_id("m1", "a", "w1:p1", "w1:t1"))
+    check("copy-remote-from-screen", txt == "from the screen" and "screen" in out, (out, txt))
+    check("copy-remote-asks-its-machine", (d / "reads").exists() and "--machine m1" in (d / "reads").read_text())
+    out, txt = run_copy("-")
+    check("copy-header-nothing", out == "", out)
+
+# 11. Jump to another machine.
+PS = "\n".join([
+    " 367912 /usr/local/bin/herdr remote-client-bridge --idle-timeout-v1",
+    " 97790 ssh -C -T box1 exec /usr/local/bin/herdr remote-client-bridge --idle-timeout-v1",
+    " 400001 /opt/homebrew/bin/herdr remote-client-bridge --idle-timeout-v1",
+    " 500 /opt/homebrew/bin/herdr server",
+])
+orig_origin = sb.ssh_origin
+sb.ssh_origin = lambda pid: {367912: "addr-1", 97790: "addr-3", 400001: "addr-2"}.get(pid)
+got = sb.client_bridges(PS)
+check("bridges-not-outgoing-ssh", got == [(367912, "addr-1"), (400001, "addr-2")], got)
+sb.ssh_origin = orig_origin
+HOSTS = {"addr-1": ("mac1", "macOS"), "addr-2": ("mac2", "macOS"), "addr-9": ("box1", "linux")}
+check("client-one-mac", sb.find_client([(1, "addr-1")], HOSTS, "", platform="linux") == ("ssh", "mac1"))
+check("client-linux-does-not-qualify", sb.find_client([(1, "addr-9")], HOSTS, "", platform="linux") is None)
+check("client-nothing", sb.find_client([], HOSTS, "", platform="linux") is None)
+check("client-local", sb.find_client([], HOSTS, "/dev/ttys000", platform="darwin") == ("local", None))
+idle = {None: 900.0, "mac1": 0.4, "mac2": 50.0}
+got = sb.find_client([(1, "addr-2"), (2, "addr-1")], HOSTS, "/dev/ttys000", idle=idle.get, platform="darwin")
+check("client-touched-last", got == ("ssh", "mac1"), got)
+idle2 = {None: 0.2, "mac1": 30.0}
+check("client-local-when-touched", sb.find_client([(2, "addr-1")], HOSTS, "/dev/ttys000", idle=idle2.get,
+                                                   platform="darwin") == ("local", None))
+TUI = " 60526 ttys000  /opt/homebrew/bin/herdr\n 96578 ??  /opt/homebrew/bin/herdr server\n 7 ttys003 /opt/homebrew/bin/herdr agent list"
+check("tty-of-the-window", sb.local_tui_tty(TUI) == "/dev/ttys000", sb.local_tui_tty(TUI))
+check("tty-no-window", sb.local_tui_tty(" 96578 ??  /opt/homebrew/bin/herdr server") is None)
+
+
+def ent(machine, pane_id, **kw):
+    e = {"machine": machine, "pane": pane_id, "ws_label": "Repo", "tab_auto": "1", "title": "", "cwd": "~/x",
+         "pane_name": "", "agent": "claude", "pane_label": ""}
+    e.update(kw)
+    return e
+
+
+ents = [ent("", "w3:p19"), ent("m1", "w3:p1D"), ent("m1", "w1:p1"), ent("m2", "w1:p1")]
+check("goto-unique-id", sb.goto_query({"pane": "w3:p1D"}, ents) == "w3:p1d")
+check("goto-repeated-id", sb.goto_query({"pane": "w1:p1"}, ents) is None)
+check("goto-id-inside-another", sb.goto_query({"pane": "w3:p1"}, ents + [ent("m1", "w3:p1")]) is None)
+check("goto-id-in-a-title", sb.goto_query({"pane": "w3:p1D"}, ents + [ent("", "w9:p2", title="see W3:P1D")]) is None)
+scr = sb.ghostty_keys_script("/dev/ttys000", "w3:p1d")
+check("applescript-one-burst", 'tty is "/dev/ttys000"' in scr and scr.count("perform action") == 1
+      and '"text:\\\\x02//w3:p1d\\\\r"' in scr and "delay" not in scr, scr)
+for bad in (("/dev/ttys000", 'x" & do shell script "rm'), ("/dev/tty; rm", "w1:p1"), ("/dev/ttys000", "W1:P1")):
+    try:
+        sb.ghostty_keys_script(*bad)
+        check("applescript-rejects %r" % (bad,), False)
+    except ValueError:
+        pass
+
+calls = []
+orig = (sb.run_out, sb.local_tui_tty, sb.subprocess.run, sb.time.sleep, sb.local_label)
+sb.run_out = lambda argv, timeout=5: calls.append(("herdr", argv[1:])) or ""
+sb.local_tui_tty = lambda ps_text=None: "/dev/ttys000"
+sb.subprocess.run = lambda argv, **kw: calls.append(("osa", argv[0])) or None
+sb.time.sleep = lambda s: None
+sb.local_label = lambda: "mac1"
+try:
+    sb.jump("box1", "a", "w1:p1", "w1:t1", "sbjabc", True, "")
+    seq = [c[0] + ":" + " ".join(c[1]) if c[0] == "herdr" else "osa" for c in calls]
+    check("jump-order", seq == ["herdr:--machine box1 pane rename w1:p1 sbjabc", "osa",
+                                "herdr:--machine box1 pane rename w1:p1 --clear",
+                                "herdr:--machine box1 agent focus w1:p1"], seq)
+    calls.clear()
+    sb.jump("mac1", "t", "w2:p3", "w2:t4", "w2:p3", False, "")
+    seq = [c[0] + ":" + " ".join(c[1]) if c[0] == "herdr" else "osa" for c in calls]
+    check("jump-local-no-rename", seq == ["osa", "herdr:tab focus w2:t4"], seq)
+    calls.clear()
+    sb.jump("box1", "a", "w1:p1", "w1:t1", "sbjabc", True, "logs")
+    check("jump-restores-the-name", ("herdr", ["--machine", "box1", "pane", "rename", "w1:p1", "logs"]) in calls, calls)
+finally:
+    sb.run_out, sb.local_tui_tty, sb.subprocess.run, sb.time.sleep, sb.local_label = orig
+
+args = sb.jump_argv({"machine": "m1", "kind": "a", "pane": "w1:p1", "tab": "w1:t1"}, "box1",
+                    ents[:3] + [ent("m2", "w1:p1", pane_label="logs")])
+check("jump-argv-renames-when-repeated", args[6] == "1" and args[5].startswith("sbj")
+      and args[:5] == ["--jump", "box1", "a", "w1:p1", "w1:t1"], args)
+check("jump-argv-name-of-that-machine", args[7] == "", args)
+popen = []
+orig_popen = sb.subprocess.Popen
+sb.subprocess.Popen = lambda argv, **kw: popen.append((argv, kw))
+try:
+    launched = sb.launch_jump(["--jump", "box1", "a", "w1:p1", "w1:t1", "w1:p1", "0", ""], ("ssh", "mac1"),
+                              helper="python3 /opt/sb/bin/switchboard")
+finally:
+    sb.subprocess.Popen = orig_popen
+argv, kw = popen[0]
+check("launches-over-ssh-detached", launched and argv[0] == sb.SSH and "mac1" in argv and kw.get("start_new_session")
+      and argv[-1].startswith("python3 /opt/sb/bin/switchboard --jump box1 a w1:p1"), argv)
+
+# 12. Select with the mouse.
+rows = sb.wrap_rows(["abcdefghij", "", "xy"], 4)
+check("wrap", rows == [(0, 0, 4), (0, 4, 8), (0, 8, 10), (1, 0, 0), (2, 0, 2)], rows)
+check("wrap-wide", sb.wrap_rows(["a中b"], 3) == [(0, 0, 2), (0, 2, 3)], sb.wrap_rows(["a中b"], 3))
+check("col-wide", [sb.col_to_index("a中b", 0, 3, c) for c in range(4)] == [0, 1, 1, 2])
+L = ["first line here", "second", "third line here"]
+check("sel-one-line", sb.selected_text(L, (0, 6), (0, 9)) == "line")
+check("sel-several", sb.selected_text(L, (0, 6), (2, 4)) == "line here\nsecond\nthird")
+check("sel-backwards", sb.selected_text(L, (2, 4), (0, 6)) == sb.selected_text(L, (0, 6), (2, 4)))
+S = sb.Selector(L, 20, 4)
+check("starts-at-bottom", S.top == 0 and S.view == 3)
+S.mouse(0, 7, 1, False)
+S.mouse(32, 10, 1, False)
+check("drag-does-not-copy", S.mouse(32, 10, 1, False) is None and S.anchor == (0, 6))
+check("release-copies", S.mouse(0, 10, 1, True) == "line")
+S2 = sb.Selector(["a"] * 30, 20, 6)
+before = S2.top
+S2.mouse(64, 1, 1, False)
+check("wheel-up", S2.top == before - 3, (before, S2.top))
+S2.mouse(0, 1, 1, False)
+check("click-copies-one-char", S2.mouse(0, 1, 1, True) == "a")
+S3 = sb.Selector(["   ", "x"], 20, 4)
+S3.mouse(0, 1, 1, False)
+check("only-spaces-not-copied", S3.mouse(0, 3, 1, True) is None)
+check("frame-inverts-selection", "\x1b[7mline" in S.frame())
+
+import pty as _pty
+import select as _sel
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    (d / "pane.txt").write_text("hello world\nsecond line of the agent\n")
+    fake = executable(d / "herdr", '#!/bin/sh\ncat "%s/pane.txt"\n' % d)
+    pid, fd = _pty.fork()
+    if pid == 0:
+        os.environ.update(HERDR_BIN_PATH=str(fake), TERM="xterm-256color")
+        os.execv(sys.executable, [sys.executable, "-B", str(TOOL), "--select", "|a|w1:p1|w1:t1"])
+    import fcntl as _f
+    import struct as _st
+    import termios as _tm
+    _f.ioctl(fd, _tm.TIOCSWINSZ, _st.pack("HHHH", 10, 40, 0, 0))
+    out = b""
+
+    def pump(sec):
+        global out
+        end = _time.time() + sec
+        while _time.time() < end:
+            r, _, _ = _sel.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    out += os.read(fd, 65536)
+                except OSError:
+                    return
+    pump(1.0)
+    # Less text than screen, at the top: "hello world" on row 1, the other on row 2.
+    os.write(fd, b"\x1b[<0;7;1M")
+    pump(0.1)
+    os.write(fd, b"\x1b[<32;6;2M")
+    pump(0.1)
+    os.write(fd, b"\x1b[<0;6;2m")
+    pump(0.5)
+    os.write(fd, b"\x1b")
+    pump(0.6)
+    done, st = os.waitpid(pid, os.WNOHANG)
+    m = re.search(rb"\x1b\]52;c;([A-Za-z0-9+/=]+)\x07", out)
+    copied = base64.b64decode(m.group(1)).decode() if m else None
+    check("pty-copies-the-drag", copied == "world\nsecond", repr(copied))
+    check("pty-exits-on-esc", done == pid)
+    check("pty-restores-the-terminal", out.rstrip().endswith(b"\x1b[?1049l") or b"\x1b[?1006l" in out[-200:])
+
+# 13. The fast jump.
+ents2 = [ent("m1", "w1:p1", title="Plugin docs"), ent("m2", "w1:p1", title="something else"),
+         ent("m1", "w2:p2", title="Fix (deploy)"), ent("m2", "w2:p2", title="x")]
+check("goto-title-when-id-repeats", sb.goto_query({"machine": "m1", "pane": "w1:p1"}, ents2) == "plugin docs",
+      sb.goto_query({"machine": "m1", "pane": "w1:p1"}, ents2))
+check("goto-odd-title-no", sb.goto_query({"machine": "m1", "pane": "w2:p2"}, ents2) is None)
+ents3 = ents2 + [ent("m3", "w9:p9", ws_label="plugin docs")]
+check("goto-title-found-in-a-workspace-no", sb.goto_query({"machine": "m1", "pane": "w1:p1"}, ents3) is None)
+
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    fake_ssh = executable(d / "ssh", '#!/bin/sh\necho "$@" > "%s/argv"\ncat > "%s/stdin"\n' % (d, d))
+    old_ssh = sb.SSH
+    sb.SSH = str(fake_ssh)
+    link = sb.JumpLink(find=lambda: ("ssh", "mac1"), helper=lambda host: "sb-helper").start()
+    args = ["--jump", "box1", "a", "w1:p1", "w1:t1", "w1:p1", "0", ""]
+    check("link-sends", link.send(args))
+    link.proc.wait(5)
+    argv = (d / "argv").read_text()
+    check("link-ssh-with-controlmaster", "ControlMaster=auto" in argv and "ControlPersist=600" in argv
+          and argv.strip().endswith("sb-helper --jump-server") and "mac1" in argv, argv)
+    check("link-one-json-line", json.loads((d / "stdin").read_text()) == args, (d / "stdin").read_text())
+    sb.SSH = old_ssh
+    nolink = sb.JumpLink(find=lambda: None).start()
+    check("link-no-client", nolink.send(args, timeout=2) is False)
+    calls2 = []
+    orig_popen = sb.subprocess.Popen
+
+    class P:
+        def __init__(self, argv, **kw):
+            calls2.append(argv)
+            self.stdin = None
+
+        def poll(self):
+            return None
+    sb.subprocess.Popen = P
+    try:
+        sb.JumpLink(find=lambda: ("local", None)).start().ready.wait(2)
+    finally:
+        sb.subprocess.Popen = orig_popen
+    check("link-local-no-ssh", calls2 and calls2[0][-1] == "--jump-server" and calls2[0][0] == sys.executable, calls2)
+
+import io as _io
+got_jump = []
+killed = []
+
+
+class FakeOsa:
+    def kill(self):
+        killed.append(1)
+
+
+orig = (sb.jump, sb.local_tui_tty, sb.subprocess.Popen)
+sb.jump = lambda *a, **kw: got_jump.append((a, kw)) or 0
+sb.local_tui_tty = lambda ps_text=None: "/dev/ttys000"
+sb.subprocess.Popen = lambda argv, **kw: FakeOsa()
+try:
+    sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", "w1:p1", "1", "logs"]) + "\n"))
+    check("server-jumps-with-what-is-ready", got_jump and got_jump[0][0] == ("box1", "a", "w1:p1", "w1:t1", "w1:p1", True, "logs")
+          and got_jump[0][1].get("tty") == "/dev/ttys000" and isinstance(got_jump[0][1].get("osa"), FakeOsa), got_jump)
+    got_jump.clear()
+    sb.jump_server(_io.StringIO(""))
+    check("server-no-line-no-jump", not got_jump and killed, (got_jump, killed))
+    killed.clear()
+    sb.jump_server(_io.StringIO("not json\n"))
+    check("server-broken-line-no-jump", not got_jump and killed)
+finally:
+    sb.jump, sb.local_tui_tty, sb.subprocess.Popen = orig
+
+# 14. No child reads the popup's terminal.
+tree = ast.parse(SOURCE)
+no_stdin = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+            and node.func.attr in ("run", "Popen") and getattr(node.func.value, "id", "") == "subprocess":
+        if not any(k.arg == "stdin" for k in node.keywords):
+            no_stdin.append(node.lineno)
+check("every-child-states-its-stdin", not no_stdin, "lines without stdin: %s" % no_stdin)
+
+# 15. Another machine, fast.
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    calls_ssh = d / "ssh-calls"
+    fake_ssh = executable(d / "ssh", '#!/bin/sh\nfor last; do :; done\necho "$last" >> "%s"\nexec sh -c "$last"\n' % calls_ssh)
+    remote_herdr = executable(d / "remote-herdr", '#!/bin/sh\necho "{\\"result\\":{\\"snapshot\\":{\\"via\\":\\"ssh $*\\"}}}"\n')
+    local_herdr = executable(d / "herdr", '#!/bin/sh\necho "{\\"result\\":{\\"snapshot\\":{\\"via\\":\\"herdr $*\\"}}}"\n')
+    saved = (sb.SSH, sb.REMOTE_HERDR, sb.HERDR)
+    sb.SSH, sb.REMOTE_HERDR, sb.HERDR = str(fake_ssh), str(remote_herdr), str(local_herdr)
+    try:
+        got = sb.snapshot("m1", 5, {"id": "m1", "target": "mac1", "session": "default"})
+        check("remote-over-ssh", got.get("via") == "ssh api snapshot", got)
+        got = sb.snapshot("m1", 5, {"id": "m1", "target": "mac1", "session": "agents"})
+        check("remote-with-session", got.get("via") == "ssh --session agents api snapshot", got)
+        sb.SSH = "/bin/false"
+        got = sb.snapshot("m1", 5, {"id": "m1", "target": "mac1"})
+        check("remote-falls-back-to-machine", got.get("via") == "herdr --machine m1 api snapshot", got)
+        sb.SSH = str(fake_ssh)
+        got = sb.snapshot("m1", 5, {"id": "m1"})
+        check("remote-no-target", got.get("via") == "herdr --machine m1 api snapshot", got)
+        got = sb.snapshot("", 5)
+        check("local-direct", got.get("via") == "herdr api snapshot", got)
+    finally:
+        sb.SSH, sb.REMOTE_HERDR, sb.HERDR = saved
+
+    sb.STATE_DIR = str(d / "state")
+    msnap = snap([pane("w1:p1")], [agent("w1:p1", "done", 4, title="from-cache")])
+    sb.save_cache("m1", msnap, now=1000.0)
+    check("cache-reads", sb.load_cache("m1", now=1040.0) == (msnap, 40.0))
+    check("cache-too-old", sb.load_cache("m1", now=1000.0 + sb.CACHE_MAX_AGE + 1) is None)
+    check("cache-none", sb.load_cache("other") is None)
+    sb.save_cache("m1", msnap)
+    fresh = snap([pane("w1:p1")], [agent("w1:p1", "working", 5, title="fresh")])
+    lv = sb.Live([{"id": "m1", "label": "other"}], [], fetch=lambda m="", t=None, i=None: fresh)
+    first = lv.changed()
+    check("cache-on-open", "from-cache" in first and "other from" in first.split("\n", 1)[0], first[:200])
+    lv.refresh_remote(0, {"id": "m1", "label": "other"})
+    t2 = lv.changed() or ""
+    check("fresh-replaces", "fresh" in t2 and " ago" not in t2.split("\n", 1)[0], t2[:200])
+    check("fresh-is-saved", sb.load_cache("m1")[0] == fresh)
+    sb.STATE_DIR = STATE
+
+
+# 16. The order across machines.
+def ents16(machine, idx, *ags):
+    """The entries of a machine with those agents: (pane, status, seq[, title])."""
+    return sb.entries_from(snap([pane(a[0]) for a in ags], [agent(*a) for a in ags]),
+                           machine, machine or "here", idx)
+
+
+rc = sb.Recency(persist=False, now=1000.0)
+loc = ents16("", 0, ("L1", "idle", 5), ("L2", "idle", 9))
+rem = ents16("m1", 1, ("R1", "idle", 3), ("R2", "idle", 7))
+rc.observe("", loc)
+rc.observe("m1", rem, now=1000.4)  # arrives later, but it is its first read
+got = order(loc + rem)
+check("recency-on-open-interleaves", got == ["L2", "R2", "L1", "R1"], got)
+rem = ents16("m1", 1, ("R1", "idle", 8), ("R2", "idle", 7))  # R1 changed and is still idle
+check("recency-sees-the-change", rc.observe("m1", rem, now=1005.0) is True)
+got = order(loc + rem)
+check("recency-remote-first", got == ["R1", "L2", "R2", "L1"], got)
+loc = ents16("", 0, ("L1", "idle", 10), ("L2", "idle", 9))
+rc.observe("", loc, now=1006.0)
+got = order(loc + rem)
+check("recency-local-first", got == ["L1", "R1", "L2", "R2"], got)
+check("recency-no-change-no-record", rc.observe("", loc, now=2000.0) is False)
+got = order(loc + rem)
+check("recency-no-change-no-move", got == ["L1", "R1", "L2", "R2"], got)
+old = dict(ents16("m1", 1, ("RD", "done", 1))[0], stamp=1.0, rank=0)
+got = order(loc + rem + [old])
+check("recency-status-decides", got[0] == "RD", got)
+rp = sb.Recency(persist=False, now=10.0)
+rp.observe("", ents16("", 0, ("X", "idle", 1)))
+rp.observe("m1", ents16("m1", 1, ("X", "idle", 1), ("Y", "idle", 2)))
+check("recency-prune-records", rp.observe("m1", ents16("m1", 1, ("Y", "idle", 2)), now=11.0) is True)
+check("recency-prune-only-its-machine", "X" not in rp.seen["m1"] and "X" in rp.seen[""], rp.seen)
+
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    r1 = sb.Recency(now=1000.0)
+    r1.observe("", ents16("", 0, ("L1", "idle", 5), ("L2", "idle", 9)))
+    r1.observe("m1", ents16("m1", 1, ("R1", "idle", 3), ("R2", "idle", 7)))
+    r1.observe("m1", ents16("m1", 1, ("R1", "idle", 8), ("R2", "idle", 7)), now=1005.0)
+    check("recency-writes", os.path.exists(os.path.join(d, "recency.json")))
+    r2 = sb.Recency(now=2000.0)
+    loc = r2.apply(ents16("", 0, ("L1", "idle", 5), ("L2", "idle", 9)))
+    rem = r2.apply(ents16("m1", 1, ("R1", "idle", 8), ("R2", "idle", 7)))
+    got = order(loc + rem)
+    check("recency-persists", got == ["R1", "L2", "R2", "L1"], got)
+    check("recency-reopen-no-record", r2.observe("", loc) is False and r2.observe("m1", rem) is False)
+    # While closed, L1 changed here and R2 there: they rise, interleaved.
+    r3 = sb.Recency(now=3000.0)
+    loc = ents16("", 0, ("L1", "idle", 6), ("L2", "idle", 9))
+    rem = ents16("m1", 1, ("R1", "idle", 8), ("R2", "idle", 11))
+    r3.observe("", loc)
+    r3.observe("m1", rem, now=3000.5)
+    got = order(loc + rem)
+    check("recency-closed-rises", got == ["L1", "R2", "R1", "L2"], got)
+    with open(os.path.join(d, "recency.json"), "w") as f:
+        f.write("{not json")
+    check("recency-broken-file", sb.Recency().seen == {})
+
+    # In the popup: the cache carries its order but is not a read.
+    m1 = [{"id": "m1", "label": "other"}]
+    vivid = {"local": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="here-one")]),
+             "m1": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="other-one")])}
+
+    def fetch16(machine="", timeout=None, info=None):
+        return vivid[machine or "local"]
+
+    sb.save_cache("m1", vivid["m1"])
+    lv = sb.Live(m1, sb.entries_from(fetch16(), "", "here", 0), fetch=fetch16)
+    check("recency-cache-is-not-a-read", "m1" not in lv.recency.fresh and "" in lv.recency.fresh)
+    lv.refresh_remote(0, m1[0])
+    t = lv.text()
+    check("recency-live-tie-local", t.index("here-one") < t.index("other-one"), t)
+    vivid["m1"] = snap([pane("w1:p1")], [agent("w1:p1", "idle", 2, title="other-one")])
+    lv.refresh_remote(0, m1[0])
+    t = lv.text()
+    check("recency-live-remote-rises", t.index("other-one") < t.index("here-one"), t)
+    vivid["local"] = snap([pane("w1:p1")], [agent("w1:p1", "idle", 2, title="here-one")])
+    lv.refresh_local()
+    t = lv.text()
+    check("recency-live-local-rises", t.index("here-one") < t.index("other-one"), t)
+    sb.STATE_DIR = STATE
+
+# 17. done: finished and not seen.
+T1, T2 = "w1:t1", "w1:t2"
+TABS17 = [{"tab_id": T1, "label": "one", "number": 1, "workspace_id": "w1"},
+          {"tab_id": T2, "label": "two", "number": 2, "workspace_id": "w1"}]
+
+
+def ag17(pid, status, seq, tab=T1, compl=None):
+    a = agent(pid, status, seq, tab=tab)
+    if compl is not None:
+        a["completion_seq"] = compl
+    return a
+
+
+def snap17(focus, *ags):
+    s = snap([pane(a["pane_id"], a["tab_id"]) for a in ags], list(ags), tabs=TABS17)
+    s["focused_tab_id"] = focus
+    return s
+
+
+def ents17(machine, idx, *ags):
+    return sb.entries_from(snap17(None, *ags), machine, machine or "here", idx)
+
+
+def st(entries):
+    return {e["pane"]: e["status"] for e in entries}
+
+
+rd = sb.Recency(persist=False, now=100.0)
+e = ents17("m1", 1, ag17("A", "idle", 5, T1, 5))
+rd.observe("m1", e, focus=T1)
+check("done-first-time-all-seen", st(e) == {"A": "idle"}, st(e))
+# Another machine: A finishes in the tab left open there (the server says idle) and B in
+# another tab that is already idle (someone went there).
+rd = sb.Recency(persist=False, now=100.0)
+rd.observe("m1", ents17("m1", 1, ag17("A", "working", 5, T1), ag17("B", "working", 6, T2)), focus=T1)
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("B", "idle", 8, T2, 8))
+rd.observe("m1", e, now=105.0, focus=T1)
+check("done-finished-in-the-open-tab-of-another", st(e) == {"A": "done", "B": "idle"}, st(e))
+check("done-counted-in-the-header", "1 done" in sb.header(e, [], [], []), sb.header(e, [], [], []))
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("B", "idle", 8, T2, 8))
+check("done-stays-without-changes", rd.observe("m1", e, now=110.0, focus=T1) is False and st(e)["A"] == "done", st(e))
+check("done-enter-other-machine-no", rd.ack_tab("", T1, e) is False and st(rd.apply(e))["A"] == "done")
+check("done-enter-other-tab-no", rd.ack_tab("m1", T2, e) is False and st(rd.apply(e))["A"] == "done")
+check("done-enter-marks-seen", rd.ack_tab("m1", T1, e) is True and st(rd.apply(e))["A"] == "idle", st(e))
+# The server had it done and turns it idle: you went there some other way.
+rd = sb.Recency(persist=False, now=100.0)
+rd.observe("m1", ents17("m1", 1, ag17("C", "working", 1, T2)), focus=T1)
+e = ents17("m1", 1, ag17("C", "done", 2, T2, 2))
+rd.observe("m1", e, now=101.0, focus=T1)
+check("done-from-the-server-respected", st(e) == {"C": "done"}, st(e))
+e = ents17("m1", 1, ag17("C", "idle", 2, T2, 2))
+rd.observe("m1", e, now=102.0, focus=T1)
+check("done-server-turned-it-idle", st(e) == {"C": "idle"}, st(e))
+# On the popup's machine: what is in front of you counts as seen.
+rd = sb.Recency(persist=False, now=100.0)
+rd.observe("", ents17("", 0, ag17("L", "working", 1, T1)), focus=T1, here=True)
+e = ents17("", 0, ag17("L", "idle", 2, T1, 2))
+rd.observe("", e, now=101.0, focus=T1, here=True)
+check("done-in-front-of-you-no", st(e) == {"L": "idle"}, st(e))
+# Finished in the tab you were on and left: done until you open the popup there.
+rd = sb.Recency(persist=False, now=100.0)
+rd.observe("", ents17("", 0, ag17("L", "working", 1, T1)), focus=T1, here=True)
+e = ents17("", 0, ag17("L", "idle", 2, T1, 2))
+rd.observe("", e, now=101.0, focus=T2, here=True)
+check("done-you-left-the-tab", st(e) == {"L": "done"}, st(e))
+e = ents17("", 0, ag17("L", "idle", 2, T1, 2))
+rd.observe("", e, now=102.0, focus=T1, here=True)
+check("done-back-on-the-tab", st(e) == {"L": "idle"}, st(e))
+# An idle that closed no work does not rise; working and blocked do not change.
+rd = sb.Recency(persist=False, now=100.0)
+rd.observe("m1", ents17("m1", 1, ag17("N", "working", 1, T1), ag17("O", "working", 2, T1),
+                         ag17("W", "idle", 3, T1), ag17("X", "idle", 4, T1)), focus=T1)
+e = ents17("m1", 1, ag17("N", "idle", 5, T1), ag17("O", "idle", 6, T1, 4),
+           ag17("W", "working", 7, T1, 3), ag17("X", "blocked", 8, T1))
+rd.observe("m1", e, now=101.0, focus=T1)
+check("done-only-when-it-closed-work", st(e) == {"N": "idle", "O": "idle", "W": "working", "X": "blocked"}, st(e))
+
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    r1 = sb.Recency(now=100.0)
+    r1.observe("m1", ents17("m1", 1, ag17("A", "working", 5, T1)), focus=T1)
+    r1.observe("m1", ents17("m1", 1, ag17("A", "idle", 7, T1, 7)), now=105.0, focus=T1)
+    e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7))
+    r2 = sb.Recency(now=200.0)
+    check("done-persists-in-the-ledger", st(r2.apply(e)) == {"A": "done"}, st(e))
+    r2.observe("m1", e, focus=T1)
+    check("done-persists-on-reread", st(e) == {"A": "done"}, st(e))
+    r2.ack_tab("m1", T1, e)
+    check("done-seen-persists", st(sb.Recency(now=300.0).apply(e)) == {"A": "idle"}, st(e))
+    with open(os.path.join(d, "recency.json"), "w") as f:
+        json.dump({"v": 1, "machines": {"m1": {"A": [7, 100.0, 0]}}}, f)
+    r3 = sb.Recency(now=400.0)
+    e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7))
+    r3.observe("m1", e, focus=T1)
+    check("done-old-file-all-seen", st(e) == {"A": "idle"}, st(e))
+
+    # In the popup: the other machine finishes something in its open tab and it shows done on top.
+    os.remove(os.path.join(d, "recency.json"))
+    m1 = [{"id": "m1", "label": "other"}]
+    vivid = {"local": snap17(T1, ag17("p1", "working", 1, T1)),
+             "m1": snap17(T1, ag17("p9", "working", 1, T1))}
+
+    def fetch17(machine="", timeout=None, info=None):
+        return vivid[machine or "local"]
+
+    lv = sb.Live(m1, sb.entries_from(fetch17(), "", "here", 0), fetch=fetch17, focus=T1)
+    lv.refresh_remote(0, m1[0])
+    vivid["m1"] = snap17(T1, ag17("p9", "idle", 2, T1, 2))
+    vivid["local"] = snap17(T1, ag17("p1", "idle", 2, T1, 2))
+    lv.refresh_remote(0, m1[0])
+    lv.refresh_local()
+    rows = lv.text().splitlines()
+    check("done-live-remote-on-top", "1 done" in rows[0] and rows[1].startswith("m1|a|p9|") and "● done" in rows[1]
+          and rows[2].startswith("|a|p1|") and "○ idle" in rows[2], rows[:3])
+    lv.recency.ack_tab("m1", T1, lv.entries())
+    with lv.lock:
+        lv.recency.apply(lv.remote["m1"])
+    check("done-live-enter-clears-it", "done" not in lv.text().split("\n", 1)[1], lv.text())
+    sb.STATE_DIR = STATE
+
+check("done-enter-acks", "live.recency.ack_tab(target[\"machine\"], target[\"tab\"], live.entries())" in SOURCE)
+
+
+if FAILS:
+    print("FAIL %d:\n  " % len(FAILS) + "\n  ".join(str(f) for f in FAILS))
+    sys.exit(1)
+print("ok")
