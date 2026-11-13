@@ -82,6 +82,10 @@ What it has to get right, and how it fails otherwise:
 26. ssh control sockets go only in a directory that is provably this user's: a directory
    someone else created first, a symlink, or one open to group or others is refused, and
    with no safe directory connections are simply not shared.
+27. A config can never crash the program: wrong types, out-of-range or non-finite numbers and
+   huge integers each fall back to their default with a warning, on both parsers, and even
+   --version survives. Lines end only at \n, so a file reads the same with tomllib and with
+   the built-in parser (U+2028 stays inside a comment, \v and \f are errors).
 
     python3 tests/test_switchboard.py
 """
@@ -1482,7 +1486,7 @@ else:
 check("program-executable", os.access(str(TOOL), os.X_OK) and SOURCE.startswith("#!/usr/bin/env python3\n"))
 std = set(getattr(sys, "stdlib_module_names", ())) or {
     "base64", "copy", "glob", "json", "os", "re", "select", "shlex", "shutil", "socket", "subprocess", "sys",
-    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty", "stat"}
+    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty", "stat", "math"}
 imported = set()
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):
@@ -1573,6 +1577,99 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         check("safe-dir-shares", "ControlMaster=auto" in mux and "ControlPath=%s/ssh-%%C" % fresh in mux, mux)
     finally:
         sb._SSH_DIR[:] = saved_dir
+
+# 27. A config can never crash the program, and reads the same on every Python.
+PARSERS = [False, True] if HAVE_TOMLLIB else [False]
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    BAD = [
+        ("[lang]\n", "lang"),
+        ('lang = ["es"]\n', "lang"),
+        ("[refresh]\ncache_max_age = 1e400\n", "refresh.cache_max_age"),
+        ("[refresh]\nlocal_seconds = nan\n", "refresh.local_seconds"),
+        ("[refresh]\nremote_seconds = inf\n", "refresh.remote_seconds"),
+        ("[refresh]\nremote_timeout = -inf\n", "refresh.remote_timeout"),
+        ("[refresh]\nremote_timeout = %s\n" % ("9" * 400), "refresh.remote_timeout"),
+        ("[refresh]\nlocal_seconds = 0.1\n", "refresh.local_seconds"),
+        ("[refresh]\nlocal_seconds = 61\n", "refresh.local_seconds"),
+        ("[refresh]\ncache_max_age = -1\n", "refresh.cache_max_age"),
+        ("[refresh]\ncache_max_age = 100000\n", "refresh.cache_max_age"),
+        ("[refresh.local_seconds]\n", "refresh.local_seconds"),
+        ("[local_label]\n", "local_label"),
+        ("[jump]\nenabled = 1\n", "jump.enabled"),
+    ]
+    for i, (text, key) in enumerate(BAD):
+        path = d / ("bad%d.toml" % i)
+        path.write_bytes(text.encode())
+        for use in PARSERS:
+            try:
+                cfg, warn = sb.load_config(str(path), use_tomllib=use)
+            except Exception as exc:
+                check("config-never-raises %r (tomllib=%s)" % (text[:40], use), False, repr(exc))
+                continue
+            check("config-bad-value-is-default %r (tomllib=%s)" % (text[:40], use), cfg == sb.DEFAULTS, cfg)
+            check("config-bad-value-warns %r (tomllib=%s)" % (text[:40], use), bool(warn) and "\n" not in warn, warn)
+            # The built-in parser rejects arrays as a whole; tomllib reads them and the key is refused.
+            if use or "[" not in text.split("=")[-1]:
+                check("config-warning-names-the-key %r (tomllib=%s)" % (text[:40], use), key in (warn or ""), warn)
+        env = dict(os.environ, HERDR_PLUGIN_CONFIG_DIR=str(d / ("dir%d" % i)))
+        os.makedirs(env["HERDR_PLUGIN_CONFIG_DIR"])
+        (pathlib.Path(env["HERDR_PLUGIN_CONFIG_DIR"]) / "config.toml").write_bytes(text.encode())
+        r = subprocess.run([sys.executable, str(TOOL), "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
+        check("config-version-survives %r" % text[:40], r.returncode == 0 and r.stdout.startswith("switchboard ")
+              and not r.stderr, (r.returncode, r.stderr[-200:]))
+    # In range, a fraction is kept as it is (it used to be truncated to an integer).
+    (d / "half.toml").write_text("[refresh]\ncache_max_age = 0.5\nlocal_seconds = 0.2\nremote_timeout = 120\n")
+    cfg, warn = sb.load_config(str(d / "half.toml"), use_tomllib=False)
+    check("config-fraction-kept", warn is None and cfg["refresh"]["cache_max_age"] == 0.5
+          and cfg["refresh"]["local_seconds"] == 0.2 and cfg["refresh"]["remote_timeout"] == 120.0, (cfg, warn))
+    # Whatever goes wrong inside, loading still returns the defaults and a warning.
+    saved_merge = sb.merge_config
+    sb.merge_config = lambda raw: 1 / 0
+    try:
+        cfg, warn = sb.load_config(str(d / "half.toml"), use_tomllib=False)
+        check("config-unexpected-error-is-defaults", cfg == sb.DEFAULTS and bool(warn), (cfg, warn))
+    finally:
+        sb.merge_config = saved_merge
+    # The refresh loops never see a non-finite interval, from the file or the environment.
+    os.environ["SWITCHBOARD_LOCAL_EVERY"] = "nan"
+    try:
+        sb.configure(sb.merge_config({})[0])
+        check("env-nan-ignored", sb.LOCAL_EVERY == sb.DEFAULTS["refresh"]["local_seconds"], sb.LOCAL_EVERY)
+    finally:
+        del os.environ["SWITCHBOARD_LOCAL_EVERY"]
+        sb.configure(sb.load_config()[0])
+        sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
+
+# The same bytes read the same through both parsers: only \n ends a line.
+SAME = [
+    ("# note [jump]\nenabled = true\n", {"enabled": True}),
+    ("# a\u0085b\nlang = \"es\"\n", {"lang": "es"}),
+    ("lang = \"es\"\r\nlocal_label = \"x\"\r\n", {"lang": "es", "local_label": "x"}),
+    ("lang = \"a\tb\"\n", {"lang": "a\tb"}),
+    ("# a\x0bb\n", None),
+    ("# a\x0cb\n", None),
+    ("# a\x1cb\n", None),
+    ("x = 1 # a\x7fb\n", None),
+    ("lang = \"es\"\rlocal_label = \"x\"\n", None),
+    (" lang = \"es\"\n", None),
+    ("lang = \"es\" \n", None),
+    ("[jump] enabled = true\n", None),
+    ("lang = \"e\x01s\"\n", None),
+]
+for text, want in SAME:
+    for use in PARSERS:
+        try:
+            got = sb.toml_loads(text, use_tomllib=use)
+        except ValueError:
+            got = None
+        check("parsers-agree %r (tomllib=%s)" % (text, use), got == want, got)
+cfg, problems = sb.merge_config(sb.toml_loads(SAME[0][0], use_tomllib=False))
+check("hidden-line-break-does-not-enable-the-jump", cfg["jump"]["enabled"] is False and problems, (cfg["jump"], problems))
+special = sb.toml_loads("a = inf\nb = -inf\nc = nan\n", use_tomllib=False)
+check("builtin-reads-special-floats", special["a"] == float("inf") and special["b"] == float("-inf")
+      and special["c"] != special["c"], special)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0] and sb._SSH_DIR[0].startswith(_tmp_root),

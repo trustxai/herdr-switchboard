@@ -17,14 +17,18 @@ lang = "en"
 local_label = ""
 
 [refresh]
-# Seconds between two reads of this machine while the popup is open.
+# Numbers may be integers or decimals. A value outside its range (or inf, nan, or not a
+# number) is reported in the popup header and replaced by the default.
+
+# Seconds between two reads of this machine while the popup is open. 0.2 to 60.
 local_seconds = 1
-# Seconds between two reads of each saved machine.
+# Seconds between two reads of each saved machine. 0.5 to 600.
 remote_seconds = 3
-# Seconds before a saved machine that does not answer is shown as offline.
+# Seconds before a saved machine that does not answer is shown as offline. 1 to 120.
 remote_timeout = 8
 # Seconds the last snapshot of a saved machine stays usable: it is shown the moment the
 # popup opens, marked with its age, until the fresh one arrives. Older ones are not shown.
+# 0 to 86400; 0 turns the cached view off.
 cache_max_age = 1800
 
 [colors]

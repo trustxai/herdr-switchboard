@@ -22,6 +22,7 @@ import base64
 import copy as copymod
 import glob
 import json
+import math
 import os
 import re
 import select
@@ -137,6 +138,7 @@ STRINGS = {
         "toml_expected_eq": "line %d: expected '=' after the key",
         "toml_missing": "line %d: missing value",
         "toml_duplicate": "line %d: duplicate key %s",
+        "toml_control_char": "line %d: control character (only tab is allowed)",
     },
     "es": {
         "st_blocked": "blocked", "st_done": "done", "st_working": "working",
@@ -206,6 +208,7 @@ STRINGS = {
         "toml_expected_eq": "línea %d: falta '=' después de la clave",
         "toml_missing": "línea %d: falta el valor",
         "toml_duplicate": "línea %d: clave repetida %s",
+        "toml_control_char": "línea %d: carácter de control (solo se acepta tab)",
     },
 }
 
@@ -229,7 +232,7 @@ DEFAULTS = {
         "local_seconds": 1.0,
         "remote_seconds": 3.0,
         "remote_timeout": 8.0,
-        "cache_max_age": 1800,
+        "cache_max_age": 1800.0,
     },
     # Names of the terminal's own ANSI palette, so the default looks right on any theme.
     "colors": {
@@ -249,6 +252,14 @@ DEFAULTS = {
     },
 }
 
+# The accepted range of each number, inclusive. Anything else, including inf and nan, is
+# reported and replaced by the default.
+NUMBER_RANGES = {
+    ("refresh", "local_seconds"): (0.2, 60.0),
+    ("refresh", "remote_seconds"): (0.5, 600.0),
+    ("refresh", "remote_timeout"): (1.0, 120.0),
+    ("refresh", "cache_max_age"): (0.0, 86400.0),
+}
 COLOR_VALUE = re.compile(r"^(-1|[0-9]{1,3}|#[0-9a-fA-F]{6}|[a-z]+(-[a-z]+)*)$")
 FZF_COLOR_SPEC = re.compile(r"^[A-Za-z0-9#:+,._-]*$")
 
@@ -278,7 +289,11 @@ class ConfigError(ValueError):
 
 
 _BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
-_TOKEN = re.compile(r"[^\s#]+")
+_TOKEN = re.compile(r"[^ \t#]+")
+# Control characters TOML forbids outside strings, comments included (tab is allowed).
+_TOML_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+_SPECIAL_FLOATS = {"inf": float("inf"), "+inf": float("inf"), "-inf": float("-inf"),
+                   "nan": float("nan"), "+nan": float("nan"), "-nan": float("nan")}
 _INT = re.compile(r"^[+-]?(0|[1-9](_?[0-9])*)$")
 _FLOAT = re.compile(r"^[+-]?(0|[1-9](_?[0-9])*)(\.[0-9](_?[0-9])*)?([eE][+-]?[0-9](_?[0-9])*)?$")
 _ESCAPES = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
@@ -353,6 +368,8 @@ def _value(s, pos, n):
         return True, m.end()
     if token == "false":
         return False, m.end()
+    if token in _SPECIAL_FLOATS:  # valid TOML; the range check rejects them later
+        return _SPECIAL_FLOATS[token], m.end()
     if _INT.match(token):
         return int(token.replace("_", "")), m.end()
     if _FLOAT.match(token) and ("." in token or "e" in token or "E" in token):
@@ -367,19 +384,30 @@ def _skip(s, i):
 
 
 def _comment_only(s, i):
-    rest = s[i:].strip()
+    rest = s[i:].strip(" \t")
     return not rest or rest.startswith("#")
 
 
 def parse_toml_subset(text):
     """The flat TOML subset the config uses: [tables] (dotted names allowed), and keys
     with string, integer, float or boolean values. Anything else is an error, as is a
-    duplicate key or table, so a file reads the same here and through tomllib."""
+    duplicate key or table, so a file reads the same here and through tomllib.
+
+    Lines end only at \n (\r\n is accepted). str.splitlines() would also break at \v,
+    \f, U+2028 and others, which tomllib reads as part of a comment: a hidden line break
+    could then turn on an option that tomllib ignores. Whitespace is space and tab only."""
     root, declared = {}, set()
     table = root
-    for n, line in enumerate(text.splitlines(), 1):
-        s = line.strip()
-        if not s or s.startswith("#"):
+    for n, line in enumerate(text.split("\n"), 1):
+        if line.endswith("\r"):
+            line = line[:-1]
+        s = line.strip(" \t")
+        if not s:
+            continue
+        # Strings may hold \t only too; other control characters are an error anywhere.
+        if _TOML_CONTROL.search(s):
+            raise ConfigError(tr("toml_control_char", n))
+        if s.startswith("#"):
             continue
         if s.startswith("["):
             if s.startswith("[["):
@@ -433,14 +461,22 @@ def toml_loads(text, use_tomllib=None):
     return parse_toml_subset(text)
 
 
-def _check(default, value):
-    """The value converted to the default's type, or None when it does not fit."""
+def _check(default, value, where=None):
+    """The value converted to the default's type, or None when its type or range does not
+    fit. Numbers must be finite and inside NUMBER_RANGES[where]."""
     if isinstance(default, bool):
         return value if isinstance(value, bool) else None
     if isinstance(default, (int, float)):
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
             return None
-        return type(default)(value)
+        try:
+            value = float(value)  # a huge integer overflows here
+        except OverflowError:
+            return None
+        low, high = NUMBER_RANGES.get(where, (0.0, float("inf")))
+        if not math.isfinite(value) or not low <= value <= high:
+            return None
+        return value
     if isinstance(default, str):
         return value if isinstance(value, str) else None
     return None
@@ -450,7 +486,7 @@ def merge_config(raw):
     """DEFAULTS with the user's values on top, and the problems found on the way (in the
     language the file asks for, when it asks for a valid one)."""
     cfg, problems = copymod.deepcopy(DEFAULTS), []
-    lang = raw.get("lang") if raw.get("lang") in STRINGS else None
+    lang = raw.get("lang") if isinstance(raw.get("lang"), str) and raw.get("lang") in STRINGS else None
     for key, value in raw.items():
         if key not in DEFAULTS:
             problems.append(tr("cfg_unknown", key, lang=lang))
@@ -464,7 +500,7 @@ def merge_config(raw):
                 if sub not in default:
                     problems.append(tr("cfg_unknown", key + "." + sub, lang=lang))
                     continue
-                got = _check(default[sub], v)
+                got = _check(default[sub], v, (key, sub))
                 if key == "colors" and got is not None and not (
                         FZF_COLOR_SPEC.match(got) if sub == "fzf" else COLOR_VALUE.match(got)):
                     got = None
@@ -496,9 +532,10 @@ def load_config(path=None, use_tomllib=None):
         return copymod.deepcopy(DEFAULTS), tr("config_warning", path, exc.strerror or exc)
     try:
         raw = toml_loads(data.decode("utf-8"), use_tomllib)
-    except (ValueError, UnicodeDecodeError) as exc:  # tomllib's error is a ValueError
-        return copymod.deepcopy(DEFAULTS), tr("config_warning", path, str(exc).splitlines()[0])
-    cfg, problems = merge_config(raw)
+        cfg, problems = merge_config(raw)
+    except Exception as exc:  # whatever the file holds, it never stops the program
+        reason = (str(exc).splitlines() or [type(exc).__name__])[0]
+        return copymod.deepcopy(DEFAULTS), tr("config_warning", path, reason)
     if not problems:
         return cfg, None
     return cfg, tr("config_warning", path, "; ".join(problems), lang=cfg["lang"])
@@ -506,9 +543,10 @@ def load_config(path=None, use_tomllib=None):
 
 def _env_float(name, default):
     try:
-        return float(os.environ[name])
+        value = float(os.environ[name])
     except (KeyError, ValueError):
         return default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 CONFIG = copymod.deepcopy(DEFAULTS)
@@ -544,7 +582,10 @@ def configure(cfg, warning=None):
     JUMP_HELPER = cfg["jump"]["helper"]
 
 
-configure(*load_config())
+try:
+    configure(*load_config())
+except Exception as _exc:  # the config must not stop modes that do not even need it
+    configure(copymod.deepcopy(DEFAULTS), tr("config_warning", config_path(), type(_exc).__name__))
 
 # --- rows -------------------------------------------------------------------------------
 
