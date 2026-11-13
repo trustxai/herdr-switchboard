@@ -102,6 +102,8 @@ What it has to get right, and how it fails otherwise:
 33. No malformed snapshot, of any type at any level, can kill a thread or print a traceback:
    snapshot() refuses it, the refresh paths treat it as no answer, --rows and the popup say
    what failed, and neither watch loop can die.
+34. In the selection viewer an arrow key whose bytes arrive in two reads scrolls instead of
+   closing the viewer, and a lone Esc still closes it.
 
     python3 tests/test_switchboard.py
 """
@@ -2170,6 +2172,53 @@ with tempfile.TemporaryDirectory() as d:
                        env=dict(env, LOCAL_FILE="bad.json", SWITCHBOARD_FZF=str(fzf_ok)), timeout=30)
     check("popup-malformed-local-is-a-message", r.returncode == 1 and "herdr api snapshot failed" in r.stdout
           and "Traceback" not in r.stderr, (r.returncode, r.stdout[-200:], r.stderr[-300:]))
+
+# 34. The selection viewer tells a split arrow key from a lone Esc.
+def viewer_alive_after(chunks, gap):
+    """Run --select in a pty, write the chunks `gap` seconds apart, and say whether the viewer
+    is still running 0.4 s later; then quit it."""
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        (d / "pane.txt").write_text("\n".join("line %d" % i for i in range(60)) + "\n")
+        fake = executable(d / "herdr", '#!/bin/sh\ncat "%s/pane.txt"\n' % d)
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(HERDR_BIN_PATH=str(fake), TERM="xterm-256color")
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL), "--select", "|a|w1:p1|w1:t1"])
+        import fcntl as _f5
+        import struct as _st5
+        import termios as _tm5
+        _f5.ioctl(fd, _tm5.TIOCSWINSZ, _st5.pack("HHHH", 10, 40, 0, 0))
+
+        def drain(sec):
+            end = _time.time() + sec
+            while _time.time() < end:
+                r, _, _ = _sel.select([fd], [], [], 0.02)
+                if r:
+                    try:
+                        os.read(fd, 65536)
+                    except OSError:
+                        return
+        drain(1.0)
+        for i, chunk in enumerate(chunks):
+            if i:
+                _time.sleep(gap)
+            os.write(fd, chunk)
+        drain(0.4)
+        done, _ = os.waitpid(pid, os.WNOHANG)
+        alive = done == 0
+        if alive:
+            os.write(fd, b"q")
+            drain(0.5)
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done == 0:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+        return alive
+
+
+check("viewer-split-arrow-keeps-it-open", viewer_alive_after([b"\x1b", b"[A"], 0.02))
+check("viewer-lone-esc-closes-it", not viewer_alive_after([b"\x1b"], 0))
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]

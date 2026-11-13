@@ -1895,10 +1895,12 @@ def select_view(row_id, tty="/dev/tty"):
                 if hit:
                     sel.scroll(keys[hit])
                     buf = buf[len(hit):]
-                elif buf[0] in ("q", "\x03") or buf == "\x1b":
+                elif buf[0] in ("q", "\x03"):
                     return 0
                 elif buf.startswith("\x1b") and len(buf) < 3:
-                    r2, _, _ = select.select([fd], [], [], 0.05)  # a lone Esc or the start of a sequence?
+                    # A lone Esc, or the first bytes of an arrow key whose rest is still on its
+                    # way? Wait a moment for more before taking it as Esc.
+                    r2, _, _ = select.select([fd], [], [], 0.05)
                     if not r2:
                         return 0
                     break
