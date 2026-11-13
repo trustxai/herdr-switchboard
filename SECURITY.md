@@ -33,8 +33,10 @@ the changelog unless you prefer otherwise.
 
 Switchboard is one Python script that uses only the standard library and drives
 [fzf](https://github.com/junegunn/fzf). It has no dependencies to install, no build step and no
-telemetry, and it opens no network connection of its own. This is everything it reaches outside
-its own process, which is also the scope of this policy.
+telemetry, and it opens no network connection of its own. With the cross-machine jump off, which
+is the default, the sections below up to the state directory are everything it reaches outside
+its own process. The jump adds what its own section describes. All of it is the scope of this
+policy.
 
 ### The local herdr
 
@@ -47,9 +49,10 @@ nothing unless the optional jump below is enabled.
 
 For every machine you already saved in herdr, it runs `ssh` to that machine to read its
 snapshot, show previews and focus panes there. It uses your own ssh configuration, keys and
-agent, and reuses one multiplexed connection per machine (OpenSSH `ControlMaster`). Switchboard
-itself never handles a password or a key, and it only reaches machines that are already saved in
-herdr. What it runs on the other side is the herdr CLI of that machine.
+agent, in batch mode (it never prompts), and reuses one multiplexed connection per machine
+(OpenSSH `ControlMaster`). Switchboard itself never handles a password or a key. What it runs on
+the other side is the herdr CLI of that machine. With the jump off, which is the default, it only
+reaches machines that are already saved in herdr.
 
 ### The clipboard (OSC 52)
 
@@ -68,28 +71,61 @@ socket other local users could reach would let them drive fzf, and that is in sc
 
 ### The state directory
 
-It keeps the last snapshot of each machine, so the list appears at once while fresh data
-arrives, and a small ledger of which agents changed and which finished work you have already
-seen. Both live in the plugin's state directory: `$HERDR_PLUGIN_STATE_DIR`, or
-`${XDG_STATE_HOME:-~/.local/state}/herdr-switchboard` when it runs outside herdr. They hold
-machine labels, workspace, tab and pane names, pane titles and working directories, and nothing
-else: no pane output, no credentials. Deleting the directory is safe.
+It keeps two things in the plugin's state directory: `$HERDR_PLUGIN_STATE_DIR`, or
+`${XDG_STATE_HOME:-~/.local/state}/herdr-switchboard` when it runs outside herdr.
+
+- **The last snapshot of each machine**, so the list appears at once while fresh data arrives.
+  It is herdr's snapshot as herdr returns it: workspace and tab labels; pane ids, titles and
+  working directories; each agent's kind, status, session id and change counters; and the
+  layout of every tab (pane sizes and positions). The herdr version comes along with it.
+- **A small ledger** of which agents changed and which finished work you have already seen: per
+  machine, the agents' change counters and the tab you last focused there.
+
+Neither holds pane output, and neither holds credentials. Deleting the directory is safe.
 
 ### The optional cross-machine jump (off by default)
 
 With `[jump] enabled = true` in the config, choosing a pane on another machine also switches your
-herdr window to that machine. To do that, the herdr server runs `ssh` back to the Mac where your
-herdr window is open and, through AppleScript (`osascript`), sends keystrokes to the Ghostty
-terminal there: the herdr shortcut that opens its own navigator, the name of the pane, and
-Enter. When the pane's name is not unique, it gives the pane a unique name for a moment and then
-restores the original one.
+herdr window to that machine. The window is driven from the Mac it runs on, so the machine where
+the popup runs (the herdr server) has to reach that Mac over ssh.
 
-This is the most sensitive part of the plugin. It only works if the herdr server can log in to
-your Mac over ssh, and anyone who controls the account that runs the herdr server can then type
-into your terminal. Turn it on only when the server is as trusted as the Mac, give the server a
-key of its own for this, and restrict that key in the Mac's `authorized_keys` (for example with a
-`from=` option). With the jump disabled, or when anything it needs is missing, Switchboard only
-focuses the pane through herdr on its own machine.
+**Which Mac.** If `[jump] client` is set, that ssh target is the Mac, and nothing is detected.
+Otherwise Switchboard looks for it:
+
+- if the herdr server is itself a Mac with a herdr window open, that machine is a candidate, and
+  for it everything below runs locally instead of over ssh;
+- it reads the source address of the ssh connections behind the herdr windows attached to this
+  server (herdr's `remote-client-bridge` processes);
+- if the `tailscale` binary is installed, it runs `tailscale status` to put a name and an
+  operating system on those addresses; Tailscale is never required;
+- an address it cannot identify that way gets `ssh <address> uname -s`, to see whether it is a
+  Mac;
+- when more than one Mac qualifies, it runs `ioreg` on each one to read how long it has been
+  idle, and picks the one you touched last.
+
+**What runs on that Mac.** Over ssh, with your keys and in batch mode:
+
+- `herdr plugin list --json`, to find where the plugin is installed there (or the command in
+  `[jump] helper`, if you set one);
+- the plugin's own helper, `python3 <plugin directory>/bin/switchboard --jump-server`. It uses
+  AppleScript (`osascript`) to send keystrokes to the Ghostty window that runs herdr: the herdr
+  shortcut that opens its navigator, a search that matches only the chosen pane, and Enter. It
+  then asks herdr to focus that pane. When no search matches only that pane, it gives the pane a
+  unique name for a moment and then restores the original one.
+
+This is the most sensitive part of the plugin, for two reasons. The herdr server must be able to
+log in to your Mac over ssh, and anyone who controls the account that runs the herdr server can
+then type into your terminal. And without `[jump] client`, the detection connects to addresses
+it learned from the system, not from your herdr configuration. So:
+
+- turn the jump on only when the server is as trusted as the Mac;
+- **set `[jump] client`** to the Mac's ssh target, so the server connects to that host and
+  nothing else;
+- give the server a key of its own for this, and restrict it in the Mac's `authorized_keys`
+  (for example with a `from=` option).
+
+With the jump off, or when anything it needs is missing, Switchboard only focuses the pane
+through herdr on its own machine.
 
 ## Out of scope
 
