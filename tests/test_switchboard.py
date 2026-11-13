@@ -166,6 +166,16 @@ os.environ.update(NO_COLOR="1", PYTHONDONTWRITEBYTECODE="1",
 os.makedirs(os.environ["HOME"])
 os.chmod(_run_root, 0o700)
 
+_socks = [0]
+
+
+def short_sock(name):
+    """A unix socket path under the short runtime root: a socket path is limited to about
+    104 bytes, and TMPDIR can be far longer (macOS, CI runners)."""
+    _socks[0] += 1
+    return os.path.join(_run_root, "%s-%d.sock" % (name, _socks[0]))
+
+
 loader = importlib.machinery.SourceFileLoader("switchboard", str(TOOL))
 spec = importlib.util.spec_from_loader("switchboard", loader)
 sb = importlib.util.module_from_spec(spec)
@@ -425,13 +435,13 @@ class FakeFzf:
 
 
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
-    sock = os.path.join(d, "f.sock")
+    sock = short_sock("f")
     fz = FakeFzf(sock, position=2)
     check("http-get-position", sb.fzf_position(sock) == 2)
     check("http-get-no-content-length", fz.reqs and b"Content-Length" not in fz.reqs[-1], fz.reqs[-1:])
     check("http-post", sb.fzf_request(sock, "POST", b"reload(x)") is not None
           and fz.reqs[-1].endswith(b"\r\n\r\nreload(x)") and b"Content-Length: 9" in fz.reqs[-1])
-    check("http-no-fzf", sb.fzf_position(os.path.join(d, "missing.sock")) is None)
+    check("http-no-fzf", sb.fzf_position(short_sock("missing")) is None)
 
     # watch() end to end: a change sends a reload, no change sends nothing.
     sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
@@ -1472,7 +1482,7 @@ with tempfile.TemporaryDirectory() as d:
     lv.refresh_remote(0, m1[0])
     lv.changed()  # the loops re-read the same data from here on: only the ack can change the rows
     check("acks-watch-before", "● done" in lv.text())
-    sock = os.path.join(str(d), "w.sock")
+    sock = short_sock("w")
     fz = FakeFzf(sock, position=0)
     stop = _threading.Event()
     _threading.Thread(target=sb.watch, args=(lv, sock, str(d / "rows"), stop, str(ack_file)), daemon=True).start()
@@ -1978,7 +1988,7 @@ with tempfile.TemporaryDirectory() as d:
         gone = d / "gone"
         gone.mkdir(mode=0o700)
         gone.chmod(0o700)
-        sock = str(d / "q.sock")
+        sock = short_sock("q")
         FakeFzf(sock)
         stop = _threading.Event()
         lv.changed()
@@ -2174,7 +2184,7 @@ saved_hook = sb.threading.excepthook
 sb.threading.excepthook = lambda a: errors.append(a.exc_type.__name__)
 try:
     with tempfile.TemporaryDirectory(dir="/tmp") as d:
-        sock = os.path.join(d, "x.sock")
+        sock = short_sock("x")
         FakeFzf(sock)
         feed["local"], feed["m1"] = good_local, good_remote
         lv3 = sb.Live([{"id": "m1", "label": "box1"}], sb.entries_from(good_local, "", "here", 0), fetch=fetch33,
@@ -2373,7 +2383,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     # watch(): a rows.tmp planted as a link is never written through.
     rows_dir = private_tmp(d, "rows-dir")
     os.symlink(decoy, os.path.join(rows_dir, "rows.tmp"))
-    sock = os.path.join(d, "r.sock")
+    sock = short_sock("r")
     FakeFzf(sock)
     feed35 = {"n": 1}
     lv = sb.Live([], [], fetch=lambda m="", t=None, i=None: snap([pane("w1:p1")], [agent("w1:p1", "idle", feed35["n"])]),
@@ -2606,7 +2616,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     try:
         lv = sb.Live([], [], fetch=lambda m="", t=None, i=None: snap([], []), cache=False)
         stop = _threading.Event()
-        t = _threading.Thread(target=sb.watch, args=(lv, os.path.join(d, "none.sock"), os.path.join(rows_dir, "rows"),
+        t = _threading.Thread(target=sb.watch, args=(lv, short_sock("none"), os.path.join(rows_dir, "rows"),
                                                     stop, None))
         t.start()
         _time.sleep(0.5)
