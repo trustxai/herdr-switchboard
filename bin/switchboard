@@ -1389,18 +1389,33 @@ def machine_labels():
     return {str(k): clean(v) for k, v in labels.items()} if isinstance(labels, dict) else {}
 
 
-def enter(row_id):
+def record_ack(target, run_dir=None):
+    """Tell the popup that this row's tab was picked: one line appended to its acks file."""
+    run_dir = run_dir or os.environ.get("SWITCHBOARD_RUN_DIR")
+    if not run_dir:
+        return
+    try:
+        with open(os.path.join(run_dir, "acks"), "a") as f:
+            f.write(json.dumps([target["machine"], target["tab"]]) + "\n")
+    except OSError:
+        pass
+
+
+def enter(row_id, run_dir=None):
     """fzf's Enter when the cross-machine jump is off (`--enter`, through transform).
 
     A row of this machine is accepted as usual. For a row of another machine this only
     prints fzf actions, at once: the footer says it is being focused, and a background
-    transform (`--focus`) does the slow part, so fzf never waits on the network."""
+    transform (`--focus`) does the slow part, so fzf never waits on the network. The tab
+    is recorded as seen right here, before fzf handles another key, so an Esc that follows
+    cannot lose it."""
     target = parse_id(row_id)
     if target is None:
         return 0
     if not target["machine"] or JUMP_ENABLED:
         sys.stdout.write("accept\n")
         return 0
+    record_ack(target, run_dir)
     label = machine_labels().get(target["machine"]) or target["machine"]
     self_cmd = " ".join(shlex.quote(x) for x in (sys.executable, os.path.abspath(__file__)))
     now = fzf_action("change-footer", tr("remote_focusing", label))
@@ -1409,9 +1424,31 @@ def enter(row_id):
     return 0
 
 
-def focus_remote(row_id, run_dir=None):
-    """`--focus`: focus a row of another machine through herdr's API, record its tab as seen
-    for the popup, and print the footer text that says how it went."""
+def focus_remote(row_id):
+    """`--focus`, fzf's background transform: hand the focus to a worker in its own session
+    and print the footer text the worker returns.
+
+    fzf stops its background transforms when it exits, so an Esc right after Enter would
+    kill a focus done in this process. The worker is detached (its own session, stdin from
+    /dev/null): it finishes the focus even if this process and the popup are gone."""
+    target = parse_id(row_id)
+    if target is None or not target["machine"]:
+        return 0
+    try:
+        worker = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--focus-now", row_id],
+                                  stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  universal_newlines=True, start_new_session=True)
+        out, _ = worker.communicate()
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    label = machine_labels().get(target["machine"]) or target["machine"]
+    sys.stdout.write((out.strip() or tr("remote_failed", label)) + "\n")
+    return 0
+
+
+def focus_now(row_id):
+    """`--focus-now`, the detached worker: focus the row's pane (or tab) on its machine
+    through herdr's API, and print how it went."""
     target = parse_id(row_id)
     if target is None or not target["machine"]:
         return 0
@@ -1421,15 +1458,12 @@ def focus_remote(row_id, run_dir=None):
         ok = True
     except Exception:
         ok = False
-    run_dir = run_dir or os.environ.get("SWITCHBOARD_RUN_DIR")
-    if run_dir:
-        try:
-            with open(os.path.join(run_dir, "acks"), "a") as f:
-                f.write(json.dumps([target["machine"], target["tab"]]) + "\n")
-        except OSError:
-            pass
     label = machine_labels().get(target["machine"]) or target["machine"]
-    sys.stdout.write(tr("remote_ready" if ok else "remote_failed", label) + "\n")
+    try:
+        sys.stdout.write(tr("remote_ready" if ok else "remote_failed", label) + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):  # the popup is gone; the focus is done all the same
+        pass
     return 0
 
 
@@ -2533,6 +2567,8 @@ def main(argv):
             return enter(argv[1] if len(argv) > 1 else "")
         if argv[:1] == ["--focus"]:
             return focus_remote(argv[1] if len(argv) > 1 else "")
+        if argv[:1] == ["--focus-now"]:
+            return focus_now(argv[1] if len(argv) > 1 else "")
         if argv[:1] == ["--jump-server"]:
             return jump_server()
         if argv[:1] == ["--jump"] and len(argv) == 8:

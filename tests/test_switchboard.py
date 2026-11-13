@@ -97,6 +97,8 @@ What it has to get right, and how it fails otherwise:
 31. Enter on a remote row never blocks fzf: the footer changes at once and the focus runs in a
    background transform. An ack written while the popup consumes acks is never lost, and the
    watch loop survives the popup removing its directory on close.
+32. A focus already asked for finishes even when the popup closes right after Enter, and the
+   tab still counts as seen.
 
     python3 tests/test_switchboard.py
 """
@@ -1372,12 +1374,14 @@ with tempfile.TemporaryDirectory() as d:
     check("enter-remote-footer-now", out.startswith("change-footer(focusing it on box1…)+bg-transform-footer"), out)
     check("enter-remote-focus-in-background", "--focus 'm1|a|w1:p4|w1:t2'" in out and out.endswith(")"), out)
     check("enter-remote-calls-no-herdr", not log.exists() or log.read_text() == "", log.read_text() if log.exists() else "")
+    acks = (run_dir / "acks").read_text().splitlines() if (run_dir / "acks").exists() else []
+    check("enter-remote-acks-the-tab-at-once", acks == ['["m1", "w1:t2"]'], acks)
     out = run_mode("--focus", "m1|a|w1:p4|w1:t2")
     check("focus-remote-footer", out == "ready on box1: switch to that machine to see it · esc closes", out)
     check("focus-remote-through-the-api", log.exists() and "--machine m1 agent focus w1:p4" in log.read_text(),
           log.read_text() if log.exists() else "")
     acks = (run_dir / "acks").read_text().splitlines() if (run_dir / "acks").exists() else []
-    check("focus-remote-acks-the-tab", acks == ['["m1", "w1:t2"]'], acks)
+    check("focus-remote-does-not-ack-again", acks == ['["m1", "w1:t2"]'], acks)
     out = run_mode("--focus", "m2|t|w1:p1|w1:t1")
     check("focus-remote-fails-quietly", "could not focus it on box2" in out, out)
     log.write_text("")
@@ -1982,6 +1986,71 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
         check("enter-pty-focus-arrives-later", "ready" in marks and marks["ready"] - marks["enter"] >= 1.5, marks)
         check("enter-pty-popup-stays-then-esc", rc == 0, rc)
         check("enter-pty-focused-through-herdr", "--machine m1 agent focus w1:p7" in (d / "log").read_text())
+
+# 32. Enter on a remote row, then Esc at once: the focus still happens, the ack is kept.
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        (d / "local.json").write_text(json.dumps({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)])}}))
+        remote_agent = dict(agent("w1:p7", "idle", 5, title="remote-done"), completion_seq=5)
+        (d / "m1.json").write_text(json.dumps({"result": {"snapshot": snap([pane("w1:p7")], [remote_agent])}}))
+        (d / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
+        state = d / "state"
+        state.mkdir()
+        # The ledger says the remote agent finished something not seen yet: the row shows done.
+        (state / "recency.json").write_text(json.dumps({"v": 2, "machines": {"m1": {"w1:p7": [5, 1000.0, 0, 4, -1]}},
+                                                        "focus": {}}))
+        fh = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n'
+                                     '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                                     '  "api snapshot") cat "%(d)s/local.json" ;;\n'
+                                     '  "--machine m1 api snapshot") cat "%(d)s/m1.json" ;;\n'
+                                     '  "--machine m1 agent focus"*) sleep 2; touch "%(d)s/focused" ;;\n'
+                                     '  *"pane read"*) echo "pane text" ;;\n'
+                                     '  *) exit 0 ;;\nesac\n' % {"d": d})
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), HERDR_PLUGIN_STATE_DIR=str(state))
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+        import fcntl as _f4
+        import struct as _st4
+        import termios as _tm4
+        _f4.ioctl(fd, _tm4.TIOCSWINSZ, _st4.pack("HHHH", 40, 180, 0, 0))
+        buf, sent, rc, exited_at, end = b"", set(), None, None, _time.time() + 25
+        while _time.time() < end:
+            r, _, _ = _sel.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    _, status = os.waitpid(pid, 0)
+                    rc, exited_at = os.waitstatus_to_exitcode(status), _time.time()
+                    break
+                buf += chunk
+            plain = sb.ANSI.sub("", buf.decode("utf-8", "replace"))
+            if "enter" not in sent and "remote-done" in plain and "● done" in plain:
+                _time.sleep(0.5)
+                os.write(fd, b"\r")
+                sent.add("enter")
+            if "enter" in sent and "esc" not in sent and "focusing it on box1" in plain:
+                os.write(fd, b"\x1b")
+                sent.add("esc")
+        if rc is None:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        check("close-after-enter-exits-at-once", rc == 0 and "esc" in sent and not (d / "focused").exists(),
+              (rc, sorted(sent), (d / "focused").exists()))
+        waited = 0.0
+        while waited < 5 and not (d / "focused").exists():
+            _time.sleep(0.1)
+            waited += 0.1
+        check("close-after-enter-focus-still-happens", (d / "focused").exists(), waited)
+        try:
+            ledger = json.loads((state / "recency.json").read_text())["machines"]["m1"]["w1:p7"]
+        except (OSError, ValueError, KeyError) as exc:
+            ledger = repr(exc)
+        check("close-after-enter-ack-kept", isinstance(ledger, list) and ledger[3] == 5, ledger)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
