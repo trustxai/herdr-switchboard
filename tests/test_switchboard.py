@@ -1303,17 +1303,25 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
     import struct as _st2
     import termios as _tm2
 
-    def run_demo(keys, ready=b"rate-limiter-review"):
-        """Run --demo in a pty, send `keys` once `ready` is on screen, return (output, rc)."""
+    # The whole interface: the full header and a row of each of the three machines. Keys go
+    # only once all of it has been drawn, so a slow runner cannot cut the test short.
+    DEMO_MARKERS = ("18 agents", "laptop", "workstation", "server", "rate-limiter-review", "terraform-plan-staging")
+
+    def demo_missing(raw):
+        plain = sb.ANSI.sub("", raw.decode("utf-8", "replace"))
+        return [m for m in DEMO_MARKERS if m not in plain]
+
+    def run_demo(keys):
+        """Run --demo in a pty, send `keys` once the whole interface is on screen, and return
+        (output, rc, the markers still missing when the keys went or time ran out)."""
         pid, fd = _pty.fork()
         if pid == 0:
             os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH="/bin/false")
             os.execv(sys.executable, [sys.executable, "-B", str(TOOL), "--demo"])
         _f2.ioctl(fd, _tm2.TIOCSWINSZ, _st2.pack("HHHH", 40, 180, 0, 0))
-        buf, sent, end = b"", False, _time.time() + 20
+        buf, missing, end = b"", None, _time.time() + 30
         while _time.time() < end:
             r, _, _ = _sel.select([fd], [], [], 0.1)
-            chunk = None
             if r:
                 try:
                     chunk = os.read(fd, 65536)
@@ -1321,21 +1329,19 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                     chunk = b""
                 if not chunk:  # the child closed the terminal: reap it
                     _, status = os.waitpid(pid, 0)
-                    return buf, os.waitstatus_to_exitcode(status)
+                    return buf, os.waitstatus_to_exitcode(status), missing
                 buf += chunk
-            if not sent and ready in buf:
-                _time.sleep(0.5)
+            if missing is None and not demo_missing(buf):
+                missing = []
+                _time.sleep(0.3)
                 os.write(fd, keys)
-                sent = True
         os.kill(pid, 9)
         os.waitpid(pid, 0)
-        return buf, None
-    screen, rc = run_demo(b"\x1b")
-    plain = sb.ANSI.sub("", screen.decode("utf-8", "replace"))
-    check("demo-pty-renders", "18 agents" in plain and "laptop" in plain and "rate-limiter-review" in plain,
-          plain[-500:])
+        return buf, None, demo_missing(buf) if missing is None else missing
+    screen, rc, missing = run_demo(b"\x1b")
+    check("demo-pty-renders", missing == [], missing)
     check("demo-pty-esc-exits-clean", rc == 0, rc)
-    screen, rc = run_demo(b"\r")
+    screen, rc, missing = run_demo(b"\r")
     plain = sb.ANSI.sub("", screen.decode("utf-8", "replace"))
     check("demo-pty-enter-prints-what-it-would-do", rc == 0 and "demo: would run `herdr --machine workstation agent focus"
           in plain, (rc, plain[-400:]))
