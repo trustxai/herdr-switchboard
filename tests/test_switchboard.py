@@ -110,15 +110,18 @@ _atexit.register(shutil.rmtree, _tmp_root, True)
 for _k in list(os.environ):
     if _k.startswith("SWITCHBOARD_") or _k.startswith("HERDR_"):
         del os.environ[_k]
-# HOME and the XDG directories too: even a regression that ignores the plugin directories
-# must not write into the real home.
+# HOME and the XDG directories too, the runtime one included (ssh control sockets go
+# there): even a regression that ignores the plugin directories must not write outside.
 os.environ.update(NO_COLOR="1", PYTHONDONTWRITEBYTECODE="1",
                   HOME=os.path.join(_tmp_root, "home"),
                   XDG_CONFIG_HOME=os.path.join(_tmp_root, "xdg-config"),
                   XDG_STATE_HOME=os.path.join(_tmp_root, "xdg-state"),
+                  XDG_RUNTIME_DIR=os.path.join(_tmp_root, "run"),
                   HERDR_PLUGIN_CONFIG_DIR=os.path.join(_tmp_root, "config"),
                   HERDR_PLUGIN_STATE_DIR=os.path.join(_tmp_root, "state"))
 os.makedirs(os.environ["HOME"])
+os.makedirs(os.environ["XDG_RUNTIME_DIR"], mode=0o700)
+os.chmod(os.environ["XDG_RUNTIME_DIR"], 0o700)
 
 loader = importlib.machinery.SourceFileLoader("switchboard", str(TOOL))
 spec = importlib.util.spec_from_loader("switchboard", loader)
@@ -1570,6 +1573,10 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         check("safe-dir-shares", "ControlMaster=auto" in mux and "ControlPath=%s/ssh-%%C" % fresh in mux, mux)
     finally:
         sb._SSH_DIR[:] = saved_dir
+
+sb.ssh_mux()
+check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0] and sb._SSH_DIR[0].startswith(_tmp_root),
+      sb._SSH_DIR)
 
 if FAILS:
     print("FAIL %d:\n  " % len(FAILS) + "\n  ".join(str(f) for f in FAILS))
