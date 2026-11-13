@@ -1567,7 +1567,7 @@ else:
 check("program-executable", os.access(str(TOOL), os.X_OK) and SOURCE.startswith("#!/usr/bin/env python3\n"))
 std = set(getattr(sys, "stdlib_module_names", ())) or {
     "base64", "copy", "glob", "json", "os", "re", "select", "shlex", "shutil", "socket", "subprocess", "sys",
-    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty", "stat", "math"}
+    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty", "stat", "math", "signal"}
 imported = set()
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):
