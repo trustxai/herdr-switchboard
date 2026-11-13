@@ -70,13 +70,17 @@ Use the names the demo uses. Machines are `laptop`, `workstation` and `server`; 
 `api`, `web`, `infra` and `docs`. The same rule applies to commit messages, pull request text and
 issue reports: describe your setup with those names, not your own.
 
+The README images are made from the demo data, never from a real session: after a change to
+what the popup draws, run `docs/render.sh` and commit the new `docs/assets/` files with it.
+
 ## Commits and pull requests
 
 - Commits follow [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`,
   `docs:`, `test:`, `ci:`, `chore:`, `refactor:`. Say in the body why the change is needed.
 - Keep pull requests small and focused, and fill in the template.
 - `make check` must pass before you ask for a review.
-- A change users will notice gets a line under `## [Unreleased]` in `CHANGELOG.md`.
+- A change users will notice gets a line in `CHANGELOG.md`: under `## [Unreleased]`, except
+  before the first tag (see [Releases](#releases)).
 
 ## Releases
 
@@ -101,9 +105,13 @@ release of version `X.Y.Z` is these steps, in this order:
 4. Create the GitHub release from the tag (`gh release create vX.Y.Z --verify-tag --title vX.Y.Z`)
    and paste that version's `CHANGELOG.md` section as its notes.
 
-The first release is the exception to step 1: `herdr-plugin.toml` already says `0.1.0` and its
-`CHANGELOG.md` entry is already written, so its pull request only changes the date of
-`## [0.1.0]` to the day of the tag.
+The first release is the exception. `herdr-plugin.toml` already says `0.1.0` and
+`## [0.1.0]` in `CHANGELOG.md` is written, so until the `v0.1.0` tag exists that section is the
+unreleased one: **a change merged before the first tag gets its line under `## [0.1.0]`**, and
+`## [Unreleased]` stays empty. The release pull request then changes the date of `## [0.1.0]`
+to the day of the tag, after checking that `## [Unreleased]` is still empty (anything found
+there moves into `## [0.1.0]`, or it would be left out of the release). From the tag on, every
+change goes under `## [Unreleased]` as above.
 
 The tools CI downloads are pinned by hand: fzf and gitleaks in
 `.github/scripts/install-pinned.sh` (version and SHA-256 of each archive), uv in
