@@ -1,0 +1,27 @@
+name: Feature request
+description: Propose a change or a new option.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Switchboard stays one stdlib-only Python script driving fzf. Proposals that keep it
+        that way are the easiest to accept.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you are trying to do and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: The proposal
+      description: What should change. Describe your setup with placeholder names (`laptop`, `server`, `api`), not your own.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

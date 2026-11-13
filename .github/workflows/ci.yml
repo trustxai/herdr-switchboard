@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least privilege: no job needs more than reading the repository.
+permissions:
+  contents: read
+
+# A new push to a pull request (or to main) cancels the run it supersedes.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  # uv installs the test interpreters and runs the pinned ruff. Bumped by hand.
+  UV_VERSION: "0.13.6"
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        # 3.9 is the oldest Python the plugin supports, because it is the
+        # /usr/bin/python3 that macOS ships. 3.15 is the newest stable CPython:
+        # bump it when a new one is released.
+        python: ["3.9", "3.15"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      # uv instead of actions/setup-python: setup-python publishes no Python 3.9
+      # build for the arm64 macOS runners behind macos-latest, uv does.
+      - name: Install Python ${{ matrix.python }}
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          uv python install "$PYTHON_VERSION"
+          interpreter=$(uv python find --managed-python "$PYTHON_VERSION")
+          dirname "$interpreter" >> "$GITHUB_PATH"
+
+      - name: Install fzf (pinned release, checksum verified)
+        run: |
+          .github/scripts/install-pinned.sh fzf "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Check the interpreter and fzf on PATH
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          command -v python3 fzf
+          python3 - <<'EOF'
+          import os, subprocess, sys
+          want = os.environ["PYTHON_VERSION"]
+          have = "%d.%d" % sys.version_info[:2]
+          if have != want:
+              sys.exit("python3 on PATH is %s, expected %s" % (have, want))
+          out = subprocess.run(["fzf", "--version"], capture_output=True, text=True, check=True).stdout
+          version = tuple(int(n) for n in out.split()[0].split(".")[:2])
+          if version < (0, 71):
+              sys.exit("fzf on PATH is %s, switchboard needs 0.71 or newer" % out.strip())
+          print("python3", sys.version.split()[0], "| fzf", out.strip())
+          EOF
+
+      # Guard: bin/switchboard and tests/test_switchboard.py arrive with the port
+      # pull request. These two steps are skipped only while NEITHER file exists;
+      # as soon as either one does, they run, and `make test` fails when the
+      # program is there without its test file. Remove both `if:` lines, and the
+      # skip branch of the Makefile's test target, once the port has landed on
+      # main, so a missing file always fails the build.
+      - name: Byte-compile with Python ${{ matrix.python }}
+        if: hashFiles('bin/switchboard', 'tests/test_switchboard.py') != ''
+        run: make compile
+
+      - name: Run the tests
+        if: hashFiles('bin/switchboard', 'tests/test_switchboard.py') != ''
+        run: make test
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      - name: make lint
+        run: make lint REQUIRE_TOOLS=1
+
+  secrets:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The whole history, not only the tip: a secret removed in a later
+          # commit is still published.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The binary, not gitleaks-action: the action needs a licence key, issued
+      # against a name and an e-mail address, for repositories owned by an
+      # organisation. The pinned binary does the same scan with nothing to sign up for.
+      - name: Install gitleaks (pinned release, checksum verified)
+        run: |
+          .github/scripts/install-pinned.sh gitleaks "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: make secrets
+        run: make secrets REQUIRE_TOOLS=1

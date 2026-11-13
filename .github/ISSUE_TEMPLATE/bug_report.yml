@@ -1,0 +1,80 @@
+name: Bug report
+description: Something does not work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. Security problems go through private vulnerability reporting
+        instead (see SECURITY.md), not here.
+
+        Before pasting output or screenshots, replace your real hostnames, addresses, usernames,
+        paths and project names with placeholders such as `laptop`, `server` and `api`.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Switchboard with ...
+        2. Press ...
+        3. See ...
+    validations:
+      required: true
+  - type: input
+    id: switchboard-version
+    attributes:
+      label: Switchboard version
+      description: The `version` line of `herdr-plugin.toml`, or the commit.
+    validations:
+      required: true
+  - type: input
+    id: herdr-version
+    attributes:
+      label: herdr version
+      description: Output of `herdr --version`.
+    validations:
+      required: true
+  - type: input
+    id: fzf-version
+    attributes:
+      label: fzf version
+      description: Output of `fzf --version`.
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output of `python3 --version`.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and terminal
+      placeholder: macOS 26 with Ghostty 1.4, Ubuntu 24.04 over ssh, ...
+    validations:
+      required: true
+  - type: dropdown
+    id: machines
+    attributes:
+      label: Machines involved
+      options:
+        - Only the local machine
+        - Local and saved machines over ssh
+        - The cross-machine jump is enabled
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Error output or screenshot
+      description: Redacted as described above.
+      render: text
