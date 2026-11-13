@@ -1385,12 +1385,21 @@ def watch(live, sock, rows_file, stop, acks=None):
         os.replace(rows_name + ".tmp", rows_name, src_dir_fd=rows_dir, dst_dir_fd=rows_dir)
         fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
 
+    def nap():
+        """Until the next local pass is due, a machine answers, or stop is set. stop is
+        looked at every fifth of a second, so closing never waits out a long interval."""
+        due = time.time() + LOCAL_EVERY
+        while not stop.is_set():
+            left = due - time.time()
+            if left <= 0 or kick.wait(min(left, 0.2)):
+                break
+        kick.clear()
+
     for i, m in enumerate(live.machines):
         threading.Thread(target=remote_loop, args=(i, m), daemon=True).start()
     try:
         while not stop.is_set():
-            kick.wait(LOCAL_EVERY)
-            kick.clear()
+            nap()
             if stop.is_set():
                 break
             try:
@@ -2647,7 +2656,7 @@ def popup(self_cmd, demo=False):
 
     # The socket and the reloadable rows go in a private (0700), short directory: on macOS
     # a unix socket path cannot exceed 104 bytes.
-    tmp = tempfile.mkdtemp(prefix="switchboard-", dir="/tmp")
+    tmp = tempfile.mkdtemp(prefix="switchboard-", dir=os.environ.get("SWITCHBOARD_RUN_ROOT") or "/tmp")
     sock, rows_file, acks = os.path.join(tmp, "fzf.sock"), os.path.join(tmp, "rows"), os.path.join(tmp, "acks")
     stop = threading.Event()
     argv = fzf_argv(fzf, self_cmd, sock, remote_enter=remote_enter)
@@ -2661,13 +2670,13 @@ def popup(self_cmd, demo=False):
     finally:
         stop.set()
         if watcher.is_alive():
-            watcher.join(2)  # it may be writing the rows file that is about to be removed
+            watcher.join(2)  # stop wakes it; a pass already under way may take a moment
         live.consume_acks(acks)  # an Enter on a remote row just before Esc
-        # Removed only once no pass of watch() can run: a pass that outlived the directory
-        # could otherwise meet a directory someone else created under the same name. If
-        # one is stuck, the directory stays: it is ours and 0700, so nobody else can use it.
-        if not watcher.is_alive():
-            shutil.rmtree(tmp, ignore_errors=True)
+        # Always removed. A pass of watch() still running after this cannot reach anything
+        # else: the rows go through the old descriptor (now ENOENT), fzf's socket is only
+        # contacted after a rows write succeeded, and the acks only through a directory
+        # that open_private_dir accepts as ours.
+        shutil.rmtree(tmp, ignore_errors=True)
     if proc.returncode == 2:
         # fzf refused its command line and drew nothing: say why instead of vanishing.
         reason = fzf_rejects(fzf, [a for a in argv[1:] if not a.startswith("--listen")]) or "exit 2"

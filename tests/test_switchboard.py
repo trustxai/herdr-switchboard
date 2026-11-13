@@ -113,6 +113,8 @@ What it has to get right, and how it fails otherwise:
    remote timeout), so the footer never says it failed before a slow focus lands.
 37. A hung local herdr cannot freeze anything: the local snapshot has a timeout at open and in
    every refresh, the refresh keeps the last rows, and the popup says what failed.
+38. Closing the popup always removes its run directory, whatever local_seconds is and however
+   slow the local snapshot, and stop wakes the watch loop at once.
 
     python3 tests/test_switchboard.py
 """
@@ -2442,6 +2444,91 @@ with tempfile.TemporaryDirectory() as d:
     took = _time.time() - t0
     check("popup-hung-herdr-says-so", r.returncode == 1 and "herdr api snapshot failed" in r.stdout and took < 4,
           (r.returncode, took, r.stdout[-200:]))
+
+# 38. Closing always removes the run directory.
+def close_popup(local_seconds, slow):
+    """Open the popup over a fake herdr, press Esc, and return (rc, seconds from Esc to exit,
+    what is left in the popup's run root). slow: every snapshot after the first hangs."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = private_tmp(d, "runs")
+        cfg = os.path.join(d, "cfg")
+        os.mkdir(cfg)
+        with open(os.path.join(cfg, "config.toml"), "w") as f:
+            f.write("[refresh]\nlocal_seconds = %s\n" % local_seconds)
+        snapfile = os.path.join(d, "snap.json")
+        with open(snapfile, "w") as f:
+            json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="only-row")])}}, f)
+        hang = 'echo $$ > "%s/hung"; exec sleep 30' % d if slow else "true"
+        fh = executable(os.path.join(d, "herdr"),
+                        '#!/bin/sh\ncase "$*" in\n  "machine list --json") echo "[]" ;;\n'
+                        '  "api snapshot") if [ -e "%(d)s/once" ]; then %(hang)s; fi; touch "%(d)s/once"; cat "%(s)s" ;;\n'
+                        '  *) exit 0 ;;\nesac\n' % {"d": d, "hang": hang, "s": snapfile})
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), HERDR_PLUGIN_CONFIG_DIR=cfg,
+                              HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"), SWITCHBOARD_RUN_ROOT=root)
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+        import fcntl as _f6
+        import struct as _st6
+        import termios as _tm6
+        _f6.ioctl(fd, _tm6.TIOCSWINSZ, _st6.pack("HHHH", 30, 140, 0, 0))
+        buf, t_esc, rc, end = b"", None, None, _time.time() + 30
+        while _time.time() < end:
+            r, _, _ = _sel.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    _, status = os.waitpid(pid, 0)
+                    rc = os.waitstatus_to_exitcode(status)
+                    break
+                buf += chunk
+            if t_esc is None and b"only-row" in buf:
+                # With a slow snapshot, wait until a refresh is hanging before closing.
+                deadline = _time.time() + 5
+                while slow and not os.path.exists(os.path.join(d, "hung")) and _time.time() < deadline:
+                    _time.sleep(0.05)
+                os.write(fd, b"\x1b")
+                t_esc = _time.time()
+        if rc is None:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        took = _time.time() - t_esc if t_esc else None
+        left = sorted(os.listdir(root))
+        if os.path.exists(os.path.join(d, "hung")):  # the hanging fake herdr outlives the popup
+            try:
+                os.kill(int(open(os.path.join(d, "hung")).read().strip()), 9)
+            except (ValueError, OSError):
+                pass
+        return rc, took, left
+
+
+rc, took, left = close_popup(10, False)
+check("close-with-a-long-interval-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 1.5,
+      (rc, took, left))
+rc, took, left = close_popup(1, True)
+check("close-during-a-slow-snapshot-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 4,
+      (rc, took, left))
+
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    rows_dir = private_tmp(d, "rows")
+    saved_every = sb.LOCAL_EVERY
+    sb.LOCAL_EVERY = 10.0
+    try:
+        lv = sb.Live([], [], fetch=lambda m="", t=None, i=None: snap([], []), cache=False)
+        stop = _threading.Event()
+        t = _threading.Thread(target=sb.watch, args=(lv, os.path.join(d, "none.sock"), os.path.join(rows_dir, "rows"),
+                                                    stop, None))
+        t.start()
+        _time.sleep(0.5)
+        t0 = _time.time()
+        stop.set()
+        t.join(3)
+        check("stop-wakes-the-watch-loop", not t.is_alive() and _time.time() - t0 < 1, _time.time() - t0)
+    finally:
+        sb.LOCAL_EVERY = saved_every
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
