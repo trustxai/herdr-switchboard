@@ -32,14 +32,17 @@ remote_timeout = 8
 cache_max_age = 1800
 
 [colors]
-# Colours of the list, as fzf colour values: a name from the terminal's own ANSI palette
-# (black, red, green, yellow, blue, magenta, cyan, white, bright-black, …), a number from
-# 0 to 255, "#rrggbb", or -1 for the terminal default. Palette names follow your theme.
+# Colours of the list, as fzf colour values. Palette names follow your terminal theme:
+# black, red, green, yellow, blue, magenta, cyan, white, their bright- forms (bright-black,
+# bright-red, ...), and gray or grey for bright-black. Also a number from 0 to 255, "#rrggbb",
+# or -1 for the terminal default. Any other value is reported and replaced by the default.
 accent = "magenta"          # matches, pointer, prompt
 selected_fg = "black"       # text of the selected row
 selected_bg = "magenta"     # background of the selected row
 muted = "bright-black"      # header, borders, info
-# Extra fzf --color entries, appended last, for anything the keys above do not cover.
+# Extra fzf --color entries, appended last, for anything the keys above do not cover,
+# e.g. "info:8,border:#6272a4". The installed fzf checks them when the popup opens; if it
+# refuses them, every colour goes back to its default and the header says so.
 fzf = ""
 
 # Example: a fixed dark theme with purple accents instead of the palette names.

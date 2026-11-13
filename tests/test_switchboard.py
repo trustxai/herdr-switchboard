@@ -86,6 +86,9 @@ What it has to get right, and how it fails otherwise:
    huge integers each fall back to their default with a warning, on both parsers, and even
    --version survives. Lines end only at \n, so a file reads the same with tomllib and with
    the built-in parser (U+2028 stays inside a comment, \v and \f are errors).
+28. Colours are exactly what fzf accepts; the extra fzf entries are checked by the installed
+   fzf before the popup opens, and if fzf still refuses its command line the popup says why
+   and waits instead of vanishing.
 
     python3 tests/test_switchboard.py
 """
@@ -1670,6 +1673,57 @@ check("hidden-line-break-does-not-enable-the-jump", cfg["jump"]["enabled"] is Fa
 special = sb.toml_loads("a = inf\nb = -inf\nc = nan\n", use_tomllib=False)
 check("builtin-reads-special-floats", special["a"] == float("inf") and special["b"] == float("-inf")
       and special["c"] != special["c"], special)
+
+# 28. Colours fzf accepts, and a popup that never vanishes on an fzf error.
+for v in ("magenta", "bright-black", "bright-white", "gray", "grey", "0", "16", "99", "255", "-1", "#bd93f9"):
+    check("color-accepted %s" % v, sb.COLOR_VALUE.match(v) is not None)
+for v in ("purple", "256", "999", "01", "#bd93f", "Magenta", "bright-gray", "", "-2", "red,blue"):
+    check("color-refused %r" % v, sb.COLOR_VALUE.match(v) is None)
+cfg, problems = sb.merge_config({"colors": {"accent": "purple", "muted": "999", "selected_bg": "blue"}})
+check("color-bad-value-is-default", cfg["colors"]["accent"] == "magenta" and cfg["colors"]["muted"] == "bright-black"
+      and cfg["colors"]["selected_bg"] == "blue" and len(problems) == 2, (cfg["colors"], problems))
+for v in ("", "info:8", "dark,fg+:#282a36:bold", "bogus"):
+    check("fzf-spec-shape-ok %r" % v, sb.FZF_COLOR_SPEC.match(v) is not None)
+for v in ("a b", "x,,y", ",x", "hl:x(y)", "hl:magenta;rm"):
+    check("fzf-spec-shape-refused %r" % v, sb.FZF_COLOR_SPEC.match(v) is None)
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    # An fzf that refuses any colour spec mentioning "bogus", as the real one does.
+    picky = executable(d / "fzf-picky", '#!/bin/sh\ncase "$*" in\n  --version) echo "0.74.0 (test)" ;;\n'
+                                        '  *bogus*) echo "invalid color specification: bogus" >&2; exit 2 ;;\n'
+                                        '  *) exit 1 ;;\nesac\n')
+    check("fzf-rejects-reports", sb.fzf_rejects(str(picky), ["--color", "bogus"]) == "invalid color specification: bogus")
+    check("fzf-rejects-accepts", sb.fzf_rejects(str(picky), ["--color", "hl:magenta"]) is None)
+    saved = (dict(sb.COLORS), sb.CONFIG_WARNING)
+    try:
+        sb.COLORS = dict(sb.DEFAULTS["colors"], fzf="bogus")
+        sb.CONFIG_WARNING = None
+        note = sb.verify_colors(str(picky))
+        check("colors-refused-by-fzf-fall-back", note and sb.COLORS == sb.DEFAULTS["colors"]
+              and note in sb.header([], [], [], []), (note, sb.COLORS))
+        sb.COLORS = dict(sb.DEFAULTS["colors"], fzf="info:8")
+        check("colors-taken-by-fzf-kept", sb.verify_colors(str(picky)) is None and sb.COLORS["fzf"] == "info:8")
+    finally:
+        sb.COLORS, sb.CONFIG_WARNING = saved
+    if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+        check("real-fzf-refuses-an-unknown-colour", "purple" in (sb.fzf_rejects(fzf_real, ["--color", "hl:purple"]) or ""))
+        check("real-fzf-takes-the-default-colours", sb.fzf_rejects(fzf_real, ["--color", sb.fzf_colors(sb.DEFAULTS["colors"])])
+              is None)
+        argv = sb.fzf_argv(fzf_real, "self", "/tmp/s.sock", remote_enter=True)
+        check("real-fzf-takes-the-whole-command-line", sb.fzf_rejects(fzf_real, [a for a in argv[1:]
+                                                                                  if not a.startswith("--listen")]) is None)
+    # End to end: an fzf that exits 2 on the real command line; the popup explains and waits.
+    broken = executable(d / "fzf-broken", '#!/bin/sh\n[ "$1" = --version ] && { echo "0.74.0 (test)"; exit 0; }\n'
+                                          'echo "unknown action: whatever" >&2; exit 2\n')
+    snapfile = d / "snap.json"
+    snapfile.write_text(json.dumps({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)])}}))
+    fh = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n  "api snapshot") cat "%s" ;;\n'
+                                 '  "machine list --json") echo "[]" ;;\n  *) exit 2 ;;\nesac\n' % snapfile)
+    env = dict(os.environ, SWITCHBOARD_FZF=str(broken), HERDR_BIN_PATH=str(fh))
+    r = subprocess.run([sys.executable, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
+    check("fzf-error-is-shown-not-swallowed", r.returncode != 0 and "fzf could not start: unknown action: whatever"
+          in r.stdout and "Press Enter" in r.stdout, (r.returncode, r.stdout[-300:], r.stderr[-300:]))
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0] and sb._SSH_DIR[0].startswith(_tmp_root),

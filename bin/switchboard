@@ -66,6 +66,18 @@ def find_herdr(env=None):
 HERDR = find_herdr()
 LOCAL = ""  # machine id of the rows of this machine
 
+# Escape sequences (CSI, OSC, DCS and the like) and control characters (C0, DEL, C1).
+ESCAPE_SEQ = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+                        r"|\x1b[PX^_][^\x1b]*(?:\x1b\\)?|\x1b.?")
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def clean(text):
+    """One line of plain text, without escape sequences or control characters."""
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
+    return CONTROL_CHARS.sub("", ESCAPE_SEQ.sub("", text))
+
 # --- user-visible text ------------------------------------------------------------------
 #
 # Every string the user can read goes through this table. Status names are herdr's own
@@ -114,6 +126,8 @@ STRINGS = {
         "demo_jump_off": "demo: the cross-machine jump is off, so the pane would be ready on %s"
                          " when you switch to that machine",
         "demo_nothing": "demo: nothing selected",
+        "colors_rejected": "fzf rejected the colours in the config, so the defaults are in use",
+        "fzf_failed": "fzf could not start: %s",
         "usage": (
             "switchboard: every herdr agent, on every saved machine, in one popup.\n\n"
             "    switchboard                 the popup (what the plugin pane runs)\n"
@@ -184,6 +198,8 @@ STRINGS = {
         "demo_jump_off": "demo: el salto entre máquinas está apagado, así que la pane quedaría"
                          " lista en %s cuando pases a esa máquina",
         "demo_nothing": "demo: no se eligió nada",
+        "colors_rejected": "fzf rechazó los colores de la config, así que se usan los de por defecto",
+        "fzf_failed": "fzf no pudo arrancar: %s",
         "usage": (
             "switchboard: todos los agentes de herdr, de todas las máquinas guardadas, en un popup.\n\n"
             "    switchboard                 el popup (lo que corre la pane del plugin)\n"
@@ -260,8 +276,15 @@ NUMBER_RANGES = {
     ("refresh", "remote_timeout"): (1.0, 120.0),
     ("refresh", "cache_max_age"): (0.0, 86400.0),
 }
-COLOR_VALUE = re.compile(r"^(-1|[0-9]{1,3}|#[0-9a-fA-F]{6}|[a-z]+(-[a-z]+)*)$")
-FZF_COLOR_SPEC = re.compile(r"^[A-Za-z0-9#:+,._-]*$")
+# Exactly the colour values fzf accepts: -1 (terminal default), 0 to 255, #rrggbb, and the
+# names of the 16 base colours (gray and grey are aliases of bright-black). An unknown name
+# makes fzf exit before drawing anything, so it is refused here.
+COLOR_VALUE = re.compile(r"^(-1|#[0-9a-fA-F]{6}|25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]"
+                         r"|(bright-)?(black|red|green|yellow|blue|magenta|cyan|white)|gray|grey)$")
+# The extra fzf entries: comma-separated "name[:value[:attribute...]]". Only the shape is
+# checked here; the installed fzf checks the names before the popup opens (verify_colors).
+_FZF_ENTRY = r"[A-Za-z0-9+_-]+(:[A-Za-z0-9#+_-]+)*"
+FZF_COLOR_SPEC = re.compile(r"^(%s(,%s)*)?$" % (_FZF_ENTRY, _FZF_ENTRY))
 
 
 def config_path(env=None):
@@ -2164,6 +2187,33 @@ def dependency_problems(python=None, fzf="auto", platform=sys.platform, executab
     return problems
 
 
+def fzf_rejects(fzf, args):
+    """fzf's own message when it refuses these options (exit 2), else None. It runs in
+    filter mode over empty input, so it draws nothing and returns at once."""
+    try:
+        r = subprocess.run([fzf] + list(args) + ["--filter", ""], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True,
+                           timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 2:
+        return None
+    lines = [l.strip() for l in r.stderr.splitlines() if l.strip()]
+    return clean(lines[0]) if lines else "exit 2"
+
+
+def verify_colors(fzf):
+    """Ask the installed fzf whether it takes the configured colours. When it does not,
+    fall back to the defaults and say so in the header; returns the note, or None."""
+    global COLORS, CONFIG_WARNING
+    if COLORS == DEFAULTS["colors"] or not fzf_rejects(fzf, ["--color", fzf_colors()]):
+        return None
+    COLORS = dict(DEFAULTS["colors"])
+    note = tr("colors_rejected")
+    CONFIG_WARNING = note if not CONFIG_WARNING else CONFIG_WARNING + " · " + note
+    return note
+
+
 def explain_and_wait(problems):
     """Print what is missing and wait for a key: the popup would vanish with the message."""
     sys.stdout.write("\n".join(problems) + "\n\n")
@@ -2251,6 +2301,7 @@ def popup(self_cmd, demo=False):
     problems = dependency_problems(fzf=fzf)
     if problems:
         return explain_and_wait(problems)
+    verify_colors(fzf)
     machines = saved_machines()
     try:
         snap = snapshot()
@@ -2271,9 +2322,9 @@ def popup(self_cmd, demo=False):
     tmp = tempfile.mkdtemp(prefix="switchboard-", dir="/tmp")
     sock, rows_file, acks = os.path.join(tmp, "fzf.sock"), os.path.join(tmp, "rows"), os.path.join(tmp, "acks")
     stop = threading.Event()
+    argv = fzf_argv(fzf, self_cmd, sock, remote_enter=remote_enter)
     try:
-        proc = subprocess.Popen(fzf_argv(fzf, self_cmd, sock, remote_enter=remote_enter),
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True,
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True,
                                 env=dict(os.environ, SWITCHBOARD_RUN_DIR=tmp))
         threading.Thread(target=watch, args=(live, sock, rows_file, stop, acks), daemon=True).start()
         out, _ = proc.communicate(first)
@@ -2281,6 +2332,10 @@ def popup(self_cmd, demo=False):
         stop.set()
         live.consume_acks(acks)  # an Enter on a remote row just before Esc
         shutil.rmtree(tmp, ignore_errors=True)
+    if proc.returncode == 2:
+        # fzf refused its command line and drew nothing: say why instead of vanishing.
+        reason = fzf_rejects(fzf, [a for a in argv[1:] if not a.startswith("--listen")]) or "exit 2"
+        return explain_and_wait([tr("fzf_failed", reason)])
     pick = out.strip()
     if proc.returncode != 0 or not pick:
         if link:
