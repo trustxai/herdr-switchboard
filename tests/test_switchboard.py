@@ -335,7 +335,7 @@ with tempfile.TemporaryDirectory() as d:
                       'case "$*" in\n'
                       '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
                       '  "--machine m1 api snapshot") cat "%(d)s/m1.json" ;;\n'
-                      '  "--machine m2 api snapshot") sleep 5 ;;\n'
+                      '  "--machine m2 api snapshot") exec sleep 5 ;;\n'
                       '  "--machine m3 api snapshot") echo "must not be asked" >&2; exit 9 ;;\n'
                       '  "api snapshot") cat "%(d)s/local.json" ;;\n'
                       "  *) exit 2 ;;\n"
@@ -1379,7 +1379,7 @@ with tempfile.TemporaryDirectory() as d:
     fh = executable(d / "herdr", '#!/bin/sh\necho "$*" >> "%(d)s/log"\ncase "$*" in\n'
                                  '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
                                  '  "--machine m2 "*) exit 1 ;;\n'
-                                 '  "--machine m1 agent focus"*) sleep 1.5 ;;\n  *) exit 0 ;;\nesac\n' % {"d": d})
+                                 '  "--machine m1 agent focus"*) exec sleep 1.5 ;;\n  *) exit 0 ;;\nesac\n' % {"d": d})
     run_dir = d / "run"
     run_dir.mkdir(mode=0o700)  # like the popup's own (mkdtemp): helpers refuse anything looser
     run_dir.chmod(0o700)
@@ -1995,7 +1995,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                                      '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
                                      '  "api snapshot") cat "%(d)s/local.json" ;;\n'
                                      '  "--machine m1 api snapshot") cat "%(d)s/m1.json" ;;\n'
-                                     '  "--machine m1 agent focus"*) sleep 2 ;;\n'
+                                     '  "--machine m1 agent focus"*) exec sleep 2 ;;\n'
                                      '  *"pane read"*) echo "pane text" ;;\n'
                                      '  *) exit 0 ;;\nesac\n' % {"d": d})
         pid, fd = _pty.fork()
@@ -2326,9 +2326,21 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
           and open(os.path.join(run, "acks")).read() == "one\ntwo\n")
     os.symlink(decoy, os.path.join(run, "readlink"))
     os.mkfifo(os.path.join(run, "pipe"))
-    t0 = _time.time()
-    check("read-only-regular-files", sb.read_small(fd, "readlink") is None and sb.read_small(fd, "pipe") is None
-          and sb.read_small(fd, "res") == "hello\n" and _time.time() - t0 < 1)
+    check("read-refuses-links-and-reads-files", sb.read_small(fd, "readlink") is None
+          and sb.read_small(fd, "res") == "hello\n")
+    # The pipe in a thread with a deadline: a read that blocked would hang the whole suite.
+    piped = []
+    reader = _threading.Thread(target=lambda: piped.append(sb.read_small(fd, "pipe")), daemon=True)
+    reader.start()
+    reader.join(1.5)
+    blocked = reader.is_alive()
+    if blocked:  # release it: a writer lets the blocked open return
+        try:
+            os.close(os.open(os.path.join(run, "pipe"), os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+        reader.join(2)
+    check("read-never-blocks-on-a-pipe", not blocked and piped == [None], (blocked, piped))
 
     # The directory goes away and someone recreates it with links planted: nothing reaches them.
     shutil.rmtree(run)
@@ -2373,7 +2385,9 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     decoy = decoy_in(d)
     (pathlib.Path(d) / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
     fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%(d)s/machines.json" ;;\n'
-                                             '  *"agent focus"*) env > "%(d)s/worker-env"; sleep 1.5; touch "%(d)s/focused" ;;\n'
+                                             '  *"agent focus"*) { [ -n "${SWITCHBOARD_RUN_DIR+x}" ] && echo has_run_dir; '
+                                             '[ -n "${SWITCHBOARD_RUN_FD+x}" ] && echo has_run_fd; } > "%(d)s/worker-flags"; '
+                                             'sleep 1.5; touch "%(d)s/focused" ;;\n'
                                              'esac\n' % {"d": d})
     env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=run, SWITCHBOARD_LABELS=json.dumps({"m1": "box1"}))
     out = subprocess.run([sys.executable, str(TOOL), "--enter", "m1|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
@@ -2394,11 +2408,9 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("attack-decoy-unchanged", open(decoy).read() == "precious\n", open(decoy).read())
     check("attack-nothing-written-in-the-new-directory", sorted(os.listdir(run)) == sorted([name, name + ".tmp"]),
           os.listdir(run))
-    worker_env = open(os.path.join(d, "worker-env")).read() if os.path.exists(os.path.join(d, "worker-env")) else ""
-    # Only flags in the failure detail: the environment can hold secrets.
-    flags = {"has_run_dir": "SWITCHBOARD_RUN_DIR=" in worker_env, "has_path": run in worker_env,
-             "has_run_fd": "SWITCHBOARD_RUN_FD=" in worker_env}
-    check("attack-worker-env-has-no-path", flags == {"has_run_dir": False, "has_path": False, "has_run_fd": True}, flags)
+    # The fake herdr records two yes/no flags, never the environment itself (it can hold secrets).
+    worker_flags = open(os.path.join(d, "worker-flags")).read().split() if os.path.exists(os.path.join(d, "worker-flags")) else None
+    check("attack-worker-env-has-no-path", worker_flags == ["has_run_fd"], worker_flags)
 
 # 36. --focus-wait outlasts the slowest worker.
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
@@ -2417,7 +2429,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
 # 37. A hung local herdr.
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
-    slow = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n  "api snapshot") sleep 6 ;;\n'
+    slow = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n  "api snapshot") exec sleep 6 ;;\n'
                                    '  "machine list --json") echo "[]" ;;\nesac\n')
     saved = (sb.HERDR, sb.LOCAL_TIMEOUT)
     sb.HERDR, sb.LOCAL_TIMEOUT = str(slow), 1.0
