@@ -73,6 +73,8 @@ What it has to get right, and how it fails otherwise:
 21. Colours: the default uses the terminal's ANSI palette; the example theme still works.
 22. Dependencies: a missing or old fzf, or an old Python, gives a message with the version
    found and how to install, and a non-zero exit.
+23. Demo: the fixtures load and cover the promised day, --demo never touches herdr, ssh or
+   the state directory, and the fixtures carry nothing personal.
     python3 tests/test_switchboard.py
 """
 import ast
@@ -1200,6 +1202,108 @@ if old_py:
                        timeout=20)
     check("deps-e2e-real-old-python", r.returncode != 0 and "Python 3.9" in r.stdout and "found Python 3." in r.stdout,
           (old_py, r.returncode, r.stdout, r.stderr[-300:]))
+
+# 23. Demo.
+demo = sb.Demo()
+check("demo-machines", demo.local == "laptop" and [m["label"] for m in demo.machines] == ["workstation", "server"],
+      (demo.local, demo.machines))
+all_ws, statuses, n_agents, n_terms, no_preview = set(), set(), 0, 0, []
+for m, s in demo.snapshots.items():
+    all_ws |= set(w["label"] for w in s["workspaces"])
+    agent_ids = set(a["pane_id"] for a in s["agents"])
+    statuses |= set(a["agent_status"] for a in s["agents"])
+    n_agents += len(s["agents"])
+    n_terms += sum(1 for p in s["panes"] if p["pane_id"] not in agent_ids)
+    no_preview += ["%s %s" % (m, p["pane_id"]) for p in s["panes"]
+                   if len(demo.previews.get(m, {}).get(p["pane_id"]) or []) < 3]
+    check("demo-unique-panes %s" % m, len(set(p["pane_id"] for p in s["panes"])) == len(s["panes"]))
+check("demo-workspaces", all_ws == {"api", "web", "infra", "docs"}, all_ws)
+check("demo-every-status", statuses == set(sb.PRIORITY), statuses)
+check("demo-about-18-agents", 16 <= n_agents <= 20, n_agents)
+check("demo-some-terminals", n_terms >= 3, n_terms)
+check("demo-a-preview-per-pane", not no_preview, no_preview)
+check("demo-several-kinds", len(set(a["agent"] for s in demo.snapshots.values() for a in s["agents"])) >= 3)
+d0 = sb.Demo(t0=0.0)
+early = {a["pane_id"]: a["agent_status"] for a in d0.snapshot("workstation", now=1.0)["agents"]}
+late = {a["pane_id"]: a["agent_status"] for a in d0.snapshot("workstation", now=100.0)["agents"]}
+check("demo-timeline-changes-a-status", early != late and set(early) == set(late), (early, late))
+saved_demo = sb.DEMO
+sb.DEMO = demo
+try:
+    check("demo-answers-herdr", json.loads(sb.herdr(["machine", "list", "--json"])) == demo.machines)
+    check("demo-preview-for-remote", "rate limiter" in sb.herdr_on("workstation", ["pane", "read", "w1:p3"]))
+    out = sb.demo_outcome(sb.make_id("", "a", "w1:p1", "w1:t1"), {"workstation": "workstation"})
+    check("demo-enter-local", out == ["demo: would run `herdr agent focus w1:p1`"], out)
+    out = sb.demo_outcome(sb.make_id("workstation", "a", "w1:p3", "w1:t2"), {"workstation": "workstation"})
+    check("demo-enter-remote", len(out) == 2 and "--machine workstation agent focus w1:p3" in out[0]
+          and "workstation" in out[1], out)
+finally:
+    sb.DEMO = saved_demo
+with tempfile.TemporaryDirectory() as d:
+    d = pathlib.Path(d)
+    marker_h, marker_s = d / "herdr-called", d / "ssh-called"
+    fh = executable(d / "herdr", '#!/bin/sh\ntouch "%s"\nexit 3\n' % marker_h)
+    fs = executable(d / "ssh", '#!/bin/sh\ntouch "%s"\nexit 3\n' % marker_s)
+    sdir = d / "state"
+    sdir.mkdir()
+    env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_SSH=str(fs), HERDR_PLUGIN_STATE_DIR=str(sdir),
+               PATH=str(d) + os.pathsep + os.environ.get("PATH", ""))
+    r = subprocess.run([sys.executable, str(TOOL), "--demo", "--rows"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
+    head = r.stdout.splitlines()[0] if r.stdout else ""
+    check("demo-rows", r.returncode == 0 and "18 agents" in head
+          and all(m in r.stdout for m in ("laptop", "workstation", "server")), (head, r.stderr[-300:]))
+    check("demo-no-herdr-no-ssh", not marker_h.exists() and not marker_s.exists())
+    check("demo-writes-no-state", not any(sdir.iterdir()), list(sdir.iterdir()))
+    r = subprocess.run([sys.executable, str(TOOL), "--demo", "--preview", "workstation|a|w1:p3|w1:t2"],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
+    check("demo-preview-trimmed", "Which of these" in r.stdout and "accept edits" not in r.stdout, r.stdout[-300:])
+
+# The demo in a real terminal, with the real fzf, when there is one recent enough.
+fzf_real = shutil.which("fzf")
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    import fcntl as _f2
+    import struct as _st2
+    import termios as _tm2
+
+    def run_demo(keys, ready=b"rate-limiter-review"):
+        """Run --demo in a pty, send `keys` once `ready` is on screen, return (output, rc)."""
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH="/bin/false")
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL), "--demo"])
+        _f2.ioctl(fd, _tm2.TIOCSWINSZ, _st2.pack("HHHH", 40, 180, 0, 0))
+        buf, sent, end = b"", False, _time.time() + 20
+        while _time.time() < end:
+            r, _, _ = _sel.select([fd], [], [], 0.1)
+            chunk = None
+            if r:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:  # the child closed the terminal: reap it
+                    _, status = os.waitpid(pid, 0)
+                    return buf, os.waitstatus_to_exitcode(status)
+                buf += chunk
+            if not sent and ready in buf:
+                _time.sleep(0.5)
+                os.write(fd, keys)
+                sent = True
+        os.kill(pid, 9)
+        os.waitpid(pid, 0)
+        return buf, None
+    screen, rc = run_demo(b"\x1b")
+    plain = sb.ANSI.sub("", screen.decode("utf-8", "replace"))
+    check("demo-pty-renders", "18 agents" in plain and "laptop" in plain and "rate-limiter-review" in plain,
+          plain[-500:])
+    check("demo-pty-esc-exits-clean", rc == 0, rc)
+    screen, rc = run_demo(b"\r")
+    plain = sb.ANSI.sub("", screen.decode("utf-8", "replace"))
+    check("demo-pty-enter-prints-what-it-would-do", rc == 0 and "demo: would run `herdr --machine workstation agent focus"
+          in plain, (rc, plain[-400:]))
+else:
+    print("note: no fzf %s or newer here; the demo was not run in a terminal" % sb.version_text(sb.MIN_FZF))
 
 
 if FAILS:
