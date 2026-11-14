@@ -1,0 +1,83 @@
+# Switchboard configuration. Every option is optional; the values below are the defaults.
+#
+# Where it goes:
+#   inside herdr   $HERDR_PLUGIN_CONFIG_DIR/config.toml
+#                  (`herdr plugin config-dir trustxai.switchboard` prints that directory)
+#   outside herdr  ${XDG_CONFIG_HOME:-~/.config}/herdr-switchboard/config.toml
+#
+# A missing file means these defaults. A file that does not parse also means these
+# defaults, plus one warning line at the top of the popup; it never stops the popup.
+# On Python 3.9 and 3.10 (no tomllib) a built-in parser reads the file: it accepts
+# tables, strings, integers, floats and booleans, which is all this file needs.
+
+# Interface language: "en" (English) or "es" (Spanish).
+lang = "en"
+
+# How this machine is named in the machine column. Empty means the short hostname.
+local_label = ""
+
+[refresh]
+# Numbers may be integers or decimals. A value outside its range (or inf, nan, or not a
+# number) is reported in the popup header and replaced by the default.
+
+# Seconds between two reads of this machine while the popup is open. 0.2 to 60.
+local_seconds = 1
+# Seconds between two reads of each saved machine. 0.5 to 600.
+remote_seconds = 3
+# Seconds before a saved machine that does not answer is shown as offline. 1 to 120.
+remote_timeout = 8
+# Seconds to wait for this machine's own herdr snapshot, at open and on every refresh.
+# Raise it if the popup says herdr did not answer in time. 1 to 120.
+local_timeout = 5
+# Seconds the last snapshot of a saved machine stays usable: it is shown the moment the
+# popup opens, marked with its age, until the fresh one arrives. Older ones are not shown.
+# 0 to 86400; 0 turns the cached view off.
+cache_max_age = 1800
+
+[colors]
+# Colours of the list, as fzf colour values. Palette names follow your terminal theme:
+# black, red, green, yellow, blue, magenta, cyan, white, their bright- forms (bright-black,
+# bright-red, ...), and gray or grey for bright-black. Also a number from 0 to 255, "#rrggbb",
+# or -1 for the terminal default. Any other value is reported and replaced by the default.
+accent = "magenta"          # matches, prompt
+selected_fg = "black"       # text and pointer of the selected row
+selected_bg = "magenta"     # background of the selected row
+muted = "bright-black"      # header, borders, info
+# Extra fzf --color entries, appended last, for anything the keys above do not cover,
+# e.g. "info:8,border:#6272a4". The installed fzf checks them when the popup opens; if it
+# refuses them, every colour goes back to its default and the header says so.
+fzf = ""
+
+# Example: a fixed dark theme with purple accents instead of the palette names.
+# accent = "#bd93f9"
+# selected_fg = "#282a36"
+# selected_bg = "#bd93f9"
+# muted = "#6272a4"
+
+[remote]
+# How to run herdr on a saved machine over ssh. A non-interactive ssh session often lacks
+# the Homebrew directories in PATH, so the default adds the usual ones.
+herdr = 'PATH="/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:$PATH" herdr'
+
+[jump]
+# Enter on another machine's row. Off (the default): the pane is focused on that machine
+# through herdr's API and the footer says it is ready there; switch machines to see it.
+# On: the window itself jumps to that machine and pane. That needs the herdr window to run
+# in Ghostty 1.4 or newer on macOS, and non-interactive ssh from the herdr server back to
+# that Mac (key-based; Tailscale, when installed, helps find the Mac but is not required).
+enabled = false
+# ssh target of the Mac running the herdr window, or "local" when the window runs on this
+# same Mac. Empty means detect it.
+client = ""
+# Command that runs this plugin's bin/switchboard on that Mac, for example
+# "python3 /path/to/herdr-switchboard/bin/switchboard". Empty means ask herdr on the Mac
+# where it installed the plugin (`herdr plugin list --json`).
+helper = ""
+# The keys the jump types into that herdr window to open its navigator (Goto): the prefix,
+# then the navigator's key, then "/" (which focuses the navigator's search; herdr fixes that
+# one). They must match the window's herdr config, [keys] prefix and [keys] goto. These are
+# herdr's own defaults (prefix "ctrl+b", goto "prefix+g"); with other bindings, the jump
+# would type into the pane instead. Accepted: prefix "ctrl+" and a letter; goto "prefix+"
+# and one key out of a-z, 0-9 and / ? ; , . = [ ] ' ` -.
+prefix = "ctrl+b"
+goto = "prefix+g"

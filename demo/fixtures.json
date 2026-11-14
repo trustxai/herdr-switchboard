@@ -1,0 +1,876 @@
+{
+ "_comment": "Fixtures for `switchboard --demo`. Everything here is invented.",
+ "local": "laptop",
+ "machines": [
+  {
+   "id": "workstation",
+   "label": "workstation",
+   "target": "",
+   "session": "default",
+   "enabled": true
+  },
+  {
+   "id": "server",
+   "label": "server",
+   "target": "",
+   "session": "default",
+   "enabled": true
+  }
+ ],
+ "snapshots": {
+  "laptop": {
+   "workspaces": [
+    {
+     "workspace_id": "w1",
+     "label": "web",
+     "number": 1
+    },
+    {
+     "workspace_id": "w2",
+     "label": "docs",
+     "number": 2
+    }
+   ],
+   "tabs": [
+    {
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "label": "checkout",
+     "number": 1
+    },
+    {
+     "tab_id": "w1:t2",
+     "workspace_id": "w1",
+     "label": "2",
+     "number": 2
+    },
+    {
+     "tab_id": "w1:t3",
+     "workspace_id": "w1",
+     "label": "e2e",
+     "number": 3
+    },
+    {
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "label": "guides",
+     "number": 1
+    },
+    {
+     "tab_id": "w2:t2",
+     "workspace_id": "w2",
+     "label": "release",
+     "number": 2
+    }
+   ],
+   "panes": [
+    {
+     "pane_id": "w1:p1",
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "flaky-checkout-test",
+     "cwd": "~/src/web"
+    },
+    {
+     "pane_id": "w1:p2",
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "npm run dev",
+     "cwd": "~/src/web"
+    },
+    {
+     "pane_id": "w1:p3",
+     "tab_id": "w1:t2",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "dark-mode-toggle",
+     "cwd": "~/src/web"
+    },
+    {
+     "pane_id": "w1:p4",
+     "tab_id": "w1:t3",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "e2e-login-flake",
+     "cwd": "~/src/web"
+    },
+    {
+     "pane_id": "w2:p1",
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "terminal_title_stripped": "api-docs-v2",
+     "cwd": "~/src/docs"
+    },
+    {
+     "pane_id": "w2:p2",
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "terminal_title_stripped": "",
+     "cwd": "~/src/docs"
+    },
+    {
+     "pane_id": "w2:p3",
+     "tab_id": "w2:t2",
+     "workspace_id": "w2",
+     "terminal_title_stripped": "release-notes-draft",
+     "cwd": "~/src/docs"
+    }
+   ],
+   "agents": [
+    {
+     "pane_id": "w1:p1",
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "agent": "claude",
+     "agent_status": "blocked",
+     "state_change_seq": 41,
+     "terminal_title_stripped": "flaky-checkout-test",
+     "cwd": "~/src/web"
+    },
+    {
+     "pane_id": "w1:p3",
+     "tab_id": "w1:t2",
+     "workspace_id": "w1",
+     "agent": "codex",
+     "agent_status": "working",
+     "state_change_seq": 38,
+     "terminal_title_stripped": "dark-mode-toggle",
+     "cwd": "~/src/web"
+    },
+    {
+     "pane_id": "w1:p4",
+     "tab_id": "w1:t3",
+     "workspace_id": "w1",
+     "agent": "claude",
+     "agent_status": "done",
+     "state_change_seq": 44,
+     "terminal_title_stripped": "e2e-login-flake",
+     "cwd": "~/src/web",
+     "completion_seq": 44
+    },
+    {
+     "pane_id": "w2:p1",
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "agent": "claude",
+     "agent_status": "idle",
+     "state_change_seq": 12,
+     "terminal_title_stripped": "api-docs-v2",
+     "cwd": "~/src/docs",
+     "completion_seq": 12
+    },
+    {
+     "pane_id": "w2:p2",
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "agent": "gemini",
+     "agent_status": "unknown",
+     "state_change_seq": 3,
+     "terminal_title_stripped": "",
+     "cwd": "~/src/docs"
+    },
+    {
+     "pane_id": "w2:p3",
+     "tab_id": "w2:t2",
+     "workspace_id": "w2",
+     "agent": "claude",
+     "agent_status": "working",
+     "state_change_seq": 20,
+     "terminal_title_stripped": "release-notes-draft",
+     "cwd": "~/src/docs"
+    }
+   ],
+   "focused_tab_id": "w2:t1"
+  },
+  "workstation": {
+   "workspaces": [
+    {
+     "workspace_id": "w1",
+     "label": "api",
+     "number": 1
+    },
+    {
+     "workspace_id": "w2",
+     "label": "web",
+     "number": 2
+    }
+   ],
+   "tabs": [
+    {
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "label": "auth",
+     "number": 1
+    },
+    {
+     "tab_id": "w1:t2",
+     "workspace_id": "w1",
+     "label": "rate-limit",
+     "number": 2
+    },
+    {
+     "tab_id": "w1:t3",
+     "workspace_id": "w1",
+     "label": "orders",
+     "number": 3
+    },
+    {
+     "tab_id": "w1:t4",
+     "workspace_id": "w1",
+     "label": "4",
+     "number": 4
+    },
+    {
+     "tab_id": "w1:t5",
+     "workspace_id": "w1",
+     "label": "cache",
+     "number": 5
+    },
+    {
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "label": "landing",
+     "number": 1
+    },
+    {
+     "tab_id": "w2:t2",
+     "workspace_id": "w2",
+     "label": "2",
+     "number": 2
+    }
+   ],
+   "panes": [
+    {
+     "pane_id": "w1:p1",
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "migrate-auth-to-oidc",
+     "cwd": "~/src/api"
+    },
+    {
+     "pane_id": "w1:p2",
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "pytest -x --lf",
+     "cwd": "~/src/api"
+    },
+    {
+     "pane_id": "w1:p3",
+     "tab_id": "w1:t2",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "rate-limiter-review",
+     "cwd": "~/src/api"
+    },
+    {
+     "pane_id": "w1:p4",
+     "tab_id": "w1:t3",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "fix-n-plus-1-orders-query",
+     "cwd": "~/src/api"
+    },
+    {
+     "pane_id": "w1:p5",
+     "tab_id": "w1:t4",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "bump-dependencies",
+     "cwd": "~/src/api"
+    },
+    {
+     "pane_id": "w1:p6",
+     "tab_id": "w1:t5",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "cache-invalidation-bug",
+     "cwd": "~/src/api"
+    },
+    {
+     "pane_id": "w2:p1",
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "terminal_title_stripped": "landing-page-copy",
+     "cwd": "~/src/web"
+    },
+    {
+     "pane_id": "w2:p2",
+     "tab_id": "w2:t2",
+     "workspace_id": "w2",
+     "terminal_title_stripped": "lazygit",
+     "cwd": "~/src/web"
+    }
+   ],
+   "agents": [
+    {
+     "pane_id": "w1:p1",
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "agent": "claude",
+     "agent_status": "working",
+     "state_change_seq": 77,
+     "terminal_title_stripped": "migrate-auth-to-oidc",
+     "cwd": "~/src/api"
+    },
+    {
+     "pane_id": "w1:p3",
+     "tab_id": "w1:t2",
+     "workspace_id": "w1",
+     "agent": "claude",
+     "agent_status": "blocked",
+     "state_change_seq": 81,
+     "terminal_title_stripped": "rate-limiter-review",
+     "cwd": "~/src/api"
+    },
+    {
+     "pane_id": "w1:p4",
+     "tab_id": "w1:t3",
+     "workspace_id": "w1",
+     "agent": "opencode",
+     "agent_status": "done",
+     "state_change_seq": 70,
+     "terminal_title_stripped": "fix-n-plus-1-orders-query",
+     "cwd": "~/src/api",
+     "completion_seq": 70
+    },
+    {
+     "pane_id": "w1:p5",
+     "tab_id": "w1:t4",
+     "workspace_id": "w1",
+     "agent": "codex",
+     "agent_status": "idle",
+     "state_change_seq": 50,
+     "terminal_title_stripped": "bump-dependencies",
+     "cwd": "~/src/api",
+     "completion_seq": 50
+    },
+    {
+     "pane_id": "w1:p6",
+     "tab_id": "w1:t5",
+     "workspace_id": "w1",
+     "agent": "claude",
+     "agent_status": "working",
+     "state_change_seq": 79,
+     "terminal_title_stripped": "cache-invalidation-bug",
+     "cwd": "~/src/api"
+    },
+    {
+     "pane_id": "w2:p1",
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "agent": "claude",
+     "agent_status": "idle",
+     "state_change_seq": 33,
+     "terminal_title_stripped": "landing-page-copy",
+     "cwd": "~/src/web",
+     "completion_seq": 33
+    }
+   ],
+   "focused_tab_id": "w1:t1"
+  },
+  "server": {
+   "workspaces": [
+    {
+     "workspace_id": "w1",
+     "label": "infra",
+     "number": 1
+    },
+    {
+     "workspace_id": "w2",
+     "label": "api",
+     "number": 2
+    }
+   ],
+   "tabs": [
+    {
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "label": "k8s",
+     "number": 1
+    },
+    {
+     "tab_id": "w1:t2",
+     "workspace_id": "w1",
+     "label": "terraform",
+     "number": 2
+    },
+    {
+     "tab_id": "w1:t3",
+     "workspace_id": "w1",
+     "label": "monitoring",
+     "number": 3
+    },
+    {
+     "tab_id": "w1:t4",
+     "workspace_id": "w1",
+     "label": "4",
+     "number": 4
+    },
+    {
+     "tab_id": "w1:t5",
+     "workspace_id": "w1",
+     "label": "logs",
+     "number": 5
+    },
+    {
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "label": "load-test",
+     "number": 1
+    },
+    {
+     "tab_id": "w2:t2",
+     "workspace_id": "w2",
+     "label": "db",
+     "number": 2
+    }
+   ],
+   "panes": [
+    {
+     "pane_id": "w1:p1",
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "probe-timeouts",
+     "cwd": "~/src/infra"
+    },
+    {
+     "pane_id": "w1:p2",
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "kubectl logs -f deploy/api",
+     "cwd": "~/src/infra"
+    },
+    {
+     "pane_id": "w1:p3",
+     "tab_id": "w1:t2",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "terraform-plan-staging",
+     "cwd": "~/src/infra"
+    },
+    {
+     "pane_id": "w1:p4",
+     "tab_id": "w1:t3",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "alert-noise-cleanup",
+     "cwd": "~/src/infra"
+    },
+    {
+     "pane_id": "w1:p5",
+     "tab_id": "w1:t4",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "btop",
+     "cwd": "~"
+    },
+    {
+     "pane_id": "w1:p6",
+     "tab_id": "w1:t5",
+     "workspace_id": "w1",
+     "terminal_title_stripped": "log-rotation-script",
+     "cwd": "~/src/infra"
+    },
+    {
+     "pane_id": "w2:p1",
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "terminal_title_stripped": "load-test-baseline",
+     "cwd": "~/src/api"
+    },
+    {
+     "pane_id": "w2:p2",
+     "tab_id": "w2:t2",
+     "workspace_id": "w2",
+     "terminal_title_stripped": "postgres-index-review",
+     "cwd": "~/src/api"
+    }
+   ],
+   "agents": [
+    {
+     "pane_id": "w1:p1",
+     "tab_id": "w1:t1",
+     "workspace_id": "w1",
+     "agent": "claude",
+     "agent_status": "working",
+     "state_change_seq": 120,
+     "terminal_title_stripped": "probe-timeouts",
+     "cwd": "~/src/infra"
+    },
+    {
+     "pane_id": "w1:p3",
+     "tab_id": "w1:t2",
+     "workspace_id": "w1",
+     "agent": "codex",
+     "agent_status": "blocked",
+     "state_change_seq": 118,
+     "terminal_title_stripped": "terraform-plan-staging",
+     "cwd": "~/src/infra"
+    },
+    {
+     "pane_id": "w1:p4",
+     "tab_id": "w1:t3",
+     "workspace_id": "w1",
+     "agent": "claude",
+     "agent_status": "done",
+     "state_change_seq": 101,
+     "terminal_title_stripped": "alert-noise-cleanup",
+     "cwd": "~/src/infra",
+     "completion_seq": 101
+    },
+    {
+     "pane_id": "w1:p6",
+     "tab_id": "w1:t5",
+     "workspace_id": "w1",
+     "agent": "codex",
+     "agent_status": "idle",
+     "state_change_seq": 96,
+     "terminal_title_stripped": "log-rotation-script",
+     "cwd": "~/src/infra",
+     "completion_seq": 96
+    },
+    {
+     "pane_id": "w2:p1",
+     "tab_id": "w2:t1",
+     "workspace_id": "w2",
+     "agent": "opencode",
+     "agent_status": "idle",
+     "state_change_seq": 90,
+     "terminal_title_stripped": "load-test-baseline",
+     "cwd": "~/src/api",
+     "completion_seq": 90
+    },
+    {
+     "pane_id": "w2:p2",
+     "tab_id": "w2:t2",
+     "workspace_id": "w2",
+     "agent": "claude",
+     "agent_status": "unknown",
+     "state_change_seq": 2,
+     "terminal_title_stripped": "postgres-index-review",
+     "cwd": "~/src/api"
+    }
+   ],
+   "focused_tab_id": "w1:t3"
+  }
+ },
+ "previews": {
+  "laptop": {
+   "w1:p1": [
+    "● The test fails about one run in five. It waits for the coupon request with a fixed",
+    "  timeout, and the request sometimes resolves after the totals render.",
+    "",
+    "● Update(tests/checkout.spec.ts)",
+    "  └  Updated tests/checkout.spec.ts with 3 additions and 2 removals",
+    "       41 -    await page.waitForTimeout(500)",
+    "       41 +    await page.waitForResponse((r) => r.url().endsWith('/coupons/apply'))",
+    "",
+    "● Now I'll run the suite ten times in a row to confirm the flake is gone.",
+    "",
+    "● Bash(npm run test:e2e -- --grep checkout)",
+    "",
+    "\u001b[2m╭────────────────────────────────────────────────────────────────────╮\u001b[0m",
+    " Bash command",
+    "",
+    "   npm run test:e2e -- --grep checkout",
+    "   \u001b[2mRun the checkout end-to-end tests\u001b[0m",
+    "",
+    " Do you want to proceed?",
+    " \u001b[36m❯ 1. Yes\u001b[0m",
+    "   2. Yes, and don't ask again for this command in this project",
+    "   3. No, and say what to do differently (esc)",
+    "\u001b[2m╰────────────────────────────────────────────────────────────────────╯\u001b[0m"
+   ],
+   "w1:p2": [
+    "",
+    "  \u001b[32mVITE\u001b[0m v5.4.2  ready in 412 ms",
+    "",
+    "  ➜  Local:   http://localhost:5173/",
+    "  ➜  Network: use --host to expose",
+    "",
+    "\u001b[2m10:41:58\u001b[0m \u001b[36m[vite]\u001b[0m page reload src/pages/Checkout.tsx",
+    "\u001b[2m10:42:07\u001b[0m \u001b[36m[vite]\u001b[0m hmr update /src/components/CouponField.tsx",
+    "\u001b[2m10:42:31\u001b[0m \u001b[36m[vite]\u001b[0m hmr update /src/components/CartTotals.tsx"
+   ],
+   "w1:p3": [
+    "› Add a dark mode toggle to the settings page and remember the choice",
+    "",
+    "• Read src/settings/SettingsPage.tsx and src/theme/tokens.ts",
+    "• Added a ThemeProvider with light, dark and system modes",
+    "• Persisting the choice in localStorage under ui.theme",
+    "",
+    "\u001b[33m• Working (1m 12s • esc to interrupt)\u001b[0m",
+    "",
+    "› ",
+    "\u001b[2m  ⏎ send   ⇧⏎ newline   ⌃C quit\u001b[0m"
+   ],
+   "w1:p4": [
+    "● Bash(npm run test:e2e -- --grep login --repeat-each 20)",
+    "  └  \u001b[32m✓\u001b[0m 20 passed (1.4m)",
+    "",
+    "● The login flake is fixed. The session cookie was read before the redirect finished;",
+    "  the test now waits for the dashboard heading instead of a fixed delay.",
+    "",
+    "  Changed:",
+    "  - tests/login.spec.ts: wait for the heading, drop waitForTimeout",
+    "  - tests/fixtures/auth.ts: reuse one signed-in storage state per worker",
+    "",
+    "  20 consecutive runs pass locally. Ready for review.",
+    "",
+    "\u001b[2m────────────────────────────────────────────────────────── e2e-login-flake ──\u001b[0m",
+    "❯ ",
+    "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
+   ],
+   "w2:p1": [
+    "● I drafted the v2 reference for the orders endpoints:",
+    "",
+    "  | Endpoint              | Change in v2                         |",
+    "  |-----------------------|--------------------------------------|",
+    "  | GET /v2/orders        | cursor pagination replaces page/size |",
+    "  | POST /v2/orders       | idempotency key header is required   |",
+    "  | GET /v2/orders/{id}   | totals moved under `amounts`         |",
+    "",
+    "  The migration guide links each change to its v1 equivalent.",
+    "",
+    "\u001b[2m────────────────────────────────────────────────────────── api-docs-v2 ──\u001b[0m",
+    "❯ ",
+    "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
+   ],
+   "w2:p2": [
+    "> summarize the open questions in docs/guides/deploy.md",
+    "",
+    "  There are three open questions in the deploy guide:",
+    "  1. Whether preview environments are deleted on merge or after 24 hours.",
+    "  2. Who approves database migrations that lock a table.",
+    "  3. How long build artifacts are kept.",
+    "",
+    "> "
+   ],
+   "w2:p3": [
+    "● Reading the merged pull requests since the last tag.",
+    "",
+    "● Bash(git log --oneline v1.8.0..HEAD)",
+    "  └  a1c9e07 Cursor pagination for orders",
+    "     4f20b11 Coupon applied before tax",
+    "     9d3e5a2 Rate limit headers on every response",
+    "     … +14 lines (ctrl+r to expand)",
+    "",
+    "● Grouping them into features, fixes and breaking changes.",
+    "",
+    "\u001b[33m✻ Drafting… (48s · ↓ 2.1k tokens · esc to interrupt)\u001b[0m",
+    "",
+    "\u001b[2m────────────────────────────────────────────────────────── release-notes-draft ──\u001b[0m",
+    "❯ ",
+    "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
+   ]
+  },
+  "workstation": {
+   "w1:p1": [
+    "● Bash(pytest tests/auth -q)",
+    "  └  \u001b[32m41 passed\u001b[0m, 2 skipped in 6.20s",
+    "",
+    "● Replacing the session middleware with the OIDC client. The refresh flow needs the",
+    "  token endpoint from discovery, so I'm caching the discovery document for an hour.",
+    "",
+    "● Update(app/auth/oidc.py)",
+    "  └  Updated app/auth/oidc.py with 58 additions",
+    "",
+    "\u001b[33m✻ Wiring the callback route… (2m 03s · ↓ 6.8k tokens · esc to interrupt)\u001b[0m",
+    "",
+    "\u001b[2m────────────────────────────────────────────────────────── migrate-auth-to-oidc ──\u001b[0m",
+    "❯ ",
+    "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
+   ],
+   "w1:p2": [
+    "$ pytest -x --lf",
+    "============================= test session starts ==============================",
+    "collected 214 items / 211 deselected / 3 selected",
+    "",
+    "tests/auth/test_refresh.py \u001b[32m...\u001b[0m                                            [100%]",
+    "",
+    "======================= \u001b[32m3 passed, 211 deselected in 1.12s\u001b[0m ========================",
+    "$ "
+   ],
+   "w1:p3": [
+    "● I reviewed the rate limiter. Two findings need a decision before I change code:",
+    "",
+    "  1. \u001b[1mBurst handling.\u001b[0m The token bucket refills once per second, so a client",
+    "     can send 2x the limit across a second boundary. A sliding window fixes it at the",
+    "     cost of one more read per request.",
+    "",
+    "  2. \u001b[1mShared limits.\u001b[0m Limits are per process. With four workers, the effective",
+    "     limit is four times the configured one. Moving the counters to the shared cache",
+    "     makes them global.",
+    "",
+    "  Which of these should I implement?",
+    "",
+    "\u001b[2m────────────────────────────────────────────────────────── rate-limiter-review ──\u001b[0m",
+    "❯ ",
+    "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
+   ],
+   "w1:p4": [
+    "  opencode",
+    "",
+    "  Fixed the N+1 in the orders list query.",
+    "",
+    "  - orders/repository.py: prefetch line items and customers in two queries",
+    "  - tests/test_orders_list.py: assert at most 3 queries for 50 orders",
+    "",
+    "  Before: 101 queries, 640 ms for 50 orders",
+    "  After:    3 queries,  38 ms for 50 orders",
+    "",
+    "  > "
+   ],
+   "w1:p5": [
+    "› Bump the minor versions and run the test suite",
+    "",
+    "• Updated 14 packages in requirements.txt",
+    "• Ran pytest: 214 passed",
+    "• No breaking changes in the changelogs of the updated packages",
+    "",
+    "› ",
+    "\u001b[2m  ⏎ send   ⇧⏎ newline   ⌃C quit\u001b[0m"
+   ],
+   "w1:p6": [
+    "● The stale prices come from the product cache: updates invalidate the product key but",
+    "  not the category listing that embeds it.",
+    "",
+    "● Search(pattern: \"cache.delete\", path: \"app\")",
+    "  └  Found 7 matches",
+    "",
+    "\u001b[33m✻ Tracing every write path… (37s · ↓ 1.6k tokens · esc to interrupt)\u001b[0m",
+    "",
+    "\u001b[2m────────────────────────────────────────────────────────── cache-invalidation-bug ──\u001b[0m",
+    "❯ ",
+    "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
+   ],
+   "w2:p1": [
+    "● Here is a tighter hero section:",
+    "",
+    "  \u001b[1mShip the fix before the standup.\u001b[0m",
+    "  One place to see every build, review and deploy that needs you.",
+    "",
+    "  I kept the call to action as is and moved the pricing link to the footer.",
+    "",
+    "\u001b[2m────────────────────────────────────────────────────────── landing-page-copy ──\u001b[0m",
+    "❯ ",
+    "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
+   ],
+   "w2:p2": [
+    " Commits",
+    "  \u001b[33m3f9a2c1\u001b[0m Hero copy, shorter subtitle",
+    "  \u001b[33mb77e014\u001b[0m Move pricing link to the footer",
+    "  \u001b[33m0c5d9e8\u001b[0m Lazy-load the demo video",
+    "  \u001b[33me41a6b3\u001b[0m Fix layout shift on the signup form",
+    "",
+    " Files",
+    "  \u001b[32mM\u001b[0m src/pages/Landing.tsx",
+    "  \u001b[32mM\u001b[0m src/components/Footer.tsx"
+   ]
+  },
+  "server": {
+   "w1:p1": [
+    "● Bash(kubectl describe pod -l app=api | grep -A3 Liveness)",
+    "  └  Liveness:  http-get :8080/healthz delay=5s timeout=1s period=10s",
+    "",
+    "● The liveness probe times out after 1s while a cold start loads the model files,",
+    "  so the pod is killed before it is ready. I'm adding a startup probe and raising the",
+    "  liveness timeout to 3s.",
+    "",
+    "\u001b[33m✻ Editing charts/api/values.yaml… (1m 41s · ↓ 3.0k tokens · esc to interrupt)\u001b[0m",
+    "",
+    "\u001b[2m────────────────────────────────────────────────────────── probe-timeouts ──\u001b[0m",
+    "❯ ",
+    "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
+   ],
+   "w1:p2": [
+    "\u001b[2m{\"level\":\"info\",\"msg\":\"request served\",\"path\":\"/v1/orders\",\"status\":200,\"ms\":12}\u001b[0m",
+    "\u001b[2m{\"level\":\"info\",\"msg\":\"request served\",\"path\":\"/v1/orders/8812\",\"status\":200,\"ms\":9}\u001b[0m",
+    "\u001b[33m{\"level\":\"warn\",\"msg\":\"slow query\",\"table\":\"line_items\",\"ms\":412}\u001b[0m",
+    "\u001b[2m{\"level\":\"info\",\"msg\":\"request served\",\"path\":\"/v1/cart\",\"status\":200,\"ms\":15}\u001b[0m",
+    "\u001b[31m{\"level\":\"error\",\"msg\":\"upstream timeout\",\"service\":\"pricing\",\"ms\":3000}\u001b[0m",
+    "\u001b[2m{\"level\":\"info\",\"msg\":\"request served\",\"path\":\"/healthz\",\"status\":200,\"ms\":1}\u001b[0m"
+   ],
+   "w1:p3": [
+    "› Run terraform plan for staging and summarize the changes",
+    "",
+    "• terraform plan -var-file=staging.tfvars",
+    "  Plan: 2 to add, 1 to change, 1 to destroy.",
+    "",
+    "  \u001b[31m- module.db.parameter_group.legacy\u001b[0m will be destroyed",
+    "",
+    "\u001b[33m▌ Allow command?\u001b[0m",
+    "▌ terraform apply -var-file=staging.tfvars",
+    "▌ [y] yes   [a] always   [n] no"
+   ],
+   "w1:p4": [
+    "● Cleaned up the noisy alerts:",
+    "",
+    "  - Disk usage: warn at 80% for 15m instead of 70% for 1m",
+    "  - 5xx rate: page only above 2% for 5m; below that, a ticket",
+    "  - Removed two alerts on metrics no service exports anymore",
+    "",
+    "  Last week's data would have produced 6 pages instead of 41.",
+    "",
+    "\u001b[2m────────────────────────────────────────────────────────── alert-noise-cleanup ──\u001b[0m",
+    "❯ ",
+    "\u001b[2m──────────────────────────────────────────────────────────────────────\u001b[0m",
+    "\u001b[2m  » accept edits on (shift+tab to cycle)\u001b[0m"
+   ],
+   "w1:p5": [
+    " cpu \u001b[32m▇▇▇▅▃▂▂▃▅▆\u001b[0m 34%   mem \u001b[33m██████░░░░\u001b[0m 6.1G/15.5G   load 0.84 0.71 0.66",
+    "",
+    "   PID USER      CPU%  MEM%  COMMAND",
+    "  2211 dev       41.0   8.2  python -m app.worker",
+    "  1980 dev       12.3   4.1  node server.js",
+    "   812 dev        3.4   1.2  postgres: checkpointer",
+    "   640 dev        0.9   0.4  herdr server"
+   ],
+   "w1:p6": [
+    "› Write a logrotate config for the worker logs and test it",
+    "",
+    "• Created deploy/logrotate/worker: daily, keep 14, compress, copytruncate",
+    "• logrotate --debug deploy/logrotate/worker: no errors",
+    "",
+    "› ",
+    "\u001b[2m  ⏎ send   ⇧⏎ newline   ⌃C quit\u001b[0m"
+   ],
+   "w2:p1": [
+    "  opencode",
+    "",
+    "  Baseline load test against the staging api (5 minutes, 200 virtual users):",
+    "",
+    "    p50 48 ms   p95 210 ms   p99 640 ms   errors 0.02%",
+    "",
+    "  p99 is driven by /v1/orders with large carts. Saved the script as loadtest/orders.js.",
+    "",
+    "  > "
+   ],
+   "w2:p2": [
+    "● Reading pg_stat_statements for the slowest queries.",
+    "",
+    "\u001b[2m(no output for 12 minutes)\u001b[0m"
+   ]
+  }
+ },
+ "timeline": [
+  {
+   "after": 8,
+   "machine": "workstation",
+   "pane": "w1:p1",
+   "set": {
+    "agent_status": "done",
+    "state_change_seq": 82,
+    "completion_seq": 82
+   }
+  },
+  {
+   "after": 16,
+   "machine": "laptop",
+   "pane": "w1:p1",
+   "set": {
+    "agent_status": "working",
+    "state_change_seq": 45
+   }
+  }
+ ]
+}

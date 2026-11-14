@@ -1,0 +1,2837 @@
+#!/usr/bin/env python3
+"""switchboard: every herdr agent, on every saved machine, in one popup ordered by priority.
+
+    switchboard                 the popup: fzf over the rows (what the plugin pane runs)
+    switchboard --demo          the same interface over bundled fixtures: no herdr, no ssh
+    switchboard --rows          print the rows without fzf
+    switchboard --preview ID    the preview of one row (fzf calls this)
+    switchboard --version
+
+One row per agent, in the order of herdr's native agent panel with
+agent_panel_sort = "priority": blocked, done, working, idle, unknown. Inside a status the
+agent whose change was seen last goes first, whatever machine it is on. Plain terminals
+go last. The preview at the bottom shows the end of the pane (`herdr pane read`).
+
+What the native Goto does not do and this does: it orders by priority instead of grouping
+by workspace, and it lists the agents of every saved machine (`herdr machine list`) next
+to the local ones. While open it refreshes itself.
+
+Python 3.9 and the standard library only: macOS ships /usr/bin/python3 3.9.
+"""
+import base64
+import copy as copymod
+import glob
+import json
+import math
+import os
+import re
+import select
+import shlex
+import shutil
+import signal
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+
+try:
+    import tomllib
+except ImportError:  # Python < 3.11: the built-in parser below reads the config
+    tomllib = None
+
+VERSION = "0.1.0"
+PLUGIN_ID = "trustxai.switchboard"
+APP_DIR = "herdr-switchboard"   # config and state directory name outside herdr
+MIN_PYTHON = (3, 9)
+MIN_FZF = (0, 71)               # --id-nth, which keeps the cursor on the same agent on reload
+
+# A plugin pane inherits the PATH of the herdr server, which may have started without
+# Homebrew's directories. fzf and herdr usually live there. They go at the end, so they
+# only fill gaps and never shadow what the user put first.
+for _d in ("/opt/homebrew/bin", "/home/linuxbrew/.linuxbrew/bin", "/usr/local/bin",
+           os.path.expanduser("~/.local/bin")):
+    if os.path.isdir(_d) and _d not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + _d
+
+
+def find_herdr(env=None):
+    """The herdr binary: the one herdr injects into plugin commands, else the one on PATH."""
+    env = os.environ if env is None else env
+    return env.get("HERDR_BIN_PATH") or shutil.which("herdr", path=env.get("PATH")) or "herdr"
+
+
+HERDR = find_herdr()
+LOCAL = ""  # machine id of the rows of this machine
+
+# Escape sequences (CSI, OSC, DCS and the like) and control characters (C0, DEL, C1).
+ESCAPE_SEQ = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"
+                        r"|\x1b[PX^_][^\x1b]*(?:\x1b\\)?|\x1b.?")
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def clean(text):
+    """One line of plain text, without escape sequences or control characters. A number
+    becomes its digits; any other non-string (a list where a label should be) becomes ""."""
+    if isinstance(text, (int, float)) and not isinstance(text, bool):
+        text = str(text)
+    elif not isinstance(text, str):
+        return ""
+    return CONTROL_CHARS.sub("", ESCAPE_SEQ.sub("", text))
+
+
+# For pane contents shown in the preview: colours (SGR) and line breaks stay, every other
+# escape (clipboard writes, title changes, screen clears) and control character goes.
+SCREEN_TOKENS = re.compile(r"(\x1b\[[0-9;:]*m)|" + ESCAPE_SEQ.pattern + r"|[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def clean_screen(text):
+    return SCREEN_TOKENS.sub(lambda m: m.group(1) or "", text)
+
+
+# What a herdr id looks like ("w1:p3", a machine id). Ids go into herdr's argv and into
+# the row id, so one that could pass for an option or break a row is refused.
+SAFE_ID = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_:.@+=-]{0,127}")
+
+
+def safe_id(value):
+    # fullmatch, not match: "$" also matches before a trailing newline.
+    return isinstance(value, str) and SAFE_ID.fullmatch(value) is not None
+
+
+def _int(value, default=0):
+    return value if isinstance(value, int) and not isinstance(value, bool) else default
+
+# --- user-visible text ------------------------------------------------------------------
+#
+# Every string the user can read goes through this table. Status names are herdr's own
+# vocabulary (the native agent panel shows them in English), so both languages keep them.
+
+STRINGS = {
+    "en": {
+        "st_blocked": "blocked", "st_done": "done", "st_working": "working",
+        "st_idle": "idle", "st_unknown": "unknown", "st_shell": "shell",
+        "agents": "%d agents",
+        "count": "%d %s",
+        "stale": "%s from %s ago",
+        "loading": "loading %s…",
+        "offline_list": "%s offline",
+        "offline_row": "offline",
+        "hint": "live · enter open · ctrl-y copy · ctrl-o select · ctrl-t terminals"
+                " · ctrl-/ preview · esc close",
+        "age_s": "%d s",
+        "age_min": "%d min",
+        "read_failed": "could not read the pane: %s",
+        "copied": "copied: %s · %d characters",
+        "what_reply": "the last reply",
+        "what_reply_screen": "the last reply (from the screen)",
+        "what_visible": "what is on screen",
+        "nothing_to_copy": "nothing to copy",
+        "copy_failed": "could not copy: %s",
+        "select_help": " drag to select · copied on release · wheel or ↑↓ to scroll · esc goes back ",
+        "select_copied": " copied: %d characters%s · esc goes back ",
+        "select_lines": ", %d lines",
+        "snapshot_failed": "herdr api snapshot failed (%s). Press Enter to close. ",
+        "rows_failed": "herdr api snapshot failed: %s",
+        "snapshot_timeout": "herdr did not answer api snapshot within %s s. If this machine is that slow, raise"
+                            " [refresh] local_timeout in %s. Press Enter to close. ",
+        "rows_timeout": "herdr did not answer api snapshot within %s s. If this machine is that slow, raise"
+                        " [refresh] local_timeout in %s.",
+        "remote_focusing": "focusing it on %s…",
+        "remote_ready": "ready on %s: switch to that machine to see it · esc closes",
+        "remote_failed": "could not focus it on %s · esc closes",
+        "config_warning": "config %s: %s (defaults in use)",
+        "need_python": "switchboard needs Python %s or newer; found Python %s (%s).",
+        "install_python_macos": "Install the Command Line Tools (xcode-select --install) for"
+                                " /usr/bin/python3, or a newer Python with Homebrew.",
+        "install_python_other": "Install Python %s or newer with your package manager.",
+        "need_fzf_missing": "switchboard needs fzf %s or newer, and fzf was not found.",
+        "need_fzf_old": "switchboard needs fzf %s or newer; found fzf %s.",
+        "install_fzf_macos": "Install it with Homebrew: brew install fzf",
+        "install_fzf_other": "Install a recent release from https://github.com/junegunn/fzf/releases"
+                             " or with Homebrew (brew install fzf); distribution packages are"
+                             " often older than %s.",
+        "press_enter": "Press Enter to close. ",
+        "demo_would": "demo: would run `herdr %s`",
+        "demo_jump_off": "demo: the cross-machine jump is off, so the pane would be ready on %s"
+                         " when you switch to that machine",
+        "demo_nothing": "demo: nothing selected",
+        "colors_rejected": "fzf rejected the colours in the config, so the defaults are in use",
+        "fzf_failed": "fzf could not start: %s",
+        "usage": (
+            "switchboard: every herdr agent, on every saved machine, in one popup.\n\n"
+            "    switchboard                 the popup (what the plugin pane runs)\n"
+            "    switchboard --demo          the same interface over bundled fixtures\n"
+            "    switchboard --rows          print the rows without fzf\n"
+            "    switchboard --version\n\n"
+            "Config: %s\n"),
+        "cfg_unknown": "unknown option %s",
+        "cfg_bad_value": "bad value for %s",
+        "cfg_not_table": "[%s] must be a table",
+        "toml_bad_escape": "line %d: bad escape sequence",
+        "toml_control": "line %d: control character in a string",
+        "toml_unterminated": "line %d: unterminated string",
+        "toml_expected_key": "line %d: expected a key",
+        "toml_multiline": "line %d: multi-line strings are not supported",
+        "toml_unsupported": "line %d: unsupported value %s",
+        "toml_array_tables": "line %d: arrays of tables are not supported",
+        "toml_bad_header": "line %d: bad table header",
+        "toml_trailing": "line %d: unexpected text at the end of the line",
+        "toml_twice": "line %d: table [%s] declared twice",
+        "toml_not_table": "line %d: %s is not a table",
+        "toml_expected_eq": "line %d: expected '=' after the key",
+        "toml_missing": "line %d: missing value",
+        "toml_duplicate": "line %d: duplicate key %s",
+        "toml_control_char": "line %d: control character (only tab is allowed)",
+    },
+    "es": {
+        "st_blocked": "blocked", "st_done": "done", "st_working": "working",
+        "st_idle": "idle", "st_unknown": "unknown", "st_shell": "shell",
+        "agents": "%d agentes",
+        "count": "%d %s",
+        "stale": "%s de hace %s",
+        "loading": "cargando %s…",
+        "offline_list": "%s sin conexión",
+        "offline_row": "sin conexión",
+        "hint": "se actualiza solo · enter abrir · ctrl-y copiar · ctrl-o seleccionar"
+                " · ctrl-t terminales · ctrl-/ preview · esc salir",
+        "age_s": "%d s",
+        "age_min": "%d min",
+        "read_failed": "no se pudo leer la pane: %s",
+        "copied": "copiado: %s · %d caracteres",
+        "what_reply": "la última respuesta",
+        "what_reply_screen": "la última respuesta (de la pantalla)",
+        "what_visible": "lo que se ve",
+        "nothing_to_copy": "no hay nada para copiar",
+        "copy_failed": "no se pudo copiar: %s",
+        "select_help": " arrastrá para seleccionar · se copia al soltar · rueda o ↑↓ para moverte"
+                       " · esc vuelve ",
+        "select_copied": " copiado: %d caracteres%s · esc vuelve ",
+        "select_lines": ", %d líneas",
+        "snapshot_failed": "falló herdr api snapshot (%s). Enter para cerrar. ",
+        "rows_failed": "falló herdr api snapshot: %s",
+        "snapshot_timeout": "herdr no contestó api snapshot en %s s. Si esta máquina es así de lenta, subí"
+                            " [refresh] local_timeout en %s. Enter para cerrar. ",
+        "rows_timeout": "herdr no contestó api snapshot en %s s. Si esta máquina es así de lenta, subí"
+                        " [refresh] local_timeout en %s.",
+        "remote_focusing": "enfocándola en %s…",
+        "remote_ready": "lista en %s: pasá a esa máquina para verla · esc cierra",
+        "remote_failed": "no se pudo enfocar en %s · esc cierra",
+        "config_warning": "config %s: %s (se usan los valores por defecto)",
+        "need_python": "switchboard necesita Python %s o más nuevo; se encontró Python %s (%s).",
+        "install_python_macos": "Instalá las Command Line Tools (xcode-select --install) para"
+                                " tener /usr/bin/python3, o un Python más nuevo con Homebrew.",
+        "install_python_other": "Instalá Python %s o más nuevo con tu gestor de paquetes.",
+        "need_fzf_missing": "switchboard necesita fzf %s o más nuevo, y no se encontró fzf.",
+        "need_fzf_old": "switchboard necesita fzf %s o más nuevo; se encontró fzf %s.",
+        "install_fzf_macos": "Instalalo con Homebrew: brew install fzf",
+        "install_fzf_other": "Instalá una versión reciente desde"
+                             " https://github.com/junegunn/fzf/releases o con Homebrew"
+                             " (brew install fzf); los paquetes de las distribuciones suelen ser"
+                             " anteriores a %s.",
+        "press_enter": "Enter para cerrar. ",
+        "demo_would": "demo: correría `herdr %s`",
+        "demo_jump_off": "demo: el salto entre máquinas está apagado, así que la pane quedaría"
+                         " lista en %s cuando pases a esa máquina",
+        "demo_nothing": "demo: no se eligió nada",
+        "colors_rejected": "fzf rechazó los colores de la config, así que se usan los de por defecto",
+        "fzf_failed": "fzf no pudo arrancar: %s",
+        "usage": (
+            "switchboard: todos los agentes de herdr, de todas las máquinas guardadas, en un popup.\n\n"
+            "    switchboard                 el popup (lo que corre la pane del plugin)\n"
+            "    switchboard --demo          la misma interfaz con datos de ejemplo\n"
+            "    switchboard --rows          las filas, sin fzf\n"
+            "    switchboard --version\n\n"
+            "Config: %s\n"),
+        "cfg_unknown": "opción desconocida %s",
+        "cfg_bad_value": "valor inválido para %s",
+        "cfg_not_table": "[%s] tiene que ser una tabla",
+        "toml_bad_escape": "línea %d: secuencia de escape inválida",
+        "toml_control": "línea %d: carácter de control dentro de un texto",
+        "toml_unterminated": "línea %d: texto sin cerrar",
+        "toml_expected_key": "línea %d: falta una clave",
+        "toml_multiline": "línea %d: no se aceptan textos de varias líneas",
+        "toml_unsupported": "línea %d: valor no soportado %s",
+        "toml_array_tables": "línea %d: no se aceptan listas de tablas",
+        "toml_bad_header": "línea %d: encabezado de tabla inválido",
+        "toml_trailing": "línea %d: texto de más al final de la línea",
+        "toml_twice": "línea %d: la tabla [%s] aparece dos veces",
+        "toml_not_table": "línea %d: %s no es una tabla",
+        "toml_expected_eq": "línea %d: falta '=' después de la clave",
+        "toml_missing": "línea %d: falta el valor",
+        "toml_duplicate": "línea %d: clave repetida %s",
+        "toml_control_char": "línea %d: carácter de control (solo se acepta tab)",
+    },
+}
+
+LANG = "en"
+
+
+def tr(key, *args, lang=None):
+    """The text for `key` in the configured language (English when a key is missing)."""
+    text = STRINGS.get(lang or LANG, STRINGS["en"]).get(key) or STRINGS["en"][key]
+    return text % args if args else text
+
+
+# --- configuration ----------------------------------------------------------------------
+
+DEFAULT_REMOTE_HERDR = 'PATH="/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:$PATH" herdr'
+
+DEFAULTS = {
+    "lang": "en",
+    "local_label": "",
+    "refresh": {
+        "local_seconds": 1.0,
+        "remote_seconds": 3.0,
+        "remote_timeout": 8.0,
+        "local_timeout": 5.0,
+        "cache_max_age": 1800.0,
+    },
+    # Names of the terminal's own ANSI palette, so the default looks right on any theme.
+    "colors": {
+        "accent": "magenta",
+        "selected_fg": "black",
+        "selected_bg": "magenta",
+        "muted": "bright-black",
+        "fzf": "",
+    },
+    "remote": {
+        "herdr": DEFAULT_REMOTE_HERDR,
+    },
+    "jump": {
+        "enabled": False,
+        "client": "",
+        "helper": "",
+        "prefix": "ctrl+b",
+        "goto": "prefix+g",
+    },
+}
+
+# The accepted range of each number, inclusive. Anything else, including inf and nan, is
+# reported and replaced by the default.
+NUMBER_RANGES = {
+    ("refresh", "local_seconds"): (0.2, 60.0),
+    ("refresh", "remote_seconds"): (0.5, 600.0),
+    ("refresh", "remote_timeout"): (1.0, 120.0),
+    ("refresh", "local_timeout"): (1.0, 120.0),
+    ("refresh", "cache_max_age"): (0.0, 86400.0),
+}
+# Exactly the colour values fzf accepts: -1 (terminal default), 0 to 255, #rrggbb, and the
+# names of the 16 base colours (gray and grey are aliases of bright-black). An unknown name
+# makes fzf exit before drawing anything, so it is refused here.
+# The herdr keys the jump types, in herdr's own syntax so they can be copied from its config:
+# the prefix (ctrl plus a letter) and the navigator's key after it (one plain key). They end
+# up inside an AppleScript string and Ghostty's text: action, so only these characters.
+PREFIX_KEY = re.compile(r"ctrl\+([a-z])")
+GOTO_KEY = re.compile(r"prefix\+([a-z0-9/?;,.=\[\]'`-])")
+# The text Ghostty is asked to type: the prefix as \xNN, the navigator key, and "/" (the key
+# that focuses the navigator's search, fixed in herdr).
+KEYS_TEXT = re.compile(r"\\x(0[1-9a-f]|1[0-9a])[a-z0-9/?;,.=\[\]'`-]/")
+
+
+def goto_keys(prefix, goto):
+    """The Ghostty text for these herdr keys, or None when either is not accepted."""
+    p = PREFIX_KEY.fullmatch(prefix or "")
+    g = GOTO_KEY.fullmatch(goto or "")
+    if not p or not g:
+        return None
+    return "\\x%02x%s/" % (ord(p.group(1)) - 96, g.group(1))
+
+
+COLOR_VALUE = re.compile(r"^(-1|#[0-9a-fA-F]{6}|25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]"
+                         r"|(bright-)?(black|red|green|yellow|blue|magenta|cyan|white)|gray|grey)$")
+# The extra fzf entries: comma-separated "name[:value[:attribute...]]". Only the shape is
+# checked here; the installed fzf checks the names before the popup opens (verify_colors).
+_FZF_ENTRY = r"[A-Za-z0-9+_-]+(:[A-Za-z0-9#+_-]+)*"
+FZF_COLOR_SPEC = re.compile(r"^(%s(,%s)*)?$" % (_FZF_ENTRY, _FZF_ENTRY))
+
+
+def config_path(env=None):
+    """$HERDR_PLUGIN_CONFIG_DIR/config.toml inside herdr; the XDG location outside it."""
+    env = os.environ if env is None else env
+    base = env.get("HERDR_PLUGIN_CONFIG_DIR")
+    if not base:
+        home = env.get("HOME") or os.path.expanduser("~")
+        base = os.path.join(env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), APP_DIR)
+    return os.path.join(base, "config.toml")
+
+
+def state_dir(env=None):
+    """Where the snapshot cache and the recency ledger live."""
+    env = os.environ if env is None else env
+    base = env.get("HERDR_PLUGIN_STATE_DIR")
+    if base:
+        return base
+    home = env.get("HOME") or os.path.expanduser("~")
+    return os.path.join(env.get("XDG_STATE_HOME") or os.path.join(home, ".local", "state"), APP_DIR)
+
+
+class ConfigError(ValueError):
+    pass
+
+
+_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+_TOKEN = re.compile(r"[^ \t#]+")
+# Control characters TOML forbids outside strings, comments included (tab is allowed).
+_TOML_CONTROL = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+_SPECIAL_FLOATS = {"inf": float("inf"), "+inf": float("inf"), "-inf": float("-inf"),
+                   "nan": float("nan"), "+nan": float("nan"), "-nan": float("nan")}
+_INT = re.compile(r"^[+-]?(0|[1-9](_?[0-9])*)$")
+_FLOAT = re.compile(r"^[+-]?(0|[1-9](_?[0-9])*)(\.[0-9](_?[0-9])*)?([eE][+-]?[0-9](_?[0-9])*)?$")
+_ESCAPES = {"b": "\b", "t": "\t", "n": "\n", "f": "\f", "r": "\r", '"': '"', "\\": "\\"}
+
+
+def _bad_char(c):
+    return (c < " " and c != "\t") or c == "\x7f"
+
+
+def _basic_string(s, pos, n):
+    out, i = [], pos + 1
+    while i < len(s):
+        c = s[i]
+        if c == '"':
+            return "".join(out), i + 1
+        if c == "\\":
+            e = s[i + 1:i + 2]
+            if e in _ESCAPES:
+                out.append(_ESCAPES[e])
+                i += 2
+                continue
+            if e in ("u", "U"):
+                width = 4 if e == "u" else 8
+                digits = s[i + 2:i + 2 + width]
+                if len(digits) != width or not re.match(r"^[0-9A-Fa-f]+$", digits):
+                    raise ConfigError(tr("toml_bad_escape", n))
+                cp = int(digits, 16)
+                if 0xD800 <= cp <= 0xDFFF or cp > 0x10FFFF:
+                    raise ConfigError(tr("toml_bad_escape", n))
+                out.append(chr(cp))
+                i += 2 + width
+                continue
+            raise ConfigError(tr("toml_bad_escape", n))
+        if _bad_char(c):
+            raise ConfigError(tr("toml_control", n))
+        out.append(c)
+        i += 1
+    raise ConfigError(tr("toml_unterminated", n))
+
+
+def _literal_string(s, pos, n):
+    end = s.find("'", pos + 1)
+    if end < 0:
+        raise ConfigError(tr("toml_unterminated", n))
+    value = s[pos + 1:end]
+    if any(_bad_char(c) for c in value):
+        raise ConfigError(tr("toml_control", n))
+    return value, end + 1
+
+
+def _key(s, pos, n):
+    if s[pos:pos + 1] == '"':
+        return _basic_string(s, pos, n)
+    if s[pos:pos + 1] == "'":
+        return _literal_string(s, pos, n)
+    m = _BARE_KEY.match(s, pos)
+    if not m:
+        raise ConfigError(tr("toml_expected_key", n))
+    return m.group(0), m.end()
+
+
+def _value(s, pos, n):
+    if s.startswith('"""', pos) or s.startswith("'''", pos):
+        raise ConfigError(tr("toml_multiline", n))
+    if s[pos] == '"':
+        return _basic_string(s, pos, n)
+    if s[pos] == "'":
+        return _literal_string(s, pos, n)
+    m = _TOKEN.match(s, pos)
+    token = m.group(0) if m else ""
+    if token == "true":
+        return True, m.end()
+    if token == "false":
+        return False, m.end()
+    if token in _SPECIAL_FLOATS:  # valid TOML; the range check rejects them later
+        return _SPECIAL_FLOATS[token], m.end()
+    if _INT.match(token):
+        return int(token.replace("_", "")), m.end()
+    if _FLOAT.match(token) and ("." in token or "e" in token or "E" in token):
+        return float(token.replace("_", "")), m.end()
+    raise ConfigError(tr("toml_unsupported", n, repr(token[:20])))
+
+
+def _skip(s, i):
+    while i < len(s) and s[i] in " \t":
+        i += 1
+    return i
+
+
+def _comment_only(s, i):
+    rest = s[i:].strip(" \t")
+    return not rest or rest.startswith("#")
+
+
+def parse_toml_subset(text):
+    """The flat TOML subset the config uses: [tables] (dotted names allowed), and keys
+    with string, integer, float or boolean values. Anything else is an error, as is a
+    duplicate key or table, so a file reads the same here and through tomllib.
+
+    Lines end only at \n (\r\n is accepted). str.splitlines() would also break at \v,
+    \f, U+2028 and others, which tomllib reads as part of a comment: a hidden line break
+    could then turn on an option that tomllib ignores. Whitespace is space and tab only."""
+    root, declared = {}, set()
+    table = root
+    lines = text.split("\n")
+    for n, line in enumerate(lines, 1):
+        # Only a \r that a \n follows ends a line; a stray one (say, at the end of the file)
+        # is a control character, as in tomllib.
+        if n < len(lines) and line.endswith("\r"):
+            line = line[:-1]
+        s = line.strip(" \t")
+        if not s:
+            continue
+        # Strings may hold \t only too; other control characters are an error anywhere.
+        if _TOML_CONTROL.search(s):
+            raise ConfigError(tr("toml_control_char", n))
+        if s.startswith("#"):
+            continue
+        if s.startswith("["):
+            if s.startswith("[["):
+                raise ConfigError(tr("toml_array_tables", n))
+            parts, i = [], 1
+            while True:
+                i = _skip(s, i)
+                key, i = _key(s, i, n)
+                parts.append(key)
+                i = _skip(s, i)
+                if s[i:i + 1] == ".":
+                    i += 1
+                    continue
+                if s[i:i + 1] == "]":
+                    i += 1
+                    break
+                raise ConfigError(tr("toml_bad_header", n))
+            if not _comment_only(s, i):
+                raise ConfigError(tr("toml_trailing", n))
+            if tuple(parts) in declared:
+                raise ConfigError(tr("toml_twice", n, ".".join(parts)))
+            declared.add(tuple(parts))
+            table = root
+            for p in parts:
+                nxt = table.setdefault(p, {})
+                if not isinstance(nxt, dict):
+                    raise ConfigError(tr("toml_not_table", n, p))
+                table = nxt
+            continue
+        key, i = _key(s, 0, n)
+        i = _skip(s, i)
+        if s[i:i + 1] != "=":
+            raise ConfigError(tr("toml_expected_eq", n))
+        i = _skip(s, i + 1)
+        if i >= len(s):
+            raise ConfigError(tr("toml_missing", n))
+        value, i = _value(s, i, n)
+        if not _comment_only(s, i):
+            raise ConfigError(tr("toml_trailing", n))
+        if key in table:
+            raise ConfigError(tr("toml_duplicate", n, key))
+        table[key] = value
+    return root
+
+
+def toml_loads(text, use_tomllib=None):
+    if use_tomllib is None:
+        use_tomllib = tomllib is not None
+    if use_tomllib:
+        return tomllib.loads(text)
+    return parse_toml_subset(text)
+
+
+def _check(default, value, where=None):
+    """The value converted to the default's type, or None when its type or range does not
+    fit. Numbers must be finite and inside NUMBER_RANGES[where]."""
+    if isinstance(default, bool):
+        return value if isinstance(value, bool) else None
+    if isinstance(default, (int, float)):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        try:
+            value = float(value)  # a huge integer overflows here
+        except OverflowError:
+            return None
+        low, high = NUMBER_RANGES.get(where, (0.0, float("inf")))
+        if not math.isfinite(value) or not low <= value <= high:
+            return None
+        return value
+    if isinstance(default, str):
+        return value if isinstance(value, str) else None
+    return None
+
+
+def merge_config(raw):
+    """DEFAULTS with the user's values on top, and the problems found on the way (in the
+    language the file asks for, when it asks for a valid one)."""
+    cfg, problems = copymod.deepcopy(DEFAULTS), []
+    lang = raw.get("lang") if isinstance(raw.get("lang"), str) and raw.get("lang") in STRINGS else None
+    for key, value in raw.items():
+        if key not in DEFAULTS:
+            problems.append(tr("cfg_unknown", key, lang=lang))
+            continue
+        default = DEFAULTS[key]
+        if isinstance(default, dict):
+            if not isinstance(value, dict):
+                problems.append(tr("cfg_not_table", key, lang=lang))
+                continue
+            for sub, v in value.items():
+                if sub not in default:
+                    problems.append(tr("cfg_unknown", key + "." + sub, lang=lang))
+                    continue
+                got = _check(default[sub], v, (key, sub))
+                if key == "colors" and got is not None and not (
+                        FZF_COLOR_SPEC.match(got) if sub == "fzf" else COLOR_VALUE.match(got)):
+                    got = None
+                if key == "jump" and got is not None and (
+                        sub == "prefix" and not PREFIX_KEY.fullmatch(got)
+                        or sub == "goto" and not GOTO_KEY.fullmatch(got)):
+                    got = None
+                if got is None:
+                    problems.append(tr("cfg_bad_value", key + "." + sub, lang=lang))
+                else:
+                    cfg[key][sub] = got
+            continue
+        got = _check(default, value)
+        if key == "lang" and got not in STRINGS:
+            got = None
+        if got is None:
+            problems.append(tr("cfg_bad_value", key, lang=lang))
+        else:
+            cfg[key] = got
+    return cfg, problems
+
+
+def load_config(path=None, use_tomllib=None):
+    """(config, warning). A missing file is the defaults with no warning; a broken one is
+    the defaults and one line saying why, never a crash."""
+    path = path or config_path()
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return copymod.deepcopy(DEFAULTS), None
+    except OSError as exc:
+        return copymod.deepcopy(DEFAULTS), tr("config_warning", path, exc.strerror or exc)
+    try:
+        raw = toml_loads(data.decode("utf-8"), use_tomllib)
+        cfg, problems = merge_config(raw)
+    except Exception as exc:  # whatever the file holds, it never stops the program
+        reason = (str(exc).splitlines() or [type(exc).__name__])[0]
+        return copymod.deepcopy(DEFAULTS), tr("config_warning", path, reason)
+    if not problems:
+        return cfg, None
+    return cfg, tr("config_warning", path, "; ".join(problems), lang=cfg["lang"])
+
+
+def _env_float(name, default):
+    try:
+        value = float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+    return value if math.isfinite(value) and value > 0 else default
+
+
+CONFIG = copymod.deepcopy(DEFAULTS)
+CONFIG_WARNING = None
+LOCAL_LABEL = ""
+LOCAL_EVERY = REMOTE_EVERY = REMOTE_TIMEOUT = 0.0
+LOCAL_TIMEOUT = 5.0  # seconds for a snapshot of this machine's herdr ([refresh] local_timeout)
+CACHE_MAX_AGE = 1800
+REMOTE_HERDR = DEFAULT_REMOTE_HERDR
+COLORS = dict(DEFAULTS["colors"])
+JUMP_ENABLED = False
+JUMP_CLIENT = ""
+JUMP_HELPER = ""
+JUMP_KEYS = "\\x02g/"
+STATE_DIR = state_dir()
+
+
+def configure(cfg, warning=None):
+    """Turn a loaded config into the module settings. SWITCHBOARD_* variables win over the
+    file (the tests use them)."""
+    global CONFIG, CONFIG_WARNING, LANG, LOCAL_LABEL, LOCAL_EVERY, REMOTE_EVERY, REMOTE_TIMEOUT
+    global CACHE_MAX_AGE, REMOTE_HERDR, COLORS, JUMP_ENABLED, JUMP_CLIENT, JUMP_HELPER, LOCAL_TIMEOUT, JUMP_KEYS
+    CONFIG, CONFIG_WARNING = cfg, warning
+    LANG = cfg["lang"]
+    LOCAL_LABEL = cfg["local_label"]
+    refresh = cfg["refresh"]
+    LOCAL_EVERY = _env_float("SWITCHBOARD_LOCAL_EVERY", refresh["local_seconds"])
+    REMOTE_EVERY = _env_float("SWITCHBOARD_REMOTE_EVERY", refresh["remote_seconds"])
+    REMOTE_TIMEOUT = _env_float("SWITCHBOARD_REMOTE_TIMEOUT", refresh["remote_timeout"])
+    LOCAL_TIMEOUT = _env_float("SWITCHBOARD_LOCAL_TIMEOUT", refresh["local_timeout"])
+    CACHE_MAX_AGE = refresh["cache_max_age"]
+    REMOTE_HERDR = os.environ.get("SWITCHBOARD_REMOTE_HERDR") or cfg["remote"]["herdr"]
+    COLORS = dict(cfg["colors"])
+    JUMP_ENABLED = cfg["jump"]["enabled"]
+    JUMP_CLIENT = cfg["jump"]["client"]
+    JUMP_HELPER = cfg["jump"]["helper"]
+    JUMP_KEYS = goto_keys(cfg["jump"]["prefix"], cfg["jump"]["goto"]) or goto_keys(
+        DEFAULTS["jump"]["prefix"], DEFAULTS["jump"]["goto"])
+
+
+try:
+    configure(*load_config())
+except Exception as _exc:  # the config must not stop modes that do not even need it
+    configure(copymod.deepcopy(DEFAULTS), tr("config_warning", config_path(), type(_exc).__name__))
+
+# --- rows -------------------------------------------------------------------------------
+
+# herdr's status_priority: higher goes first.
+PRIORITY = {"blocked": 4, "done": 3, "working": 2, "idle": 1, "unknown": 0}
+
+COLOR = not os.environ.get("NO_COLOR")
+
+
+def _c(code):
+    return "\x1b[%sm" % code if COLOR else ""
+
+
+OFF = _c("0")
+DIM = _c("2")
+GRAY = _c("90")
+# ANSI palette indexes, never hex: the terminal theme decides the actual colours.
+MARK = {
+    "blocked": (_c("31"), "●"),
+    "done": (_c("36"), "●"),
+    "working": (_c("33"), "●"),
+    "idle": (GRAY, "○"),
+    "unknown": (DIM, "·"),
+    "shell": (DIM, "›"),  # its own glyph: ctrl-t filters terminals with "^› "
+}
+
+SEP = "|"  # inside a row id; herdr ids use ':' and never '|'
+MACHINE_WIDTH = 12  # room for a name like "workstation"
+
+
+def pad(s, n):
+    return s[: n - 1] + "…" if len(s) >= n else s + " " * (n - len(s))
+
+
+def tilde(path, remote):
+    """A home directory becomes ~. For another machine any /home/x, /Users/x or /root."""
+    if not path:
+        return ""
+    if remote:
+        return re.sub(r"^(/home/[^/]+|/Users/[^/]+|/root)(?=/|$)", "~", path)
+    home = os.path.expanduser("~")
+    if path == home or path.startswith(home + "/"):
+        return "~" + path[len(home):]
+    return path
+
+
+def make_id(machine, kind, pane, tab):
+    return SEP.join((machine, kind, pane, tab))
+
+
+def parse_id(row_id):
+    """None when the row leads nowhere: the header, an offline machine, or an id that does
+    not look like herdr's."""
+    parts = row_id.split(SEP)
+    if len(parts) != 4:
+        return None
+    machine, kind, pane, tab = parts
+    if kind not in ("a", "t") or (machine and not safe_id(machine)) or not safe_id(pane) or not safe_id(tab):
+        return None
+    return {"machine": machine, "kind": kind, "pane": pane, "tab": tab}
+
+
+def entries_from(snap, machine=LOCAL, machine_label="", machine_index=0):
+    """The entries (dicts) of one `herdr api snapshot`.
+
+    A snapshot is untrusted input: any process in a pane sets its own title, and a remote
+    machine sends whatever it sends. Ids must look like herdr's (they reach herdr's argv and
+    the row id), text loses escape sequences and control characters (a newline in a title
+    would otherwise make a row of its own), and numbers must be numbers."""
+    if machine and not safe_id(machine):
+        return []
+
+    def items(key):
+        value = snap.get(key) if isinstance(snap, dict) else None
+        return [x for x in value if isinstance(x, dict)] if isinstance(value, list) else []
+
+    def index(key, field):
+        return {x[field]: x for x in items(key) if isinstance(x.get(field), str)}
+
+    wss = index("workspaces", "workspace_id")
+    tabs = index("tabs", "tab_id")
+    agents = index("agents", "pane_id")
+    panes = [p for p in items("panes") if safe_id(p.get("pane_id")) and safe_id(p.get("tab_id"))]
+    # A pane's number is its position inside its tab in snapshot order, as in the Goto.
+    by_tab = {}
+    for p in panes:
+        by_tab.setdefault(p["tab_id"], []).append(p["pane_id"])
+    machine_label = clean(machine_label)
+    out = []
+    for p in panes:
+        a = agents.get(p["pane_id"])
+        w = wss.get(p.get("workspace_id")) if isinstance(p.get("workspace_id"), str) else None
+        w = w or {}
+        t = tabs.get(p["tab_id"]) or {}
+        if a:
+            st = a.get("agent_status")
+            status = st if isinstance(st, str) and st in PRIORITY else "unknown"
+        else:
+            status = "shell"
+        src = a or p
+        siblings = by_tab.get(p["tab_id"], [])
+        tab_label = clean(t.get("label"))
+        completion = (a or {}).get("completion_seq")
+        out.append({
+            "machine": machine,
+            "machine_label": machine_label,
+            "machine_index": machine_index,
+            "kind": "a" if a else "t",
+            "pane": p["pane_id"],
+            "tab": p["tab_id"],
+            "status": status,          # what is shown: Recency.apply may raise it to done
+            "server_status": status,   # what the server says
+            "seq": _int((a or {}).get("state_change_seq")),
+            # The seq at which a piece of work finished, whether anyone saw it or not.
+            "completion": completion if _int(completion, None) is not None else None,
+            "ws_label": clean(w.get("label")) or clean(p.get("workspace_id")),
+            "ws_number": _int(w.get("number")),
+            # An unnamed tab is called "1", "2": that is its number, not a name.
+            "tab_name": tab_label if (t.get("custom_label") or not tab_label.isdigit()) else "",
+            "tab_auto": tab_label,
+            "tab_number": _int(t.get("number")),
+            # The pane's name: the one from `herdr pane rename`, or the agent's.
+            "pane_name": clean(p.get("label")) or clean((a or {}).get("name")),
+            "pane_label": clean(p.get("label")),
+            "pane_index": siblings.index(p["pane_id"]) + 1,
+            "tab_panes": len(siblings),
+            "title": clean((a or {}).get("title")) or clean(src.get("terminal_title_stripped")),
+            "agent": clean((a or {}).get("agent")),
+            "cwd": tilde(clean(src.get("cwd")), remote=bool(machine)),
+        })
+    return out
+
+
+def sort_key(e):
+    if e["kind"] == "t":  # terminals last, in tab-bar order
+        return (1, 0, e["machine_index"], e["ws_number"], e["tab_number"], e["pane"])
+    # Inside a status, the time the last change was seen (see Recency) decides, not the
+    # machine, so machines interleave. Without that (stamp 0): this machine first and,
+    # inside each machine, its state_change_seq.
+    return (0, -PRIORITY[e["status"]], -e.get("stamp", 0.0), e.get("rank", 0),
+            e["machine_index"], -e["seq"], e["pane"])
+
+
+SHELL_TITLE = re.compile(r"^\S+@\S+:")  # "user@host:~/dir" is set by the shell and says nothing
+
+
+def pane_column(e):
+    """As in the Goto: the pane's name, else the title its agent set. In a split tab the
+    pane's number goes first, to tell which one it is."""
+    name = e["pane_name"] or ("" if SHELL_TITLE.match(e["title"]) else e["title"])
+    if name.lower() == e["tab_name"].lower():
+        name = ""
+    if e["tab_panes"] > 1:
+        return "%d · %s" % (e["pane_index"], name) if name else str(e["pane_index"])
+    return name
+
+
+def format_row(e):
+    """status, machine > workspace > tab > pane, and the directory dimmed."""
+    color, glyph = MARK[e["status"]]
+    # Most agents are claude: the kind is shown only when it is something else.
+    kind = e["agent"] if e["agent"] not in ("", "claude") else ""
+    tail = "  ".join(x for x in (kind, e["cwd"]) if x)
+    # No fixed colours in the text: fzf paints the selected row, and a fixed colour there
+    # would not read on its background. Only the glyph carries the status colour; the word
+    # takes the row's colour, so it stays legible when selected. Dimmed text uses only the
+    # dim attribute.
+    cols = [
+        "%s%s%s %s" % (color, glyph, OFF, pad(tr("st_" + e["status"]), 8)),
+        pad(e["machine_label"], MACHINE_WIDTH),
+        pad(e["ws_label"], 15),
+        # An unnamed tab shows its number dimmed: it is the one on the tab bar.
+        pad(e["tab_name"], 26) if e["tab_name"] else "%s%s%s" % (DIM, pad(e["tab_auto"], 26), OFF),
+        pad(pane_column(e), 42),
+        "%s%s%s" % (DIM, tail, OFF),
+    ]
+    row_id = make_id(e["machine"], e["kind"], e["pane"], e["tab"])
+    return row_id + "\t" + " ".join(cols)
+
+
+def down_row(label):
+    return "-\t%s· %s %s %s%s" % (DIM, pad("", 8), pad(clean(label), MACHINE_WIDTH), tr("offline_row"), OFF)
+
+
+def header(entries, machines, pending, down, stale=()):
+    agents = [e for e in entries if e["kind"] == "a"]
+    counts = [(s, sum(1 for e in agents if e["status"] == s)) for s in ("blocked", "done", "working")]
+    parts = [tr("agents", len(agents))] + [tr("count", n, tr("st_" + s)) for s, n in counts if n]
+    if stale:
+        parts.append(", ".join(tr("stale", clean(label), age) for label, age in stale))
+    if pending:
+        parts.append(tr("loading", ", ".join(clean(x) for x in pending)))
+    if down:
+        parts.append(tr("offline_list", ", ".join(clean(x) for x in down)))
+    if CONFIG_WARNING:
+        parts.insert(0, clean(CONFIG_WARNING))
+    return "-\t%s%s   %s%s" % (GRAY, " · ".join(parts), tr("hint"), OFF)
+
+
+# --- herdr ------------------------------------------------------------------------------
+
+DEMO = None  # a Demo when running --demo: herdr calls are answered from the fixtures
+
+
+def herdr(args, timeout=None):
+    # stdin is /dev/null for EVERY child: the popup is a terminal, and a child that reads
+    # it (an ssh without -n, say) eats keystrokes. Half an arrow key (the ESC of ESC [ B)
+    # reaches fzf as Esc and closes it.
+    if DEMO is not None:
+        return DEMO.run(args)
+    r = subprocess.run([HERDR] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL, universal_newlines=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError("herdr %s: rc %d" % (" ".join(args), r.returncode))
+    return r.stdout
+
+
+_MACHINES = {}
+
+
+def machine_info(machine):
+    """The saved profile of that machine ({id, label, target, session}), or {}."""
+    if not _MACHINES:
+        for m in saved_machines():
+            _MACHINES[m["id"]] = m
+    return _MACHINES.get(machine, {})
+
+
+def herdr_on(machine, args, timeout=None, info=None, need_output=True):
+    """herdr on that machine ("" = this one).
+
+    For another machine, first an ssh that reuses an open connection (ControlMaster) and
+    runs herdr there: one round trip, against several for `herdr --machine`, which also
+    negotiates versions. If the ssh fails (no target, or the machine cannot be reached that
+    way), the usual `herdr --machine`."""
+    if DEMO is not None:
+        return DEMO.run((["--machine", machine] if machine else []) + args)
+    if not machine:
+        return herdr(args, timeout)
+    info = info or machine_info(machine)
+    target = info.get("target")
+    if target:
+        session = info.get("session") or "default"
+        remote = REMOTE_HERDR + ("" if session == "default" else " --session " + shlex.quote(session))
+        remote += " " + " ".join(shlex.quote(a) for a in args)
+        argv = ssh_argv(target, remote)
+        try:
+            if argv:
+                r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, universal_newlines=True, timeout=timeout)
+                if r.returncode == 0 and (r.stdout.strip() or not need_output):
+                    return r.stdout
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return herdr(["--machine", machine] + args, timeout)
+
+
+def snapshot(machine=LOCAL, timeout=None, info=None):
+    """The snapshot object of `herdr api snapshot` on that machine. Anything that is not an
+    object holding a snapshot object raises ValueError, which every caller treats as a
+    failed read. It never waits forever: by default the local timeout here and the remote
+    one for another machine, so a hung herdr cannot freeze the popup or its refresh loop."""
+    if timeout is None:
+        timeout = REMOTE_TIMEOUT if machine else LOCAL_TIMEOUT
+    data = json.loads(herdr_on(machine, ["api", "snapshot"], timeout, info))
+    result = data.get("result") if isinstance(data, dict) else None
+    snap = result.get("snapshot") if isinstance(result, dict) else None
+    if not isinstance(snap, dict):
+        raise ValueError("herdr api snapshot: not a snapshot")
+    return snap
+
+
+def focused_tab(snap):
+    """The focused tab of a snapshot, when it is a string; else None."""
+    tab = snap.get("focused_tab_id") if isinstance(snap, dict) else None
+    return tab if isinstance(tab, str) else None
+
+
+def saved_machines():
+    """The enabled saved machines, with ids herdr would produce and labels made plain."""
+    try:
+        ms = json.loads(herdr(["machine", "list", "--json"], 3))
+    except Exception:
+        return []
+    return [dict(m, label=clean(m.get("label")) or m["id"]) for m in (ms if isinstance(ms, list) else [])
+            if isinstance(m, dict) and m.get("enabled") and safe_id(m.get("id"))]
+
+
+def _safe_name(machine):
+    return re.sub(r"[^\w.-]", "_", machine) or "_"
+
+
+def save_cache(machine, snap, now=None):
+    """The last snapshot seen of a machine, to show it the moment the popup opens."""
+    try:
+        d = os.path.join(STATE_DIR, "snapshots")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, _safe_name(machine) + ".json")
+        with open(path + ".tmp", "w") as f:
+            json.dump({"t": now or time.time(), "snapshot": snap}, f)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
+def load_cache(machine, now=None):
+    """(snapshot, age in seconds), or None when there is none or it is too old to trust."""
+    path = os.path.join(STATE_DIR, "snapshots", _safe_name(machine) + ".json")
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        age = (now or time.time()) - float(d["t"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return (d["snapshot"], age) if 0 <= age <= CACHE_MAX_AGE else None
+
+
+def fmt_age(seconds):
+    return tr("age_s", seconds) if seconds < 60 else tr("age_min", seconds // 60)
+
+
+class Recency:
+    """Which agent changed last, across machines: what orders the rows inside a status.
+
+    state_change_seq is a per-server counter, so one machine's value cannot be compared
+    with another's. herdr's own client keeps a counter of its own: whenever it sees an
+    agent's seq change, on any machine, that agent becomes the most recent. This does the
+    same, with two differences that come from the popup living seconds instead of hours:
+
+    - It is kept on disk (recency.json in the state directory), with the time each change
+      was seen.
+    - Everything that changed while the popup was closed is seen at once on open, and the
+      API gives no timestamps to tell which happened first on which machine. Those changes
+      get the opening time and, at equal time, interleave: the most recent of each machine,
+      then the second of each. While the popup is open the order is the real one, within
+      the refresh interval.
+
+    It also decides what is `done`, meaning finished and not seen yet. The server's own
+    status is not enough: it marks as seen whatever finishes in its active tab while a
+    window is focused, and its active tab is the last one opened ON THAT MACHINE, even
+    while you are looking at another. The native panel keeps its own per-window count,
+    which no API exposes, so this keeps one with what the popup can know. A finished piece
+    of work (completion_seq equal to state_change_seq) counts as seen when:
+
+    - the popup opens on its tab (the focused tab of the popup's machine);
+    - you pick it with Enter (ack_tab);
+    - the server had it done and turned it idle: you went there some other way;
+    - it finished outside the active tab of its machine and is already idle: the same,
+      except the popup never saw it done.
+
+    Otherwise it stays done: that is what finished in the tab left open on one machine while
+    you were on another. The first time a machine is seen everything counts as seen.
+    """
+
+    def __init__(self, persist=True, now=None):
+        self.path = os.path.join(STATE_DIR, "recency.json") if persist else None
+        self.opened = now or time.time()
+        # machine -> {pane: [seq, time seen, rank, seen up to seq, seq the server said done]}
+        self.seen = {}
+        self.focus = {}      # machine -> its focused tab at the last read
+        self.fresh = set()   # machines already read since this popup opened
+        self.lock = threading.Lock()
+        if self.path:
+            try:
+                with open(self.path) as f:
+                    d = json.load(f)
+                # An entry from before the seen-count existed (3 fields) counts as seen:
+                # otherwise everything finished would turn done at once.
+                self.seen = {str(m): {str(p): [int(v[0]), float(v[1]), int(v[2]),
+                                               int(v[3]) if len(v) > 3 else int(v[0]),
+                                               int(v[4]) if len(v) > 4 else -1]
+                                      for p, v in panes.items()}
+                             for m, panes in d["machines"].items()}
+                self.focus = {str(m): str(tab) for m, tab in (d.get("focus") or {}).items()}
+            except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError):
+                self.seen, self.focus = {}, {}
+
+    @staticmethod
+    def completed(e):
+        """The current idle closed a piece of work, whether anyone saw it or not."""
+        return (e.get("server_status", e["status"]) in ("idle", "done")
+                and e.get("completion") is not None and e["completion"] == e["seq"])
+
+    def apply(self, entries):
+        """Give each agent its recorded time and rank (0 when none), and raise it to done
+        when it finished a piece of work you have not seen yet."""
+        for e in entries:
+            if e["kind"] == "a":
+                known = self.seen.get(e["machine"], {}).get(e["pane"])
+                e["stamp"], e["rank"] = (known[1], known[2]) if known else (0.0, 0)
+                raw = e.get("server_status", e["status"])
+                unseen = bool(known) and known[0] == e["seq"] and known[3] < e["seq"]
+                e["status"] = "done" if raw == "idle" and unseen and self.completed(e) else raw
+        return entries
+
+    def observe(self, machine, entries, now=None, focus=None, here=False):
+        """Record a FRESH snapshot of that machine (never one from the cache). True when
+        something changed.
+
+        focus: the focused tab of that snapshot. here: it is the machine the popup runs on,
+        so that tab is the one in front of you."""
+        with self.lock:
+            # The first read of each machine brings everything that happened while closed.
+            stamp = (now or time.time()) if machine in self.fresh else self.opened
+            self.fresh.add(machine)
+            baseline = machine not in self.seen
+            known = self.seen.setdefault(machine, {})
+            before = json.dumps([known, self.focus.get(machine)], sort_keys=True)
+            last_focus = self.focus.get(machine)
+            agents = [e for e in entries if e["kind"] == "a"]
+            changed = []
+            for e in agents:
+                k = known.get(e["pane"])
+                seq, raw = e["seq"], e.get("server_status", e["status"])
+                moved = k is None or k[0] != seq
+                ack = seq if baseline else (k[3] if k else -1)
+                sdone = k[4] if k and not moved else -1
+                if raw == "done":
+                    sdone = seq
+                if here and focus and e["tab"] == focus:
+                    ack = seq  # it is in front of you
+                elif raw == "idle" and ack < seq and self.completed(e):
+                    if sdone == seq:
+                        ack = seq  # the server had it done and turned it idle: you went there
+                    elif moved and e["tab"] not in (focus, last_focus):
+                        ack = seq  # finished outside the active tab and already idle
+                    # Otherwise it finished in the tab left open on that machine; the server
+                    # counts it as seen by itself, so it stays done until you go there.
+                if moved:
+                    changed.append(e)
+                    known[e["pane"]] = [seq, stamp, 0, ack, sdone]
+                else:
+                    k[3], k[4] = ack, sdone
+            for rank, e in enumerate(sorted(changed, key=lambda e: -e["seq"])):
+                known[e["pane"]][2] = rank
+            alive = set(e["pane"] for e in agents)
+            for p in [p for p in known if p not in alive]:
+                del known[p]
+            if focus:
+                self.focus[machine] = focus
+            self.apply(entries)
+            dirty = before != json.dumps([known, self.focus.get(machine)], sort_keys=True)
+            if dirty:
+                self._save()
+        return dirty
+
+    def ack_tab(self, machine, tab, entries):
+        """A row of that tab was picked: whatever finished there counts as seen."""
+        with self.lock:
+            known = self.seen.get(machine, {})
+            dirty = False
+            for e in entries:
+                if e["kind"] == "a" and e["machine"] == machine and e["tab"] == tab:
+                    k = known.get(e["pane"])
+                    if k and k[3] < k[0]:
+                        k[3] = k[0]
+                        dirty = True
+            if dirty:
+                self._save()
+        return dirty
+
+    def _save(self):
+        if not self.path:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path + ".tmp", "w") as f:
+                json.dump({"v": 2, "machines": self.seen, "focus": self.focus}, f)
+            os.replace(self.path + ".tmp", self.path)
+        except OSError:
+            pass
+
+
+def local_label():
+    return os.environ.get("SWITCHBOARD_LABEL") or (DEMO.local if DEMO is not None else "") \
+        or LOCAL_LABEL or socket.gethostname().split(".")[0]
+
+
+def collect(with_remote):
+    """(entries, remote machines, offline ones). Remote machines are read in parallel."""
+    machines = saved_machines() if with_remote else []
+    recency = Recency()
+    snap = snapshot()
+    entries = entries_from(snap, LOCAL, local_label(), 0)
+    recency.observe(LOCAL, entries, focus=focused_tab(snap), here=True)
+    results, focus, down = {}, {}, []
+
+    def fetch(i, m):
+        try:
+            s = snapshot(m["id"], REMOTE_TIMEOUT, m)
+            results[i], focus[i] = entries_from(s, m["id"], m["label"], i + 1), focused_tab(s)
+        except Exception:
+            results[i] = None
+
+    threads = [threading.Thread(target=fetch, args=(i, m)) for i, m in enumerate(machines)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for i, m in enumerate(machines):
+        if results.get(i) is None:
+            down.append(m["label"])
+        else:
+            recency.observe(m["id"], results[i], focus=focus.get(i))
+            entries += results[i]
+    return entries, machines, down
+
+
+def render(entries, machines, pending=(), down=(), stale=()):
+    lines = [header(entries, machines, list(pending), list(down), list(stale))]
+    lines += [format_row(e) for e in sorted(entries, key=sort_key)]
+    lines += [down_row(label) for label in down]
+    return "\n".join(lines) + "\n"
+
+
+# --- live -------------------------------------------------------------------------------
+
+class Live:
+    """What the popup shows, kept current while it is open.
+
+    This machine is read every LOCAL_EVERY seconds (a snapshot is cheap) and each saved
+    machine every REMOTE_EVERY seconds, each in its own thread so a slow one does not hold
+    up the others. A remote machine that stops answering keeps its last rows: the popup is
+    short-lived, and a row that disappears and comes back is worse than an old one.
+    """
+
+    def __init__(self, machines, local_entries, fetch=None, cache=True, recency=None, focus=None):
+        self.machines = machines
+        self.recency = recency or Recency(persist=cache)
+        # focus: this machine's focused tab when the popup opened, the one in front of you.
+        self.recency.observe(LOCAL, local_entries, focus=focus, here=True)
+        self.local = local_entries
+        self.remote = {}  # id -> entries, or None when it never answered
+        self.stale = {}   # id -> "40 s": what is shown comes from the cache, that old
+        self.fetch = fetch or snapshot
+        self.cache = cache
+        self.lock = threading.Lock()
+        self.last = None
+        # The last thing seen, right away; fresh reads replace it as they arrive. Its age is
+        # fixed here and never recomputed: text that changed every second would make fzf
+        # reload every second.
+        for i, m in enumerate(machines if cache else []):
+            cached = load_cache(m["id"])
+            if cached:
+                try:
+                    # From the cache: it carries the recorded order but is not a read.
+                    self.remote[m["id"]] = self.recency.apply(
+                        entries_from(cached[0], m["id"], m["label"], i + 1))
+                    self.stale[m["id"]] = fmt_age(cached[1])
+                except Exception:
+                    pass
+
+    def refresh_local(self):
+        try:
+            snap = self.fetch()
+            if not isinstance(snap, dict):
+                raise ValueError("not a snapshot")
+            entries = entries_from(snap, LOCAL, local_label(), 0)
+        except Exception:
+            return  # keep the rows of the last good read
+        self.recency.observe(LOCAL, entries, focus=focused_tab(snap), here=True)
+        with self.lock:
+            self.local = entries
+
+    def refresh_remote(self, i, m):
+        try:
+            snap = self.fetch(m["id"], REMOTE_TIMEOUT, m)
+            if not isinstance(snap, dict):
+                raise ValueError("not a snapshot")
+            entries = entries_from(snap, m["id"], m["label"], i + 1)
+        except Exception:  # a malformed answer counts as no answer
+            snap = entries = None
+        if snap is not None and self.cache:
+            save_cache(m["id"], snap)
+        if entries is not None:
+            self.recency.observe(m["id"], entries, focus=focused_tab(snap))
+        with self.lock:
+            if entries is not None:
+                self.remote[m["id"]] = entries
+                self.stale.pop(m["id"], None)
+            elif self.remote.get(m["id"]) is None:
+                self.remote[m["id"]] = None
+
+    def entries(self):
+        with self.lock:
+            return list(self.local) + [e for v in self.remote.values() if v for e in v]
+
+    def ack(self, machine, tab):
+        """A row of that tab was picked somewhere else (the Enter of a remote row): what
+        finished there counts as seen, and the rows show it at once."""
+        entries = self.entries()
+        dirty = self.recency.ack_tab(machine, tab, entries)
+        with self.lock:
+            self.recency.apply(list(self.local) + [e for v in self.remote.values() if v for e in v])
+        return dirty
+
+    def consume_acks(self, path):
+        """Apply the tabs `--enter` wrote to `path`.
+
+        The file is first renamed to a private name and only then read: an `--enter` that
+        appends while this runs writes to a new `path`, which the next call picks up.
+        Reading first and removing after would drop that line. Everything goes through a
+        descriptor of the (private) directory and never follows a symlink."""
+        dir_fd = open_private_dir(os.path.dirname(path) or ".")
+        if dir_fd is None:
+            return False
+        name = os.path.basename(path)
+        private = "%s.%d.%d" % (name, os.getpid(), threading.get_ident())
+        try:
+            try:
+                os.replace(name, private, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            except OSError:
+                return False
+            lines = (read_small(dir_fd, private, 1 << 20) or "").splitlines()
+            try:
+                os.remove(private, dir_fd=dir_fd)
+            except OSError:
+                pass
+        finally:
+            os.close(dir_fd)
+        dirty = False
+        for line in lines:
+            try:
+                machine, tab = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            dirty = self.ack(str(machine), str(tab)) or dirty
+        return dirty
+
+    def text(self):
+        with self.lock:
+            entries, pending, down, stale = list(self.local), [], [], []
+            for m in self.machines:
+                if m["id"] not in self.remote:
+                    pending.append(m["label"])
+                elif self.remote[m["id"]] is None:
+                    down.append(m["label"])
+                else:
+                    entries += self.remote[m["id"]]
+                    if m["id"] in self.stale:
+                        stale.append((m["label"], self.stale[m["id"]]))
+        return render(entries, self.machines, pending, down, stale)
+
+    def changed(self):
+        """The new text when it changed since the last call, or None."""
+        t = self.text()
+        if t == self.last:
+            return None
+        self.last = t
+        return t
+
+
+def fzf_request(sock, method, body=b""):
+    """One HTTP request to fzf's --listen (a unix socket: no port, no key).
+
+    The response body, or None when fzf does not answer. fzf rejects a GET that carries a
+    Content-Length, even 0, with "invalid content length".
+    """
+    head = "%s %s HTTP/1.1\r\nHost: fzf\r\n" % (method, "/?limit=0" if method == "GET" else "/")
+    if method == "POST":
+        head += "Content-Length: %d\r\n" % len(body)
+    s = socket.socket(socket.AF_UNIX)
+    s.settimeout(2)
+    try:
+        s.connect(sock)
+        s.sendall((head + "\r\n").encode() + body)
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        hdr, _, rest = data.partition(b"\r\n\r\n")
+        m = re.search(rb"(?i)content-length:\s*(\d+)", hdr)
+        while m and len(rest) < int(m.group(1)):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            rest += chunk
+        return rest
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def fzf_position(sock):
+    """The cursor's row (0 = the first), or None when it cannot be known."""
+    body = fzf_request(sock, "GET")
+    try:
+        return int(json.loads(body)["position"])
+    except Exception:
+        return None
+
+
+def reload_action(rows_file, position):
+    """With the cursor on the first row, keep it there: the most urgent row goes there.
+    Further down, `track-current` keeps it on the same agent even when that agent moves."""
+    action = "reload-sync(cat %s)+refresh-preview" % shlex.quote(rows_file)
+    return action if not position else "track-current+" + action
+
+
+def watch(live, sock, rows_file, stop, acks=None):
+    """Until the popup closes: whenever something changed, have fzf reload `rows_file`.
+
+    Without `track-current` the cursor stays at the same position and lands on another
+    agent (see reload_action). The reload reads a file already written: while tracking,
+    fzf blocks input until the load finishes, and asking a remote machine takes long.
+    """
+    # When a machine answers, reload at once instead of on the next local tick.
+    kick = threading.Event()
+
+    # No pass of either loop may end its thread: a dead thread would freeze the list
+    # without a word, so whatever one pass hits, the next one runs. That includes the rows
+    # file vanishing while the popup closes and removes its directory.
+    def remote_loop(i, m):
+        while not stop.is_set():
+            try:
+                live.refresh_remote(i, m)
+            except Exception:
+                pass
+            kick.set()
+            stop.wait(REMOTE_EVERY)
+
+    # The rows file is written through a descriptor of its (private) directory, never through
+    # a symlink, so a pass that outlives the directory cannot write anywhere else.
+    rows_dir = open_private_dir(os.path.dirname(rows_file) or ".")
+    rows_name = os.path.basename(rows_file)
+
+    def local_pass():
+        live.refresh_local()
+        if acks:
+            live.consume_acks(acks)
+        text = live.changed()
+        if text is None or rows_dir is None:
+            return
+        fd = os.open(rows_name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
+                     dir_fd=rows_dir)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(rows_name + ".tmp", rows_name, src_dir_fd=rows_dir, dst_dir_fd=rows_dir)
+        fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
+
+    def nap():
+        """Until the next local pass is due, a machine answers, or stop is set. stop is
+        looked at every fifth of a second, so closing never waits out a long interval."""
+        due = time.time() + LOCAL_EVERY
+        while not stop.is_set():
+            left = due - time.time()
+            if left <= 0 or kick.wait(min(left, 0.2)):
+                break
+        kick.clear()
+
+    for i, m in enumerate(live.machines):
+        threading.Thread(target=remote_loop, args=(i, m), daemon=True).start()
+    try:
+        while not stop.is_set():
+            nap()
+            if stop.is_set():
+                break
+            try:
+                local_pass()
+            except Exception:
+                continue
+    finally:
+        if rows_dir is not None:
+            os.close(rows_dir)
+
+
+# --- actions ----------------------------------------------------------------------------
+
+def action_for(row_id, labels):
+    """The herdr argv that picking the row means, or None."""
+    target = parse_id(row_id)
+    if target is None:
+        return None
+    # On another machine: focus it there. The popup cannot choose which machine the window
+    # shows (that belongs to the client and has no API), but a focus through the API moves
+    # EVERY window attached to that server, so switching to that machine lands on the agent.
+    prefix = ["--machine", target["machine"]] if target["machine"] else []
+    if target["kind"] == "a":
+        return prefix + ["agent", "focus", target["pane"]]
+    return prefix + ["tab", "focus", target["tab"]]
+
+
+FZF_DELIMITERS = ("()", "[]", "{}", "<>", "~~", "!!", "@@", "##", "$$", "%%", "^^", "&&", "**", ";;", "//", "||")
+
+
+def fzf_action(name, arg):
+    """fzf's `name(arg)`, with the first delimiter pair that does not occur in arg (fzf ends
+    the argument at the first closing delimiter). None when every pair occurs."""
+    for d in FZF_DELIMITERS:
+        if d[0] not in arg and d[1] not in arg:
+            return "%s%s%s%s" % (name, d[0], arg, d[1])
+    return None
+
+
+def machine_labels():
+    """{machine id: label}, handed down by the popup so its helpers need not ask herdr."""
+    try:
+        labels = json.loads(os.environ.get("SWITCHBOARD_LABELS") or "{}")
+    except ValueError:
+        return {}
+    return {str(k): clean(v) for k, v in labels.items()} if isinstance(labels, dict) else {}
+
+
+RESULT_NAME = re.compile(r"focus-[0-9]+-[0-9]+")
+
+
+def record_ack(target, dir_fd):
+    """Tell the popup that this row's tab was picked: one line appended to its acks file."""
+    if dir_fd is not None:
+        append_line(dir_fd, "acks", json.dumps([target["machine"], target["tab"]]))
+
+
+def enter(row_id, run_dir=None):
+    """fzf's Enter when the cross-machine jump is off (`--enter`, through transform).
+
+    A row of this machine is accepted as usual. For a row of another machine, everything
+    that must survive an Esc happens here, before fzf handles another key: the tab is
+    recorded as seen, and a worker that does the focus is started in its own session, so
+    neither fzf exiting nor the popup closing can stop it. Then it prints fzf actions at
+    once: a footer saying the pane is being focused, and a background transform
+    (`--focus-wait`) that shows the worker's result when it arrives.
+
+    The worker outlives the popup on purpose, so it never gets the run directory's name:
+    it inherits a descriptor of that directory, opened and checked here while the popup
+    still owns it, and its argv holds only the bare name of its result file. If the popup
+    has removed the directory by the time the worker finishes, there is nowhere to write
+    and nothing is written; the focus has happened all the same."""
+    target = parse_id(row_id)
+    if target is None:
+        return 0
+    if not target["machine"] or JUMP_ENABLED:
+        sys.stdout.write("accept\n")
+        return 0
+    run_fd = open_private_dir(run_dir or os.environ.get("SWITCHBOARD_RUN_DIR"))
+    try:
+        record_ack(target, run_fd)
+        name = "focus-%d-%d" % (os.getpid(), int(time.time() * 1000)) if run_fd is not None else ""
+        env = {k: v for k, v in os.environ.items() if k not in ("SWITCHBOARD_RUN_DIR", "SWITCHBOARD_RUN_FD")}
+        if run_fd is not None:
+            env["SWITCHBOARD_RUN_FD"] = str(run_fd)
+        me = [sys.executable, os.path.abspath(__file__)]
+        try:
+            subprocess.Popen(me + ["--focus", row_id] + ([name] if name else []), stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                             pass_fds=(run_fd,) if run_fd is not None else (), env=env)
+        except OSError:
+            pass
+    finally:
+        if run_fd is not None:
+            os.close(run_fd)
+    label = machine_labels().get(target["machine"]) or target["machine"]
+    actions = [fzf_action("change-footer", tr("remote_focusing", label))]
+    if name:
+        self_cmd = " ".join(shlex.quote(x) for x in me)
+        actions.append(fzf_action("bg-transform-footer", "%s --focus-wait %s %s"
+                                  % (self_cmd, name, shlex.quote(row_id))))
+    sys.stdout.write("+".join(a for a in actions if a) + "\n")
+    return 0
+
+
+def focus_remote(row_id, name=None):
+    """`--focus ROW [NAME]`, the detached worker: focus the row's pane (or tab) on its
+    machine through herdr's API. With NAME, the footer text that says how it went goes to
+    that file inside the directory inherited as SWITCHBOARD_RUN_FD (checked again: ours, 0700),
+    created new and never through a symlink; without it, to stdout."""
+    target = parse_id(row_id)
+    if target is None or not target["machine"]:
+        return 0
+    args = ["agent", "focus", target["pane"]] if target["kind"] == "a" else ["tab", "focus", target["tab"]]
+    try:
+        herdr_on(target["machine"], args, REMOTE_TIMEOUT, need_output=False)
+        ok = True
+    except Exception:
+        ok = False
+    label = machine_labels().get(target["machine"]) or target["machine"]
+    text = tr("remote_ready" if ok else "remote_failed", label) + "\n"
+    if not name:
+        try:
+            sys.stdout.write(text)
+            sys.stdout.flush()
+        except OSError:
+            pass
+        return 0
+    try:
+        dir_fd = int(os.environ.get("SWITCHBOARD_RUN_FD", ""))
+    except ValueError:
+        return 0
+    if RESULT_NAME.fullmatch(name) and private_fd(dir_fd):
+        write_new(dir_fd, name, text)
+    return 0
+
+
+def focus_wait(name, row_id):
+    """`--focus-wait NAME ROW`, fzf's background transform: wait for the worker's result file
+    NAME in the popup's run directory and print it as the new footer. The directory is opened
+    once, at the start, while the popup owns it, and only a regular file is read, never
+    through a symlink. It gives up a little after the longest the worker can take: herdr_on
+    may spend the remote timeout on ssh and then the same again on `herdr --machine`."""
+    target = parse_id(row_id)
+    label = (machine_labels().get(target["machine"]) or target["machine"]) if target else ""
+    dir_fd = open_private_dir(os.environ.get("SWITCHBOARD_RUN_DIR")) if RESULT_NAME.fullmatch(name) else None
+    deadline = time.time() + 2 * REMOTE_TIMEOUT + 3
+    try:
+        while dir_fd is not None and time.time() < deadline:
+            text = clean((read_small(dir_fd, name) or "").strip())
+            if text:
+                sys.stdout.write(text + "\n")
+                return 0
+            time.sleep(0.05)
+    finally:
+        if dir_fd is not None:
+            os.close(dir_fd)
+    sys.stdout.write(tr("remote_failed", label) + "\n")
+    return 0
+
+
+ANSI = re.compile(r"\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+PROMPTS = ("❯", "›", ">")
+
+
+def _is_rule(plain):
+    s = plain.strip()
+    n = s.count("─")
+    # The top rule of an input box may carry the session name.
+    return n >= 10 and n >= 0.6 * len(s.replace(" ", ""))
+
+
+def trim_footer(text, lookback=14):
+    """Remove the agent's input box and status bar from the bottom of a pane.
+
+    The box is a rule, the prompt line (❯) and another rule; below it come the status and
+    mode lines. The cut starts at the top rule of the LAST such box within the last
+    `lookback` lines. Without that pattern nothing is touched: a table or a separator in
+    the text has no prompt between two rules.
+    """
+    lines = text.split("\n")
+    plain = [ANSI.sub("", l) for l in lines]
+    start = max(0, len(lines) - lookback)
+    rules = [i for i in range(start, len(lines)) if _is_rule(plain[i])]
+    cut = None
+    for a, b in reversed(list(zip(rules, rules[1:]))):
+        if b - a > 1 and all(plain[k].lstrip().startswith(PROMPTS) or not plain[k].strip()
+                             for k in range(a + 1, b)) \
+                and any(plain[k].strip() for k in range(a + 1, b)):
+            cut = a
+            break
+    if cut is None:
+        return text
+    kept = lines[:cut]
+    # And what hangs above it: blank lines and right-aligned hints.
+    while kept:
+        s = ANSI.sub("", kept[-1])
+        if s.strip() and len(s) - len(s.lstrip()) < 40:
+            break
+        kept.pop()
+    return "\n".join(kept) + "\x1b[0m\n"
+
+
+def preview(row_id):
+    target = parse_id(row_id)
+    if target is None:
+        return 0
+    lines = os.environ.get("FZF_PREVIEW_LINES", "40")
+    args = ["pane", "read", target["pane"], "--source", "recent", "--lines",
+            str(int(lines) * 2), "--format", "ansi"]
+    try:
+        text = herdr_on(target["machine"], args, REMOTE_TIMEOUT if target["machine"] else 5)
+        sys.stdout.write(clean_screen(trim_footer(text)))
+    except Exception as exc:
+        sys.stdout.write(tr("read_failed", clean(str(exc))) + "\n")
+    return 0
+
+
+# With terminals already filtered, back to everything; otherwise filter. No braces: fzf
+# could take them for one of its placeholders ({q}, {1}).
+TOGGLE_TERMINALS = 'case "$FZF_QUERY" in "^› "*) ;; *) printf %s "^› " ;; esac'
+
+
+TOOL_LINE = re.compile(r"^[●⏺] [A-Za-z][\w.:-]*\(")   # "● Bash(…)", "● Read(…)": a tool call
+STATUS_LINE = ("✻", "✶", "✳", "✢", "※", "❯", "●", "⏺")
+
+
+def last_reply_from_transcript(path, tail_bytes=4 << 20):
+    """The last text reply of a Claude Code session, as it was written.
+
+    Each block is an `assistant` entry; the blocks of one message share message.id and are
+    joined. A subagent's blocks (isSidechain) do not count.
+    """
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - tail_bytes))
+            # Starting mid-line leaves a piece that is not JSON; it is skipped.
+            raw = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    entries = []
+    for line in raw:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if d.get("type") == "assistant" and not d.get("isSidechain"):
+            msg = d.get("message") or {}
+            texts = [c.get("text", "") for c in msg.get("content") or [] if c.get("type") == "text"]
+            if texts:
+                entries.append((msg.get("id"), "\n\n".join(texts)))
+    if not entries:
+        return None
+    last_id = entries[-1][0]
+    parts = [t for i, t in entries if i == last_id] if last_id else [entries[-1][1]]
+    return "\n\n".join(parts).strip() or None
+
+
+def last_reply_from_screen(text):
+    """The same, read from the screen: the last "● …" block that is not a tool call, up
+    to the next status line. It keeps the line breaks the agent made at its pane width."""
+    lines = [ANSI.sub("", l).rstrip() for l in text.split("\n")]
+    start = next((i for i in range(len(lines) - 1, -1, -1)
+                  if lines[i].startswith(("● ", "⏺ ")) and not TOOL_LINE.match(lines[i])), None)
+    if start is None:
+        return None
+    out = [lines[start][2:]]
+    for l in lines[start + 1:]:
+        if l.startswith(STATUS_LINE):
+            break
+        out.append(l[2:] if l.startswith("  ") else l)
+    return "\n".join(out).strip() or None
+
+
+def transcript_path(session_id):
+    """The Claude Code transcript of a session id, in any config directory under home."""
+    if not re.match(r"^[0-9a-fA-F-]{8,}$", session_id or ""):
+        return None
+    found = glob.glob(os.path.expanduser("~/.*/projects/*/%s.jsonl" % session_id))
+    return max(found, key=os.path.getmtime) if found else None
+
+
+def osc52(text):
+    payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return "\x1b]52;c;%s\x07" % payload
+
+
+def copy(row_id, tty=None):
+    """Put the agent's last reply on the clipboard and say what was copied.
+
+    The clipboard is the one of the machine running the herdr window: the popup writes
+    OSC 52 to its terminal and herdr forwards it to the client. In order: the Claude Code
+    transcript when the session is on this machine; else the last block on the screen;
+    else what is visible.
+    """
+    target = parse_id(row_id)
+    if target is None:
+        return 0
+    text, what = None, ""
+    if not target["machine"] and target["kind"] == "a":
+        try:
+            snap = snapshot()
+            agent = next((a for a in snap.get("agents", []) if a["pane_id"] == target["pane"]), {})
+            path = transcript_path((agent.get("agent_session") or {}).get("value"))
+            text = last_reply_from_transcript(path) if path else None
+            what = tr("what_reply")
+        except Exception:
+            text = None
+    if not text:
+        args = ["pane", "read", target["pane"], "--source", "recent", "--lines", "400", "--format", "text"]
+        try:
+            screen = trim_footer(herdr_on(target["machine"], args, REMOTE_TIMEOUT if target["machine"] else 5))
+        except Exception as exc:
+            print(tr("read_failed", clean(str(exc))))
+            return 0
+        text = last_reply_from_screen(screen) if target["kind"] == "a" else None
+        what = tr("what_reply_screen")
+        if not text:
+            text = "\n".join(l.rstrip() for l in ANSI.sub("", screen).split("\n")).strip()
+            lines = int(os.environ.get("FZF_PREVIEW_LINES") or 60)
+            text = "\n".join(text.split("\n")[-lines:]).strip()
+            what = tr("what_visible")
+    if not text:
+        print(tr("nothing_to_copy"))
+        return 0
+    text = text[:100000]
+    tty = tty or os.environ.get("SWITCHBOARD_TTY") or "/dev/tty"
+    try:
+        with open(tty, "w") as t:
+            t.write(osc52(text))
+    except OSError as exc:
+        print(tr("copy_failed", clean(str(exc))))
+        return 0
+    print(tr("copied", what, len(text)))
+    return 0
+
+
+def fzf_colors(colors=None):
+    """fzf's --color value. The defaults are ANSI palette names (see DEFAULTS)."""
+    c = colors or COLORS
+    spec = [
+        "fg:-1", "bg:-1", "hl:" + c["accent"], "fg+:%s:bold" % c["selected_fg"],
+        "bg+:" + c["selected_bg"], "hl+:%s:bold:underline" % c["selected_fg"], "gutter:-1",
+        # The pointer sits on the selected row's background, so it takes that row's text
+        # colour: in the accent it would vanish into a background of the same colour.
+        "pointer:" + c["selected_fg"], "prompt:" + c["accent"], "spinner:" + c["accent"],
+        "label:" + c["accent"], "border:" + c["muted"], "info:" + c["muted"],
+        "header:" + c["muted"], "scrollbar:" + c["muted"],
+    ]
+    return ",".join(spec + ([c["fzf"]] if c.get("fzf") else []))
+
+
+def fzf_argv(fzf, self_cmd, sock, remote_enter=False):
+    argv = [
+        fzf, "--ansi", "--delimiter", "\t", "--with-nth", "2..", "--header-lines", "1",
+        # No padding: every column lost here breaks a preview line.
+        "--layout", "reverse", "--height", "100%", "--border", "none",
+        "--prompt", "❯ ", "--pointer", "▌", "--highlight-line", "--info", "inline-right",
+        # A blank gutter: fzf 0.66+ draws it as a ▌ on every row, a column of half blocks
+        # that also hides the pointer. --gutter exists since 0.66, below the 0.71 minimum.
+        "--gutter", " ",
+        "--no-multi", "--cycle", "--scrollbar", "│",
+        # With a query, score ties keep the priority order.
+        "--tiebreak", "index",
+        "--preview", self_cmd + " --preview {1}",
+        # At the bottom, not on the side: agents write at the width of their pane, and a
+        # full-width pane does not fit in half the screen. `follow` shows the end.
+        "--preview-window", "down,50%,border-top,follow,wrap",
+        "--bind", "ctrl-/:toggle-preview",
+        # Copy: inside a popup herdr hands the whole mouse to the program and never selects,
+        # so copying goes through a key and OSC 52.
+        "--bind", "ctrl-y:" + fzf_action("transform-footer", self_cmd + " --copy {1}"),
+        # Moving clears the "copied: …" of ctrl-y.
+        "--bind", "focus:change-footer()",
+        # Select with the mouse exactly what you want: a viewer that takes the terminal.
+        "--bind", "ctrl-o:" + fzf_action("execute", self_cmd + " --select {1}"),
+        # Only terminals, or everything again. sh, not $SHELL: in zsh a leading ^ in a
+        # pattern is special.
+        "--with-shell", "sh -c",
+        "--bind", "ctrl-t:transform-query:" + TOGGLE_TERMINALS,
+        "--color", fzf_colors(),
+        # watch() reloads through here. The row id (field 1) is what track-current uses to
+        # find the same agent in the new list.
+        "--listen=%s" % sock, "--id-nth", "1",
+    ]
+    if remote_enter:
+        # With the jump off, Enter on another machine's row focuses it there and keeps the
+        # popup open with a footer; rows of this machine are accepted as usual.
+        argv += ["--bind", "enter:" + fzf_action("transform", self_cmd + " --enter {1}")]
+    return argv
+
+
+# --- select with the mouse --------------------------------------------------------------
+#
+# In a popup herdr passes the whole mouse to the program and never selects, and fzf's
+# preview cannot be selected either. This viewer asks for the mouse with drag reporting
+# (1002 + SGR 1006), shades the selection and on release copies exactly that through
+# OSC 52: the pane's text, without borders or whatever surrounds the popup.
+
+def char_width(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def wrap_rows(lines, width):
+    """The screen rows: [(line, start, end)], each line wrapped at the width."""
+    rows = []
+    for i, line in enumerate(lines):
+        start, col = 0, 0
+        for j, ch in enumerate(line):
+            w = char_width(ch)
+            if col + w > width and j > start:
+                rows.append((i, start, j))
+                start, col = j, 0
+            col += w
+        rows.append((i, start, len(line)))
+    return rows
+
+
+def col_to_index(line, start, end, col):
+    """The index of the character at column `col` of that row (0 = the first)."""
+    c = 0
+    for j in range(start, end):
+        w = char_width(line[j])
+        if col < c + w:
+            return j
+        c += w
+    return end
+
+
+def selected_text(lines, a, b):
+    """The text between two (line, index) points, in either order, b included."""
+    (l1, c1), (l2, c2) = sorted([a, b])
+    if l1 == l2:
+        return lines[l1][c1:c2 + 1]
+    parts = [lines[l1][c1:]] + lines[l1 + 1:l2] + [lines[l2][:c2 + 1]]
+    return "\n".join(parts)
+
+
+ESC_WAIT = 0.15  # seconds a lone Esc waits for the rest of a possible escape sequence
+SGR_MOUSE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
+
+
+class Selector:
+    def __init__(self, lines, width, height):
+        self.lines = lines or [""]
+        self.resize(width, height)
+        self.anchor = self.cursor = None
+        self.status = ""
+
+    def resize(self, width, height):
+        self.width, self.height = max(10, width), max(3, height)
+        self.rows = wrap_rows(self.lines, self.width)
+        self.view = self.height - 1  # the last row is the help bar
+        self.top = max(0, len(self.rows) - self.view)  # starts at the bottom, the newest
+
+    def scroll(self, n):
+        self.top = min(max(0, self.top + n), max(0, len(self.rows) - self.view))
+
+    def point(self, x, y):
+        """(line, index) of the character under cell x, y (1-based, as in SGR)."""
+        r = min(max(0, self.top + y - 1), len(self.rows) - 1)
+        i, start, end = self.rows[r]
+        return (i, min(col_to_index(self.lines[i], start, end, x - 1), max(0, len(self.lines[i]) - 1)))
+
+    def mouse(self, code, x, y, release):
+        """One SGR event. Returns the text to copy on release, or None."""
+        if code in (64, 65):  # wheel
+            self.scroll(-3 if code == 64 else 3)
+        elif code & 3 == 0 and not code & 64:
+            if not release and not code & 32:  # pressed
+                self.anchor = self.cursor = self.point(x, y)
+            elif self.anchor is not None:
+                self.cursor = self.point(x, y)
+                if release:
+                    text = selected_text(self.lines, self.anchor, self.cursor)
+                    return text if text.strip() else None
+        return None
+
+    def in_selection(self, i, j):
+        if self.anchor is None:
+            return False
+        a, b = sorted([self.anchor, self.cursor])
+        return a <= (i, j) <= b
+
+    def frame(self):
+        out = ["\x1b[H"]
+        for r in range(self.top, self.top + self.view):
+            out.append("\x1b[2K")
+            if r < len(self.rows):
+                i, start, end = self.rows[r]
+                inv = False
+                for j in range(start, end):
+                    sel = self.in_selection(i, j)
+                    if sel != inv:
+                        out.append("\x1b[7m" if sel else "\x1b[27m")
+                        inv = sel
+                    out.append(self.lines[i][j])
+                if inv:
+                    out.append("\x1b[27m")
+            out.append("\r\n")
+        bar = (self.status or tr("select_help"))[: self.width]
+        out.append("\x1b[2K\x1b[7m" + bar + " " * (self.width - len(bar)) + "\x1b[0m")
+        return "".join(out)
+
+
+def select_view(row_id, tty="/dev/tty"):
+    """The selection viewer for that row: ctrl-o in the popup."""
+    target = parse_id(row_id)
+    if target is None:
+        return 0
+    args = ["pane", "read", target["pane"], "--source", "recent", "--lines", "2000", "--format", "text"]
+    try:
+        text = trim_footer(herdr_on(target["machine"], args, REMOTE_TIMEOUT if target["machine"] else 5))
+    except Exception as exc:
+        text = tr("read_failed", clean(str(exc)))
+    lines = [CONTROL_CHARS.sub("", l).rstrip() for l in ESCAPE_SEQ.sub("", text).split("\n")]
+    while len(lines) > 1 and not lines[-1]:
+        lines.pop()
+    import termios
+    import tty as ttymod
+    fd = os.open(tty, os.O_RDWR)
+    old = termios.tcgetattr(fd)
+    size = os.get_terminal_size(fd)
+    sel = Selector(lines, size.columns, size.lines)
+
+    def write(data):
+        os.write(fd, data.encode("utf-8"))
+    try:
+        ttymod.setraw(fd)
+        write("\x1b[?1049h\x1b[?25l\x1b[?1002h\x1b[?1006h\x1b[2J")
+        buf = ""
+        while True:
+            write(sel.frame())
+            r, _, _ = select.select([fd], [], [], 0.5)
+            size2 = os.get_terminal_size(fd)
+            if (size2.columns, size2.lines) != (sel.width, sel.height):
+                sel.resize(size2.columns, size2.lines)
+            if not r:
+                continue
+            buf += os.read(fd, 4096).decode("utf-8", "replace")
+            while buf:
+                m = SGR_MOUSE.match(buf)
+                if m:
+                    buf = buf[m.end():]
+                    text = sel.mouse(int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) == "m")
+                    if text:
+                        write(osc52(text[:100000]))
+                        lines_note = "" if "\n" not in text else tr("select_lines", text.count("\n") + 1)
+                        sel.status = tr("select_copied", len(text), lines_note)
+                    continue
+                if buf.startswith("\x1b[<"):  # a mouse report still arriving
+                    if len(buf) < 32:
+                        break
+                    buf = buf[3:]
+                    continue
+                keys = {"\x1b[A": -1, "\x1b[B": 1, "\x1b[5~": -sel.view, "\x1b[6~": sel.view, "k": -1, "j": 1}
+                hit = next((k for k in keys if buf.startswith(k)), None)
+                if hit:
+                    sel.scroll(keys[hit])
+                    buf = buf[len(hit):]
+                elif buf[0] in ("q", "\x03"):
+                    return 0
+                elif buf.startswith("\x1b") and len(buf) < 3:
+                    # A lone Esc, or the first bytes of an arrow key whose rest is still on its
+                    # way? Wait a moment for more before taking it as Esc (150 ms: enough for a
+                    # slow machine or link, still instant to the eye; tmux waits 500 ms).
+                    r2, _, _ = select.select([fd], [], [], ESC_WAIT)
+                    if not r2:
+                        return 0
+                    break
+                else:
+                    buf = buf[1:]
+    finally:
+        write("\x1b[?1006l\x1b[?1002l\x1b[?25h\x1b[?1049l")
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        os.close(fd)
+
+
+# --- jump to another machine (opt-in: [jump] enabled = true) ----------------------------
+#
+# Which machine the window shows is decided by the window (herdr's client), and no API
+# asks it to switch. herdr's native Goto does switch between machines, though, and on macOS
+# Ghostty (1.4 or newer) accepts keystrokes for one of its terminals through AppleScript
+# (perform action "text:…"). So the jump is: find the Mac running the window, open its Goto
+# with a query that matches only that pane, press Enter, and focus through the API as well.
+# Anything missing on the way leaves the API focus alone, which never fails loudly.
+
+TAILSCALE = ("tailscale", "/usr/local/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+SSH = os.environ.get("SWITCHBOARD_SSH", "ssh")
+OSASCRIPT = os.environ.get("SWITCHBOARD_OSASCRIPT", "osascript")
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+
+
+# ssh appends "/ssh-" and a 40-character hash to the directory, and a unix socket path is
+# limited to 104 bytes on macOS. That rules out macOS's long per-user temporary directory.
+SOCKET_DIR_MAX = 58
+
+
+def private_dir(path):
+    """Create `path` (mode 0700) when missing, and say whether it is safe to hold ssh control
+    sockets: a real directory, not a symlink, owned by this user, with no access for group
+    or others. A directory someone else created first at the same path fails, so nobody
+    can plant a control socket for this user's connections."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
+
+
+def private_fd(fd):
+    """True when the open descriptor is a directory of this user with no access for group
+    or others."""
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
+
+
+def open_private_dir(path):
+    """A descriptor for `path` when it is a real directory (not a symlink) of this user with
+    mode 0700 or stricter; else None. Whatever is done inside it afterwards goes through the
+    descriptor, so it stays tied to this directory even if the name is later removed and
+    taken by someone else."""
+    if not path:
+        return None
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    if private_fd(fd):
+        return fd
+    os.close(fd)
+    return None
+
+
+def write_new(dir_fd, name, text):
+    """Write `text` to `name` inside the directory `dir_fd`: a new file (O_EXCL), never
+    through a symlink (O_NOFOLLOW), mode 0600, then renamed into place. False when it cannot,
+    for instance because that directory has been removed."""
+    tmp = name + ".tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.rename(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        return True
+    except OSError:
+        return False
+
+
+def append_line(dir_fd, name, line):
+    """Append one line to `name` inside `dir_fd`, creating it 0600, never through a symlink."""
+    try:
+        fd = os.open(name, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    except OSError:
+        return False
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return False
+        os.write(fd, (line + "\n").encode("utf-8"))
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def read_small(dir_fd, name, limit=65536):
+    """The text of a regular file `name` inside `dir_fd`, never through a symlink and never
+    blocking on a pipe; None when there is no such file."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return os.read(fd, limit).decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def find_ssh_control_dir(env=None, tmp="/tmp"):
+    """The directory for ssh control sockets, or None (then connections are not shared).
+
+    $XDG_RUNTIME_DIR/switchboard first, when that runtime directory belongs to this user and
+    nobody else can write to it; then /tmp/switchboard-<uid>. Each is checked before use."""
+    env = os.environ if env is None else env
+    candidates = []
+    runtime = env.get("XDG_RUNTIME_DIR") or ""
+    if os.path.isabs(runtime):
+        try:
+            st = os.lstat(runtime)
+            if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o022:
+                candidates.append(os.path.join(runtime, "switchboard"))
+        except OSError:
+            pass
+    candidates.append(os.path.join(tmp, "switchboard-%d" % os.getuid()))
+    for d in candidates:
+        if len(d) <= SOCKET_DIR_MAX and private_dir(d):
+            return d
+    return None
+
+
+_SSH_DIR = []  # the directory found once per process: [path or None]
+
+
+def valid_host(host):
+    """A destination ssh will not mistake for an option: no leading "-", no whitespace or
+    control characters. Detected destinations (a Tailscale host name, the address of an
+    incoming connection) and configured ones all pass through here."""
+    return isinstance(host, str) and bool(host) and not host.startswith("-") \
+        and re.search(r"[\s\x00-\x1f\x7f]", host) is None
+
+
+def ssh_argv(host, command, mux=True):
+    """The ssh command line for running `command` on `host`, or None when the destination
+    is not valid. "--" ends ssh's options, so the destination is never read as one."""
+    if not valid_host(host):
+        return None
+    return [SSH] + SSH_OPTS + (ssh_mux() if mux else []) + ["--", host, command]
+
+
+def ssh_mux():
+    """Options that share one ssh connection per host (ControlMaster), or none at all when
+    no safe directory for the control sockets exists."""
+    if not _SSH_DIR:
+        _SSH_DIR.append(find_ssh_control_dir())
+    if not _SSH_DIR[0]:
+        return []
+    return ["-o", "ControlMaster=auto", "-o", "ControlPath=%s/ssh-%%C" % _SSH_DIR[0], "-o", "ControlPersist=600"]
+
+
+def run_out(argv, timeout=5):
+    try:
+        r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           universal_newlines=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def ssh_origin(pid):
+    """The address an ssh connection to that process came from, or None."""
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as f:
+            env = dict(kv.split("=", 1) for kv in f.read().decode("utf-8", "replace").split("\0") if "=" in kv)
+        conn = env.get("SSH_CONNECTION", "")
+    except OSError:  # macOS: the environment comes from ps -E, space separated
+        out = run_out(["ps", "-wwE", "-p", str(pid), "-o", "command="])
+        m = re.search(r"\bSSH_CONNECTION=(\S+) ", out)
+        conn = m.group(1) if m else ""
+    return conn.split()[0] if conn.split() else None
+
+
+def client_bridges(ps_text=None):
+    """[(pid, address)] of the windows attached to this server from another machine.
+
+    They are the `herdr remote-client-bridge` processes; a one-off `herdr --machine` also
+    creates one, which is why the choice is made per machine and not per process."""
+    ps_text = ps_text if ps_text is not None else run_out(["ps", "-axo", "pid=,command="])
+    out = []
+    for line in ps_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and os.path.basename(parts[1]) == "herdr" and "remote-client-bridge" in parts[2:]:
+            addr = ssh_origin(int(parts[0]))
+            if addr:
+                out.append((int(parts[0]), addr))
+    return sorted(out)
+
+
+def tailnet_hosts():
+    """{address: (hostname, os)} of every Tailscale node, or {} without Tailscale."""
+    for t in TAILSCALE:
+        out = run_out([t, "status", "--json"])
+        if out:
+            break
+    else:
+        return {}
+    try:
+        d = json.loads(out)
+    except ValueError:
+        return {}
+    hosts = {}
+    for node in [d.get("Self") or {}] + list((d.get("Peer") or {}).values()):
+        for addr in node.get("TailscaleIPs") or []:
+            hosts[addr] = (node.get("HostName") or "", node.get("OS") or "")
+    return hosts
+
+
+def answers_as_mac(host):
+    """True when `host` takes a non-interactive ssh and runs macOS."""
+    argv = ssh_argv(host, "uname -s", mux=False)
+    return bool(argv) and run_out(argv, timeout=8).strip() == "Darwin"
+
+
+def local_tui_tty(ps_text=None):
+    """The tty of a herdr window running on this machine, or None."""
+    ps_text = ps_text if ps_text is not None else run_out(["ps", "-axo", "pid=,tty=,command="])
+    for line in ps_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and os.path.basename(parts[2]) == "herdr" and parts[1] not in ("??", "?") \
+                and not any(w in parts[3:4] for w in ("server", "remote-client-bridge", "api", "agent",
+                                                       "pane", "tab", "machine", "status", "plugin")):
+            return "/dev/" + parts[1] if not parts[1].startswith("/dev/") else parts[1]
+    return None
+
+
+def idle_seconds(host):
+    """How long since the Mac was last touched (HIDIdleTime). host None is this machine."""
+    argv = ssh_argv(host, "ioreg -c IOHIDSystem", mux=False) if host else ["ioreg", "-c", "IOHIDSystem"]
+    out = run_out(argv, timeout=6) if argv else ""
+    m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
+    return int(m.group(1)) / 1e9 if m else float("inf")
+
+
+def find_client(bridges=None, hosts=None, local_tty=None, idle=idle_seconds, platform=sys.platform,
+                is_mac=None, configured=None):
+    """Where the window that opened the popup runs: ("local", None), ("ssh", host) or None.
+
+    `[jump] client` in the config answers directly. Otherwise only a Mac qualifies, since
+    Ghostty receives the keys: this machine when it is a Mac with a herdr window, and each
+    remote window's address, named and identified through Tailscale when it is installed,
+    or asked over ssh when it is not. With several candidates, the one touched last, which
+    is the one you are typing on."""
+    configured = JUMP_CLIENT if configured is None else configured
+    if configured:
+        if configured == "local":
+            return ("local", None)
+        return ("ssh", configured) if valid_host(configured) else None
+    bridges = client_bridges() if bridges is None else bridges
+    candidates = []
+    if platform == "darwin" and (local_tty if local_tty is not None else local_tui_tty()):
+        candidates.append(None)
+    if bridges:
+        hosts = tailnet_hosts() if hosts is None else hosts
+        is_mac = is_mac or answers_as_mac
+        for _, addr in bridges:
+            if addr in hosts:
+                name, os_name = hosts[addr]
+                if valid_host(name) and os_name.lower() == "macos" and name not in candidates:
+                    candidates.append(name)
+            elif valid_host(addr) and addr not in candidates and is_mac(addr):
+                candidates.append(addr)
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        results = {}
+        threads = [threading.Thread(target=lambda c=c: results.__setitem__(c, idle(c))) for c in candidates]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        candidates.sort(key=lambda c: results.get(c, float("inf")))
+    best = candidates[0]
+    return ("local", None) if best is None else ("ssh", best)
+
+
+def plugin_root_from(text):
+    """This plugin's directory in the output of `herdr plugin list --json`, or None."""
+    try:
+        plugins = json.loads(text)["result"]["plugins"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    for p in plugins if isinstance(plugins, list) else []:
+        if isinstance(p, dict) and p.get("plugin_id") == PLUGIN_ID and p.get("plugin_root"):
+            return p["plugin_root"]
+    return None
+
+
+def resolve_helper(host):
+    """The command that runs this program on the client Mac, or None.
+
+    `[jump] helper` in the config wins; otherwise herdr on that Mac says where it installed
+    or linked the plugin. No location is assumed."""
+    if JUMP_HELPER:
+        return JUMP_HELPER
+    argv = ssh_argv(host, REMOTE_HERDR + " plugin list --json")
+    root = plugin_root_from(run_out(argv, timeout=10)) if argv else None
+    if not root:
+        return None
+    return "python3 " + shlex.quote(root.rstrip("/") + "/bin/switchboard")
+
+
+QUERY_CHARS = re.compile(r"^[a-z0-9:._ -]+$")
+
+
+def goto_query(target, entries):
+    """What to type in the Goto so the only row left is that one.
+
+    The Goto wants EVERY word inside one field of a row (or of its tab, workspace or
+    machine), and one of the fields is the pane id. The pane id, name and title are tried,
+    in lower case; the first that leaves only that row wins. None when none does, and the
+    pane then carries a unique name for a moment."""
+    me = next((e for e in entries if e["machine"] == target.get("machine", e["machine"])
+               and e["pane"] == target["pane"]), None)
+    candidates = [target["pane"]] + ([me["pane_name"], me["title"]] if me else [])
+    for cand in candidates:
+        q = (cand or "").strip().lower()
+        if not q or not QUERY_CHARS.match(q):
+            continue
+        words = q.split()
+        hits = 0
+        for e in entries:
+            fields = (e["pane"], e["ws_label"], e.get("tab_auto", ""), e["title"], e["cwd"],
+                      e["pane_name"], e["agent"], e.get("machine_label", ""))
+            if any(all(w in (f or "").lower() for w in words) for f in fields):
+                hits += 1
+        if hits == 1:
+            return q
+    return None
+
+
+def ghostty_keys_script(tty, query, keys=None):
+    """The AppleScript that opens the Goto in the terminal on that tty, searches and jumps.
+
+    keys (the Ghostty text for [jump] prefix and goto, then /) opens the navigator and its
+    search; then the query and Enter, all in ONE burst so the window processes it at once
+    and shows the jump, not the navigator typing. keys, query and tty are checked against
+    closed character sets: nothing to escape, and nothing can leave the text: string."""
+    keys = keys or JUMP_KEYS
+    if not QUERY_CHARS.match(query) or not re.match(r"^/dev/[\w.]+$", tty) or not KEYS_TEXT.fullmatch(keys):
+        raise ValueError("unexpected characters in the keys, the query or the tty")
+    return "\n".join([
+        'tell application "Ghostty"',
+        '  set t to first terminal whose tty is "%s"' % tty,
+        '  perform action "text:%s%s\\\\r" on t' % (keys.replace("\\", "\\\\"), query),
+        'end tell',
+    ])
+
+
+def jump(label, kind, pane, tab, query, rename, old_label, keys=None, wait=0.15, tty=None, osa=None):
+    """Runs on the Mac of the window, while the popup closes.
+
+    tty and osa come ready from --jump-server: the window's tty and an osascript already
+    started and waiting for the script on stdin."""
+    time.sleep(wait)
+    api = [] if label == local_label() else ["--machine", label]
+    focus = api + (["agent", "focus", pane] if kind == "a" else ["tab", "focus", tab])
+    if rename:
+        run_out([HERDR] + api + ["pane", "rename", pane, query], timeout=10)
+        time.sleep(0.8)  # let the new name reach the window
+    tty = tty or local_tui_tty()
+    if tty:
+        script = ghostty_keys_script(tty, query, keys)
+        if osa is not None:
+            osa.communicate(script.encode("utf-8"), timeout=10)
+        else:
+            subprocess.run([OSASCRIPT, "-e", script], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        time.sleep(0.6)
+    if rename:
+        # The label goes as it is: herdr takes a label that starts with "-" as text, and a
+        # "--" in front would become part of the label (checked against herdr 0.9.5).
+        run_out([HERDR] + api + ["pane", "rename", pane] + ([old_label] if old_label else ["--clear"]), timeout=10)
+    # In case the Goto landed on another pane of that machine, this puts it right.
+    run_out([HERDR] + focus, timeout=10)
+    return 0
+
+
+def jump_argv(target, label, entries):
+    """The --jump arguments for that row."""
+    query = goto_query(target, entries)
+    rename = query is None
+    if rename:
+        query = "sbj" + base64.b32encode(os.urandom(5)).decode("ascii").lower().rstrip("=")
+    old = next((e["pane_label"] for e in entries if e["machine"] == target["machine"] and e["pane"] == target["pane"]), "")
+    # The keys go along: they are the window's herdr keys, set where the popup is opened.
+    return ["--jump", label, target["kind"], target["pane"], target["tab"], query, "1" if rename else "0", old,
+            JUMP_KEYS]
+
+
+def jump_server(stdin=None):
+    """--jump-server: runs on the Mac of the window from the moment the popup opens.
+
+    It gets the tty and an osascript ready and waits for one line with the jump's arguments.
+    On EOF with nothing (a row of the popup's own machine was picked, or Esc), it exits."""
+    stdin = stdin or sys.stdin
+    tty = local_tui_tty()
+    osa = None
+    if tty:
+        osa = subprocess.Popen([OSASCRIPT, "-"], stdin=subprocess.PIPE,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    line = stdin.readline()
+    try:
+        args = json.loads(line) if line.strip() else None
+    except ValueError:
+        args = None
+    if not (isinstance(args, list) and len(args) == 9 and args[0] == "--jump"):
+        if osa is not None:
+            osa.kill()
+        return 0
+    return jump(args[1], args[2], args[3], args[4], args[5], args[6] == "1", args[7], keys=args[8],
+                wait=0.05, tty=tty, osa=osa)
+
+
+class JumpLink:
+    """The connection to the Mac of the window, opened as soon as the popup opens.
+
+    A new ssh connection costs several round trips; opening it while you choose means
+    Enter only sends one line. If Enter comes before it connects, the line waits in the pipe.
+    """
+
+    def __init__(self, find=None, helper=None):
+        self.find = find or find_client
+        self.helper = helper or resolve_helper
+        self.proc = None
+        self.client = None
+        self.ready = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._start, daemon=True).start()
+        return self
+
+    def _start(self):
+        try:
+            self.client = self.find()
+            if self.client:
+                if self.client[0] == "local":
+                    argv = [sys.executable, os.path.abspath(__file__), "--jump-server"]
+                else:
+                    helper = self.helper(self.client[1])
+                    if not helper:
+                        return  # nothing to run there: the API focus is all there is
+                    argv = ssh_argv(self.client[1], helper + " --jump-server")
+                    if not argv:
+                        return
+                self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except Exception:
+            self.proc = None
+        finally:
+            self.ready.set()
+
+    def send(self, args, timeout=2.0):
+        """Send the jump. False when there is no connection: launch_jump is the fallback."""
+        self.ready.wait(timeout)
+        if self.proc is None or self.proc.poll() is not None:
+            return False
+        try:
+            self.proc.stdin.write((json.dumps(args) + "\n").encode("utf-8"))
+            self.proc.stdin.close()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def close(self):
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()
+            except (OSError, ValueError):
+                pass
+
+
+def launch_jump(args, client, helper=None):
+    """Start the jump detached from the popup, which is about to close. False when there
+    is nothing to run on the client."""
+    if client[0] == "local":
+        argv = [sys.executable, os.path.abspath(__file__)] + args
+    else:
+        helper = helper or resolve_helper(client[1])
+        if not helper:
+            return False
+        argv = ssh_argv(client[1], helper + " " + " ".join(shlex.quote(a) for a in args))
+        if not argv:
+            return False
+    subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    return True
+
+
+# --- dependencies -----------------------------------------------------------------------
+
+def version_text(v):
+    return ".".join(str(x) for x in v)
+
+
+def fzf_binary():
+    """The fzf to run: SWITCHBOARD_FZF when set (empty or missing means none), else PATH."""
+    override = os.environ.get("SWITCHBOARD_FZF")
+    if override is not None:
+        return override if override and os.path.isfile(override) and os.access(override, os.X_OK) else None
+    return shutil.which("fzf")
+
+
+def fzf_version(fzf):
+    """((major, minor, patch), text) from `fzf --version`, or None when it does not say."""
+    m = re.match(r"\s*(\d+)\.(\d+)(?:\.(\d+))?", run_out([fzf, "--version"], timeout=5))
+    if not m:
+        return None
+    return tuple(int(x or 0) for x in m.groups()), m.group(0).strip()
+
+
+def dependency_problems(python=None, fzf="auto", platform=sys.platform, executable=None):
+    """The lines that explain what is missing, or [] when everything is there.
+
+    python: a version tuple (default: this interpreter). fzf: a path, None for "not found",
+    or "auto" to look it up; False skips the check."""
+    python = tuple(python or sys.version_info[:3])
+    problems = []
+    if python[:2] < MIN_PYTHON:
+        problems.append(tr("need_python", version_text(MIN_PYTHON), version_text(python),
+                           executable or sys.executable))
+        problems.append(tr("install_python_macos") if platform == "darwin"
+                        else tr("install_python_other", version_text(MIN_PYTHON)))
+    if fzf is False:
+        return problems
+    path = fzf_binary() if fzf == "auto" else fzf
+    found = fzf_version(path) if path else None
+    if found is None or found[0][:2] < MIN_FZF:
+        if found is None:
+            problems.append(tr("need_fzf_missing", version_text(MIN_FZF)))
+        else:
+            problems.append(tr("need_fzf_old", version_text(MIN_FZF), found[1]))
+        problems.append(tr("install_fzf_macos") if platform == "darwin"
+                        else tr("install_fzf_other", version_text(MIN_FZF)))
+    return problems
+
+
+def fzf_rejects(fzf, args):
+    """fzf's own message when it refuses these options (exit 2), else None. It runs in
+    filter mode over empty input, so it draws nothing and returns at once."""
+    try:
+        r = subprocess.run([fzf] + list(args) + ["--filter", ""], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, universal_newlines=True,
+                           timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 2:
+        return None
+    lines = [l.strip() for l in r.stderr.splitlines() if l.strip()]
+    return clean(lines[0]) if lines else "exit 2"
+
+
+def verify_colors(fzf):
+    """Ask the installed fzf whether it takes the configured colours. When it does not,
+    fall back to the defaults and say so in the header; returns the note, or None."""
+    global COLORS, CONFIG_WARNING
+    if COLORS == DEFAULTS["colors"] or not fzf_rejects(fzf, ["--color", fzf_colors()]):
+        return None
+    COLORS = dict(DEFAULTS["colors"])
+    note = tr("colors_rejected")
+    CONFIG_WARNING = note if not CONFIG_WARNING else CONFIG_WARNING + " · " + note
+    return note
+
+
+def explain_and_wait(problems):
+    """Print what is missing and wait for a key: the popup would vanish with the message."""
+    sys.stdout.write("\n".join(problems) + "\n\n")
+    sys.stdout.flush()
+    try:
+        input(tr("press_enter"))
+    except (EOFError, KeyboardInterrupt):
+        pass
+    return 1
+
+
+# --- demo -------------------------------------------------------------------------------
+
+DEMO_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "demo", "fixtures.json")
+
+
+class Demo:
+    """The fixtures behind --demo: three machines, their snapshots, a canned preview per
+    pane and a short timeline of changes, served where herdr would answer."""
+
+    def __init__(self, path=None, t0=None):
+        with open(path or DEMO_FILE) as f:
+            d = json.load(f)
+        self.local = d["local"]
+        self.machines = d["machines"]
+        self.snapshots = d["snapshots"]
+        self.previews = d["previews"]
+        self.timeline = d.get("timeline", [])
+        self.t0 = time.time() if t0 is None else t0
+
+    def snapshot(self, machine, now=None):
+        key = machine or self.local
+        snap = copymod.deepcopy(self.snapshots[key])
+        elapsed = (now or time.time()) - self.t0
+        for event in self.timeline:
+            if event["machine"] == key and event["after"] <= elapsed:
+                for a in snap["agents"]:
+                    if a["pane_id"] == event["pane"]:
+                        a.update(event["set"])
+        return snap
+
+    def run(self, args):
+        machine = ""
+        if args[:1] == ["--machine"]:
+            machine, args = args[1], args[2:]
+        if args == ["machine", "list", "--json"]:
+            return json.dumps(self.machines)
+        if args[:2] == ["api", "snapshot"]:
+            return json.dumps({"result": {"snapshot": self.snapshot(machine)}})
+        if args[:2] == ["pane", "read"] and len(args) > 2:
+            lines = self.previews.get(machine or self.local, {}).get(args[2])
+            if lines is not None:
+                return "\n".join(lines) + "\n"
+        raise RuntimeError("herdr %s" % " ".join(args))
+
+
+def demo_outcome(row_id, labels):
+    """What Enter would have done in the demo, as the lines to print."""
+    cmd = action_for(row_id, labels)
+    if not cmd:
+        return [tr("demo_nothing")]
+    out = [tr("demo_would", " ".join(cmd))]
+    target = parse_id(row_id)
+    if target["machine"] and not JUMP_ENABLED:
+        out.append(tr("demo_jump_off", labels.get(target["machine"], target["machine"])))
+    return out
+
+
+# --- main -------------------------------------------------------------------------------
+
+def enter_mode(machines, demo=False):
+    """(open a JumpLink, bind Enter to --enter) for this popup.
+
+    Both only matter with other machines. With the jump on, the connection to the client
+    opens right away so Enter only sends one line; with it off (the default), Enter on a
+    remote row focuses it there and leaves the popup open with a footer. The demo does
+    neither: Enter prints what it would have done."""
+    if demo or not machines:
+        return False, False
+    return (True, False) if JUMP_ENABLED else (False, True)
+
+
+def popup(self_cmd, demo=False):
+    fzf = fzf_binary()
+    problems = dependency_problems(fzf=fzf)
+    if problems:
+        return explain_and_wait(problems)
+    verify_colors(fzf)
+    machines = saved_machines()
+    try:
+        snap = snapshot()
+        entries = entries_from(snap, LOCAL, local_label(), 0)
+    except Exception as exc:
+        try:
+            if isinstance(exc, subprocess.TimeoutExpired):
+                input(tr("snapshot_timeout", "%g" % LOCAL_TIMEOUT, config_path()))
+            else:
+                input(tr("snapshot_failed", clean(str(exc))))
+        except (EOFError, KeyboardInterrupt):
+            pass
+        return 1
+    live = Live(machines, entries, focus=focused_tab(snap))
+    first = live.changed()
+    open_link, remote_enter = enter_mode(machines, demo)
+    link = JumpLink().start() if open_link else None
+
+    # The socket and the reloadable rows go in a private (0700), short directory: on macOS
+    # a unix socket path cannot exceed 104 bytes.
+    tmp = tempfile.mkdtemp(prefix="switchboard-", dir=os.environ.get("SWITCHBOARD_RUN_ROOT") or "/tmp")
+    sock, rows_file, acks = os.path.join(tmp, "fzf.sock"), os.path.join(tmp, "rows"), os.path.join(tmp, "acks")
+    stop = threading.Event()
+    argv = fzf_argv(fzf, self_cmd, sock, remote_enter=remote_enter)
+    labels = {m["id"]: m["label"] for m in machines}
+    watcher = threading.Thread(target=watch, args=(live, sock, rows_file, stop, acks), daemon=True)
+    try:
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True,
+                                env=dict(os.environ, SWITCHBOARD_RUN_DIR=tmp, SWITCHBOARD_LABELS=json.dumps(labels)))
+        watcher.start()
+        out, _ = proc.communicate(first)
+    finally:
+        stop.set()
+        if watcher.is_alive():
+            watcher.join(2)  # stop wakes it; a pass already under way may take a moment
+        live.consume_acks(acks)  # an Enter on a remote row just before Esc
+        # Always removed. A pass of watch() still running after this cannot reach anything
+        # else: the rows go through the old descriptor (now ENOENT), fzf's socket is only
+        # contacted after a rows write succeeded, and the acks only through a directory
+        # that open_private_dir accepts as ours.
+        shutil.rmtree(tmp, ignore_errors=True)
+    if proc.returncode == 2:
+        # fzf refused its command line and drew nothing: say why instead of vanishing.
+        reason = fzf_rejects(fzf, [a for a in argv[1:] if not a.startswith("--listen")]) or "exit 2"
+        return explain_and_wait([tr("fzf_failed", reason)])
+    pick = out.strip()
+    if proc.returncode != 0 or not pick:
+        if link:
+            link.close()
+        return 0
+    row_id = pick.split("\t", 1)[0]
+    if demo:
+        sys.stdout.write("\n".join(demo_outcome(row_id, labels)) + "\n")
+        return 0
+    target = parse_id(row_id)
+    cmd = action_for(row_id, labels)
+    if target:  # you are going there: whatever finished in that tab counts as seen
+        live.recency.ack_tab(target["machine"], target["tab"], live.entries())
+    if target and target["machine"]:
+        # The API focus always goes out: if the jump does not arrive, the pane is ready on
+        # its machine.
+        if cmd:
+            subprocess.Popen([HERDR] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        if JUMP_ENABLED:
+            args = jump_argv(target, labels.get(target["machine"], ""), live.entries())
+            if not (link and link.send(args)):
+                client = (link.client if link else None) or find_client()
+                if client:
+                    launch_jump(args, client)
+        return 0
+    if link:
+        link.close()
+    if cmd:
+        subprocess.run([HERDR] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+    return 0
+
+
+def _exit_on_signal(signum, frame):
+    raise SystemExit(128 + signum)
+
+
+def main(argv):
+    global DEMO, STATE_DIR
+    if argv[:1] in (["-h"], ["--help"]):
+        sys.stdout.write(tr("usage", config_path()))
+        return 0
+    if argv[:1] == ["--version"]:
+        sys.stdout.write("switchboard %s\n" % VERSION)
+        return 0
+    problems = dependency_problems(fzf=False)
+    if problems:
+        return explain_and_wait(problems)
+    # A popup whose window or session goes away gets SIGHUP (or SIGTERM). By default Python
+    # would die on the spot and leave its temporary directories behind; as an exit, the
+    # cleanup in the finally blocks runs.
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, _exit_on_signal)
+    demo = argv[:1] == ["--demo"]
+    if demo:
+        argv = argv[1:]
+        DEMO = Demo()
+        # Nothing of the demo is written outside a temporary directory.
+        STATE_DIR = tempfile.mkdtemp(prefix="switchboard-demo-")
+    self_cmd = " ".join(shlex.quote(x) for x in (sys.executable, os.path.abspath(__file__)))
+    if demo:
+        self_cmd += " --demo"
+    try:
+        if argv[:1] == ["--preview"]:
+            return preview(argv[1] if len(argv) > 1 else "")
+        if argv[:1] == ["--copy"]:
+            return copy(argv[1] if len(argv) > 1 else "")
+        if argv[:1] == ["--select"]:
+            return select_view(argv[1] if len(argv) > 1 else "")
+        if argv[:1] == ["--enter"]:
+            return enter(argv[1] if len(argv) > 1 else "")
+        if argv[:1] == ["--focus"]:
+            return focus_remote(argv[1] if len(argv) > 1 else "", argv[2] if len(argv) > 2 else None)
+        if argv[:1] == ["--focus-wait"] and len(argv) == 3:
+            return focus_wait(argv[1], argv[2])
+        if argv[:1] == ["--jump-server"]:
+            return jump_server()
+        if argv[:1] == ["--jump"] and len(argv) == 9:
+            return jump(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6] == "1", argv[7], keys=argv[8])
+        if argv[:1] == ["--rows"]:
+            try:
+                entries, machines, down = collect(with_remote=True)
+            except Exception as exc:  # the local herdr did not answer with a snapshot
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    sys.stderr.write(tr("rows_timeout", "%g" % LOCAL_TIMEOUT, config_path()) + "\n")
+                else:
+                    sys.stderr.write(tr("rows_failed", clean(str(exc))) + "\n")
+                return 1
+            sys.stdout.write(render(entries, machines, down=down))
+            return 0
+        return popup(self_cmd, demo=demo)
+    finally:
+        if demo:
+            shutil.rmtree(STATE_DIR, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
