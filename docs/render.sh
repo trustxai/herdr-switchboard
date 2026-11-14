@@ -12,21 +12,24 @@
 #
 # Needs python3 (3.9+), fzf 0.71+, tmux, Google Chrome or Chromium (or CHROME=/path), and
 # ImageMagick (`convert`). It does not need herdr, ssh or the network: Chrome's resolver
-# is pointed at nothing. It leaves nothing behind: the tmux server and its socket, Chrome's
-# profile and every intermediate file live in one temporary directory, removed on exit
-# whatever happens, and the demo is closed with Esc so it removes its own files.
+# is pointed at nothing. It leaves nothing behind: the tmux server and its socket, the demo's
+# run and state directories, Chrome's profile and every intermediate file live in one
+# temporary directory, removed on exit whatever happens, and the demo is closed with Esc and
+# waited for, so it removes its own files.
 #
 # Every child runs with an empty environment plus PATH, a throwaway HOME and a UTF-8
 # locale, so no personal configuration (a Switchboard config.toml, a tmux.conf, a Chrome
-# profile) can change what the images show. The saved machines are read only once, so the
-# sample timeline cannot change the list between two frames; each frame is otherwise
-# exactly what the popup draws, and the script checks the counts in its header.
+# profile) can change what the images show. The saved machines are read only once, and a
+# session that runs into the sample timeline's change on this machine is redone, so the list
+# cannot change between two frames; each frame is otherwise exactly what the popup draws, and
+# the script checks the counts in its header.
 set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT="$ROOT/docs/assets"
 COLS=144       # wide enough for the whole header line
-ROWS=44        # tall enough for every status and a terminal row above the preview
+HERO_ROWS=44   # every status and a terminal row above, a preview that fills the half below
+GIF_ROWS=34    # the animation's previews are shorter: no empty half screen in every frame
 FRAMES_TO=""
 if [ "${1:-}" = "--frames" ]; then
   [ -n "${2:-}" ] || { echo "usage: docs/render.sh [--frames DIR]" >&2; exit 2; }
@@ -56,7 +59,7 @@ case $(uname -s) in Darwin) LOCALE=en_US.UTF-8 ;; *) LOCALE=C.UTF-8 ;; esac
 # /tmp, not $TMPDIR: the tmux socket path must stay under the 104-byte limit of macOS.
 WORK=$(mktemp -d /tmp/switchboard-render.XXXXXX)
 SOCK="$WORK/tmux.sock"
-mkdir "$WORK/home" "$WORK/frames"
+mkdir "$WORK/home" "$WORK/frames" "$WORK/run"
 
 clean() {
   env -i PATH="$PATH" HOME="$WORK/home" TMPDIR="$WORK" TERM=xterm-256color \
@@ -130,16 +133,32 @@ EOF
 
 # A prompt line, then the demo, then nothing: the pane stays up for the last frame. The saved
 # machines are read once (the sample timeline changes one of them after 8 s); this machine
-# keeps its default 1 s refresh, which the popup needs to close cleanly, and its own change
-# comes after 16 s: a session that takes longer is retried (see attempt).
+# keeps its default 1 s refresh, and its own change comes after 16 s: a session that takes
+# longer is retried (see attempt). The popup's run directory goes inside $WORK too.
 DEMO_CMD="printf '\$ bin/switchboard --demo\\n'; \
-SWITCHBOARD_REMOTE_EVERY=3600 python3 '$ROOT/bin/switchboard' --demo; sleep 3600"
+SWITCHBOARD_REMOTE_EVERY=3600 SWITCHBOARD_RUN_ROOT='$WORK/run' python3 '$ROOT/bin/switchboard' --demo; \
+sleep 3600"
 
+# start_demo ROWS: a fresh demo in a terminal of COLS x ROWS.
+ROWS=""
 start_demo() {
-  if [ -S "$SOCK" ]; then
+  if [ -S "$SOCK" ] && [ "$ROWS" = "$1" ]; then
     tm respawn-pane -k -t sb "$DEMO_CMD"
   else
-    tm -f "$WORK/tmux.conf" new-session -d -s sb -x $COLS -y $ROWS "$DEMO_CMD"
+    if [ -S "$SOCK" ]; then
+      # The pane only holds `sleep` by now (the demo has exited). tmux does not remove a -S
+      # socket when it stops, so wait for the server and then remove the file.
+      tm kill-server
+      i=0
+      while tm has-session -t sb 2>/dev/null; do
+        i=$((i + 1))
+        [ $i -le 50 ] || die "the tmux server did not stop"
+        sleep 0.1
+      done
+      rm -f "$SOCK"
+    fi
+    ROWS=$1
+    tm -f "$WORK/tmux.conf" new-session -d -s sb -x $COLS -y "$ROWS" "$DEMO_CMD"
   fi
   # Complete once every machine has answered: the header no longer says "loading".
   settle "$COUNTS .*esc close"
@@ -173,18 +192,19 @@ attempt() {
   die "$1 failed three times"
 }
 
-# The hero: the whole list, with a blocked agent on another machine selected.
+# The hero: the whole list, with a blocked agent selected; its preview (an agent asking to
+# run a command) fills the lower half.
 hero() {
-  start_demo
-  select_row 'terraform-plan-staging'
-  settle 'Allow command\?'
+  start_demo $HERO_ROWS
+  select_row 'flaky-checkout-test'
+  settle 'Do you want to proceed\?'
   grab hero --list || return 1
   close_demo
 }
 
 # The animation: open, filter by machine, move so the preview changes, copy, Enter.
 animation() {
-  start_demo
+  start_demo $GIF_ROWS
   settle 'I reviewed the rate limiter'
   grab 1-open --list || return 1
   tm send-keys -t sb -l 'workstation'
@@ -225,8 +245,8 @@ fi
 
 # --- frames to pictures ---------------------------------------------------------------------
 
-shoot() {   # shoot NAME SCALE MARGIN
-  python3 -I "$ROOT/docs/ansi2html.py" "$WORK/frames/$1.ansi" --cols $COLS --rows $ROWS \
+shoot() {   # shoot NAME SCALE MARGIN ROWS
+  python3 -I "$ROOT/docs/ansi2html.py" "$WORK/frames/$1.ansi" --cols $COLS --rows "$4" \
     --title 'switchboard (demo data)' > "$WORK/frames/$1.html"
   clean "$CHROME" --headless=new --disable-gpu --hide-scrollbars --no-first-run \
     --no-default-browser-check --disable-extensions --disable-sync --disable-component-update \
@@ -240,11 +260,11 @@ shoot() {   # shoot NAME SCALE MARGIN
     -border "$3" -strip "$WORK/frames/$1.png"
 }
 
-shoot hero 2 40
+shoot hero 2 40 $HERO_ROWS
 convert "$WORK/frames/hero.png" -dither None -colors 256 -define png:compression-level=9 \
-  PNG8:"$WORK/frames/hero.small.png"
+  -strip PNG8:"$WORK/frames/hero.small.png"
 # The GIF at 1.5x: sharper than 1x once GitHub scales it down, and still well under 1 MB.
-for f in 1-open 2-filter 3-move 4-copy 5-enter; do shoot "$f" 1.5 30; done
+for f in 1-open 2-filter 3-move 4-copy 5-enter; do shoot "$f" 1.5 30 $GIF_ROWS; done
 sizes=$(cd "$WORK/frames" && identify -format '%wx%h\n' 1-open.png 2-filter.png 3-move.png \
   4-copy.png 5-enter.png | sort -u | wc -l)
 [ "$sizes" -eq 1 ] || die "the GIF frames do not all have the same size"
