@@ -135,8 +135,9 @@ What it has to get right, and how it fails otherwise:
    Esc, a preview read's timeout, and the popup told to leave (SIGTERM, SIGHUP) while --copy or
    --select waits, whether the popup leads its terminal's session or not: the command and its
    read end, the terminal comes back, and it is quick.
-57. A read that times out leaves nothing holding its pipe, in each mode; end_fzf's last step
-   ends everything below fzf and nothing else, within its bound, and puts the terminal back.
+57. A read that times out leaves nothing holding its pipe, in each mode; a preview started once
+   the popup is closing reads nothing; end_fzf's last step ends everything below fzf and nothing
+   else, within its bound, and puts the terminal back.
 58. A close never waits for a read that can hang: with a machine whose snapshot read hangs, Esc
    and Enter on a local row act at once, and a signal during a close never leaves the run
    directory behind. watch() does not wait for its remote reads, and once close_state() ran
@@ -4000,6 +4001,29 @@ for mode, orphan in (("--preview", False), ("--copy", True), ("--select", True))
     found, alive = holder_after_timeout(mode, orphan)
     check("%s-read-timeout-ends-what-holds-its-pipe" % mode[2:], found and not alive, (found, alive))
 
+# A preview fzf starts once the popup has begun ending it (a redraw after the command it waited
+# for, say) reads nothing: end_fzf found what was below fzf before it started, and fzf need not
+# kill it on the way out. Without the popup's mark the same preview reads as usual.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    run57 = private_tmp(d, "run")
+    with open(os.path.join(d, "machines.json"), "w") as f:
+        json.dump([{"id": "m1", "label": "box1", "enabled": True, "target": "box1-host"}], f)
+    ssh57 = executable(os.path.join(d, "ssh"), '#!/bin/sh\ncase "$*" in\n'
+                       '  *"pane read"*) echo read >> "%s/reads"; echo screen ;;\n  *) exit 1 ;;\nesac\n' % d)
+    herdr57 = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n'
+                         '  "machine list --json") cat "%s/machines.json" ;;\n  *) exit 1 ;;\nesac\n' % d)
+    env57 = dict(os.environ, HERDR_BIN_PATH=str(herdr57), SWITCHBOARD_SSH=str(ssh57), SWITCHBOARD_RUN_DIR=run57,
+                 HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
+    reads57 = []
+    for closing in (False, True):
+        if closing:
+            open(os.path.join(run57, "closing"), "w").close()
+        subprocess.run([sys.executable, "-B", str(TOOL), "--preview", "m1|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, env=env57)
+        reads57.append(len(open(os.path.join(d, "reads")).read().split()) if os.path.exists(os.path.join(d, "reads"))
+                       else 0)
+    check("preview-reads-nothing-once-the-popup-is-closing", reads57 == [1, 1], reads57)
+
 # end_fzf's last step, on a stand-in for fzf that ignores SIGTERM, as do its child and
 # grandchild. The terminal is a pty: the stand-in puts it in raw mode on the alternate screen.
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
@@ -4058,12 +4082,16 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     import struct as _st57
     import termios as _tm57b
     ready, popup_pid, popup_rc = (os.path.join(d, n) for n in ("ready", "popup.pid", "popup.rc"))
+    seen = os.path.join(d, "closing-seen")  # what the stand-in finds when the popup's SIGTERM comes
     stuck_fzf = executable(os.path.join(d, "fzf"), "#!%s\nimport os, signal, sys, time, tty\n"
                            "if '--version' in sys.argv:\n    print('0.74.2')\n    sys.exit(0)\n"
-                           "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                           "def noted(*_):\n"
+                           "    run = os.environ.get('SWITCHBOARD_RUN_DIR', '')\n"
+                           "    open(%r, 'a').write('%%s\\n' %% os.path.exists(os.path.join(run, 'closing')))\n"
+                           "signal.signal(signal.SIGTERM, noted)\n"
                            "fd = os.open('/dev/tty', os.O_RDWR)\ntty.setraw(fd)\n"
                            "os.write(fd, b'\\x1b[?1049h\\x1b[?1000h')\nopen(%r, 'w').close()\ntime.sleep(60)\n"
-                           % (sys.executable, ready))
+                           % (sys.executable, seen, ready))
     with open(os.path.join(d, "local.json"), "w") as f:
         json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="here")])}}, f)
     fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") echo "[]" ;;\n'
@@ -4100,6 +4128,9 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("popup-puts-the-terminal-back-when-fzf-must-be-killed", stuck and rc == 128 + 15
           and b"\x1b[?1049l" in shown and b"\x1b[?1000l" in shown and bool(lflag & _tm57b.ECHO)
           and bool(lflag & _tm57b.ICANON), (stuck, rc, round(took, 1), shown[-40:], lflag))
+    # The run directory says the popup is closing before fzf gets its first SIGTERM.
+    check("popup-marks-closing-before-ending-fzf", os.path.exists(seen) and open(seen).read().split()[:1] == ["True"],
+          open(seen).read() if os.path.exists(seen) else None)
     finish(pid, fd, 0)
 
 # 58. A close never waits for a read that can hang, and a signal during a close never leaves

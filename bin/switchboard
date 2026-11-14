@@ -1886,7 +1886,7 @@ def trim_footer(text, lookback=14):
 
 def preview(row_id):
     target = parse_id(row_id)
-    if target is None:
+    if target is None or popup_closing():
         return 0
     lines = os.environ.get("FZF_PREVIEW_LINES", "40")
     args = ["pane", "read", target["pane"], "--source", "recent", "--lines",
@@ -2343,6 +2343,35 @@ def write_new(dir_fd, name, text):
         return True
     except OSError:
         return False
+
+
+CLOSING = "closing"  # created in the run directory when the popup starts ending its fzf
+
+
+def mark_closing(run_dir):
+    """The popup is ending its fzf: see popup_closing()."""
+    fd = open_private_dir(run_dir)
+    if fd is not None:
+        try:
+            append_line(fd, CLOSING, "")
+        finally:
+            os.close(fd)
+
+
+def popup_closing():
+    """True in a command fzf starts once the popup has begun ending fzf. end_fzf signals what
+    is below fzf when it looks; a preview fzf starts after that is found by nothing, and fzf
+    need not kill it on its way out. So such a preview reads nothing."""
+    fd = open_private_dir(os.environ.get("SWITCHBOARD_RUN_DIR"))
+    if fd is None:
+        return False
+    try:
+        os.stat(CLOSING, dir_fd=fd, follow_symlinks=False)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def append_line(dir_fd, name, line):
@@ -3090,7 +3119,9 @@ def popup(self_cmd, demo=False):
         if proc is not None and proc.poll() is None:
             # Leaving on a signal: fzf goes too. Nothing else is sure to end it: the kernel
             # hangs it up only when this process leads the terminal's session, and macOS
-            # first waits for the terminal's output to drain.
+            # first waits for the terminal's output to drain. From here on, a preview fzf
+            # starts reads nothing (popup_closing).
+            mark_closing(tmp)
             end_fzf(proc, terminal)
         if terminal is not None:
             os.close(terminal[0])

@@ -127,7 +127,8 @@ because a Unix socket path is limited to 104 bytes on macOS; the tests move it w
   It is a Unix socket in a directory only your user can open, never a TCP port: a socket other
   local users could reach would let them drive fzf, and that is in scope.
 - `rows`, the list fzf reloads;
-- `acks` and `focus-<pid>-<ms>` files, for Enter on another machine's row (below).
+- `acks` and `focus-<pid>-<ms>` files, for Enter on another machine's row (below);
+- `closing`, an empty file the popup creates when it starts ending fzf on a signal (below).
 
 The parts of Switchboard that use the directory after the popup has started open it once, check
 that it is a real directory (not a symlink) owned by you with no access for group or others, and
@@ -154,10 +155,12 @@ and fzf get SIGKILL. Whenever fzf did not leave on the first SIGTERM, whether it
 second step or was killed, the popup then also puts the terminal back itself (the settings it
 saved before starting fzf, and the sequences that leave the alternate screen and turn the mouse
 off). Ending fzf takes at most ten seconds: three waits of two seconds and two `ps` runs of up
-to two seconds each. Only processes below the popup's fzf at that moment are signalled; one that
-has already left that tree (its parent died) is not found, and a pid that ends and is reused
-between the `ps` and the signal is the one exception. A second SIGHUP or SIGTERM during that
-cleanup is ignored, so it finishes.
+to two seconds each. Before its first SIGTERM to fzf the popup creates `closing` in the run
+directory, and a preview that fzf starts from then on reads nothing: the popup's search for what
+is below fzf may already be over, and fzf need not kill it on its way out. Only processes below
+the popup's fzf at that moment are signalled; one that has already left that tree (its parent
+died) is not found, and a pid that ends and is reused between the `ps` and the signal is the one
+exception. A second SIGHUP or SIGTERM during that cleanup is ignored, so it finishes.
 
 Which children get a session of their own. Every helper that goes through `run_child` does,
 with its own process group, killed whole when its timeout passes and when the process that
