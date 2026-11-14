@@ -2928,12 +2928,13 @@ rc, took, left, _, _ = close_popup(1, True)
 # ...without waiting for the hung local read (it used to wait 2 s for it; now about 0.2 s).
 check("close-during-a-slow-snapshot-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 1.0,
       (rc, took, left))
-# A second signal during the cleanup is ignored: the first one's exit code and nothing left.
-# fzf does not outlive the popup either (the popup ends it, and here the kernel's hang-up of
-# a session leader's terminal would too).
+# SIGTERM while a refresh hangs: the first signal's exit code and nothing left. (The SIGHUP
+# sent 0.4 s later comes after the exit: the close waits for no read. A second signal while
+# the close is under way is block 56's two_signals.) fzf does not outlive the popup either
+# (the popup ends it, and here the kernel's hang-up of a session leader's terminal would too).
 rc, took, left, lingering, _ = close_popup(1, True, signals=True)
-check("second-signal-does-not-cut-the-cleanup", rc == 128 + 15 and left == [] and took is not None and took < 5,
-      (rc, took, left))
+check("signal-during-a-slow-snapshot-removes-the-run-dir", rc == 128 + 15 and left == [] and took is not None
+      and took < 5, (rc, took, left))
 check("signal-leaves-no-fzf", not lingering)
 # The same with a parent leading the terminal's session: no hang-up from the kernel, so only
 # the popup's own kill ends fzf (on macOS the kernel's hang-up could not be counted on).
@@ -3952,9 +3953,11 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
             os.kill(pid, _signal.SIGHUP)
         except OSError:
             pass
-    r = popup_with_hung_reads(two_signals, leader=False, snapshot_hangs=True)
-    check("second-signal-during-the-close-is-ignored", r["rc"] == 128 + 15 and not r["left"] and not r["run_dir_left"]
-          and all(r["terminal"].values()), (r["rc"], r["left"], r["run_dir_left"], r["terminal"], r["left_detail"]))
+    for leader in (False, True):
+        r = popup_with_hung_reads(two_signals, leader=leader, snapshot_hangs=True)
+        check("second-signal-during-the-close-is-ignored" + ("-leading" if leader else ""),
+              r["rc"] == 128 + 15 and not r["left"] and not r["run_dir_left"] and all(r["terminal"].values()),
+              (r["rc"], r["left"], r["run_dir_left"], r["terminal"], r["left_detail"]))
     # A read that times out inside a preview is killed then, with the popup still open and the
     # cursor where it was.
     timed_out = []
@@ -4291,9 +4294,12 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
     rc, took, focus_at, left, alive = close_with_hung_remote("enter")
     check("enter-focuses-without-waiting-for-a-hung-read", rc == 0 and focus_at is not None and focus_at < CLOSE_FAST
           and not left, (rc, focus_at, left))
+    # The review's case: Esc, then SIGHUP 0.5 s later. At cd73858 the close still waited for the
+    # hung read, the SIGHUP landed in that wait and the run directory was left. Now the close
+    # is over before it (about 0.1 s). A signal during a close: the busy close below.
     for leader in (True, False):
         rc, took, _, left, alive = close_with_hung_remote("esc+hup", leader)
-        check("esc-then-sighup-leaves-no-run-dir-%s" % ("leading" if leader else "not-leading"),
+        check("esc-then-sighup-half-a-second-later-leaves-no-run-dir-%s" % ("leading" if leader else "not-leading"),
               rc in (0, 128 + 1) and not left and not alive, (rc, took, left, alive))
 
 
@@ -4408,12 +4414,13 @@ check("demo-closes-its-state-before-removing-it", "            close_state()  # 
 # 59. No ps line the program matches is cut: ps cuts at $COLUMNS (fzf sets it for its
 # commands, and child_env() passes it on). With COLUMNS=20, a herdr remote-client-bridge and a
 # herdr window on a terminal, both started from a long path, are still found. A `ps` wrapper
-# first on PATH keeps only these two (this machine may run a real herdr); a fake address
-# stands for the ssh connection. And every `ps` the program runs asks for whole lines.
+# first on PATH keeps only these two (this machine may run a real herdr, or another run of
+# this suite); a fake address stands for the ssh connection. And every `ps` the program runs
+# asks for whole lines.
 block("59. ps lines are never cut")
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
-    mark = "colmark59"
-    long_dir = os.path.join(d, mark, "a-directory-name-long-enough-to-be-cut")
+    mark = os.path.basename(d)  # unique to this run: other suites may run at the same time
+    long_dir = os.path.join(d, "colmark59", "a-directory-name-long-enough-to-be-cut")
     os.makedirs(long_dir)
     os.symlink("/bin/sh", os.path.join(long_dir, "herdr"))
     real_ps = shutil.which("ps")
