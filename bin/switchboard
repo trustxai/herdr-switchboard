@@ -3182,9 +3182,10 @@ def popup(self_cmd, demo=False):
             if held:
                 writes.release()
             os.close(run_fd)
-    if not demo:
-        release_signals()  # the run directory is gone: a signal held meanwhile acts now
-    # (In --demo main acts on it, once the temporary state directory is gone too.)
+    # The run directory is gone: a signal held meanwhile acts now, and from here on one acts at
+    # once (the message below waits for Enter). In --demo, main removes the temporary state
+    # directory on the way out, whichever way that is.
+    release_signals()
     if proc.returncode == 2:
         # fzf refused its command line and drew nothing: say why instead of vanishing.
         reason = fzf_rejects(fzf, [a for a in argv[1:] if not a.startswith("--listen")]) or "exit 2"
@@ -3230,13 +3231,24 @@ _HOLDING = [False]  # a close is under way: hold_signals() .. release_signals()
 _HELD = []  # the SIGHUP or SIGTERM that arrived meanwhile
 
 
+def remove_demo_state():
+    """--demo's temporary state directory goes on the way out: from main's finally block, and
+    again at exit. A SIGHUP or SIGTERM handled in that block before hold_signals() raises there
+    and cuts the removal short; but it has set both signals to be ignored, so the second try,
+    at exit, runs whole. A refresh that outlived the popup writes nothing there once
+    close_state() ran."""
+    close_state()
+    shutil.rmtree(STATE_DIR, ignore_errors=True)
+
+
 def _exit_on_signal(signum, frame):
     """The first SIGHUP or SIGTERM exits through the finally blocks. Any later one is ignored:
     raised again inside a finally block, it would cut the cleanup short (a window that closes
     sends SIGHUP right after SIGTERM, for example). For the same reason, during a close that
-    already started (hold_signals(), once fzf has returned) a signal is only noted, and
-    release_signals() acts on it: the popup's call once its run directory is gone, or in
-    --demo main's call, once the temporary state directory is gone too."""
+    already started (hold_signals(), once fzf has returned) a signal is only noted, and the
+    popup's release_signals() acts on it once the run directory is gone; from then on a signal
+    acts at once again. In --demo the temporary state directory is removed on the way out,
+    held the same way in main's finally block, and again at exit (remove_demo_state)."""
     if _HOLDING[0]:
         _HELD.append(signum)
         return
@@ -3279,6 +3291,7 @@ def main(argv):
         DEMO = Demo()
         # Nothing of the demo is written outside a temporary directory.
         STATE_DIR = tempfile.mkdtemp(prefix="switchboard-demo-")
+        atexit.register(remove_demo_state)
     self_cmd = " ".join(shlex.quote(x) for x in (sys.executable, os.path.abspath(__file__)))
     if demo:
         self_cmd += " --demo"
@@ -3316,8 +3329,7 @@ def main(argv):
     finally:
         if demo:
             hold_signals()
-            close_state()  # a refresh that outlived the popup writes nothing from here on
-            shutil.rmtree(STATE_DIR, ignore_errors=True)
+            remove_demo_state()
             release_signals()
 
 

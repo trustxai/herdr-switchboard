@@ -148,8 +148,10 @@ the removal, for at most half a second, while the name is still that same direct
 open, so a new directory under the same name cannot be taken for it); nothing in Switchboard
 writes there for that long, and once the directory is gone nothing can be created in it any
 more. A SIGHUP or SIGTERM that arrives once the close has started waits until the directory is
-gone (in `--demo`, until its temporary state directory is gone too), then ends the popup with
-its usual status.
+gone, then ends the popup with its usual status; from then on one ends it at once, also while a
+message waits for Enter. In `--demo` the temporary state directory is removed on the way out,
+whichever way that is: a signal that cuts that removal short has already turned SIGHUP and
+SIGTERM off, and the removal runs again, whole, at exit.
 
 The popup also closes this way when its window or session goes away: SIGHUP and SIGTERM exit
 through the same cleanup, which ends the popup's own fzf and removes the run directory (and, for

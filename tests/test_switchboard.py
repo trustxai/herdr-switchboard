@@ -147,6 +147,9 @@ What it has to get right, and how it fails otherwise:
 60. The run directory goes also when another process (the focus worker) writes into it during
    the removal, and a directory made under the same name afterwards is left alone. Once a close
    by signal starts, no rows are written and fzf is asked for no reload.
+61. --demo: a SIGTERM or SIGHUP at the message that waits for Enter ends the popup at once, and
+   the temporary state directory goes on every way out, also when a signal cuts main's finally
+   block short.
 
     python3 tests/test_switchboard.py
 """
@@ -4178,20 +4181,20 @@ block("58. a close waits for no read")
 CLOSE_FAST = 1.0  # s: a close used to take at least 2 s here (the wait for the read); now ~0.2 s
 
 
-def popup_in_pty(env, leader=True):
-    """Start the popup in a terminal with `env` added. leader=False: a parent leads the
-    terminal's session and outlives the popup. Returns (pid of the pty child, fd, d) where d
-    holds popup.pid and popup.rc (leader=False) once known."""
+def popup_in_pty(env, leader=True, args=()):
+    """Start the popup (with `args`) in a terminal with `env` added. leader=False: a parent
+    leads the terminal's session and outlives the popup. Returns (pid of the pty child, fd, d)
+    where d holds popup.pid and popup.rc (leader=False) once known."""
     d = tempfile.mkdtemp(prefix="pty58-", dir=_tmp_root)
     popup_pid, popup_rc = os.path.join(d, "popup.pid"), os.path.join(d, "popup.rc")
     pid, fd = _pty.fork()
     if pid == 0:
         os.environ.update(env)
         if leader:
-            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)] + list(args))
         inner = os.fork()
         if inner == 0:
-            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)] + list(args))
         with open(popup_pid + ".tmp", "w") as f:
             f.write(str(inner))
         os.rename(popup_pid + ".tmp", popup_pid)
@@ -4408,8 +4411,8 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         release58.set()
         sb._STATE_CLOSED.discard(state58)
         sb.STATE_DIR = saved_state
-check("demo-closes-its-state-before-removing-it", "            close_state()  # a refresh that outlived the popup "
-      "writes nothing from here on\n            shutil.rmtree(STATE_DIR, ignore_errors=True)" in SOURCE)
+check("demo-closes-its-state-before-removing-it", "    close_state()\n    shutil.rmtree(STATE_DIR, ignore_errors=True)"
+      in SOURCE and "            hold_signals()\n            remove_demo_state()\n" in SOURCE)
 
 # 59. No ps line the program matches is cut: ps cuts at $COLUMNS (fzf sets it for its
 # commands, and child_env() passes it on). With COLUMNS=20, a herdr remote-client-bridge and a
@@ -4575,10 +4578,74 @@ for leader in (True, False):
     check("no-reload-asked-of-fzf-once-the-close-starts-%s" % ("leading" if leader else "not-leading"),
           not late and rc == 128 + 15 and not left, (len(late), late[:3], rc, left))
 
-# In --demo the signal held during the close is acted on by main, after the temporary state
-# directory is gone too: popup() leaves it to main.
-check("demo-signals-released-after-the-state-dir", "    if not demo:\n        release_signals()" in SOURCE
-      and "            shutil.rmtree(STATE_DIR, ignore_errors=True)\n            release_signals()" in SOURCE)
+# In --demo, main removes the temporary state directory holding signals, and again at exit:
+# block 61 checks both ways out. (The popup itself releases them once the run directory is gone.)
+check("demo-state-dir-removed-in-main-and-at-exit", "        atexit.register(remove_demo_state)" in SOURCE
+      and "            hold_signals()\n            remove_demo_state()\n            release_signals()" in SOURCE)
+
+# 61. --demo: a signal at the message that waits for Enter ends the popup at once, and the
+# temporary state directory goes on every way out. fzf refuses to start when its socket path
+# is too long (a run root of 100 characters more), the popup says why and waits for Enter: a
+# SIGTERM or SIGHUP there exits with its status within a second, leading the session or not,
+# and leaves nothing in the run root or in TMPDIR (where --demo keeps its state). It used to
+# be held until Enter. And a signal handled in main's finally block before it holds signals
+# (simulated: hold_signals raises the exit once) still leaves no state directory: the
+# removal runs again at exit.
+block("61. --demo: a signal at the prompt, and the state directory on every way out")
+PROMPT_FAST = 1.0  # s: it used to wait for Enter; now about 0.02 s
+
+
+def signal_at_the_prompt(sig, leader):
+    """(rc, seconds from the signal to the exit, what is left in the run root, in TMPDIR)."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = os.path.join(d, "r" * 100)
+        os.makedirs(root, 0o700)
+        tmpdir = private_tmp(d, "tmp")
+        env = dict(TERM="xterm-256color", SWITCHBOARD_RUN_ROOT=root, TMPDIR=tmpdir, HERDR_BIN_PATH="/bin/false")
+        pid, fd, pd = popup_in_pty(env, leader, args=("--demo",))
+        read_until(fd, lambda b: b"Enter" in b and os.path.exists(os.path.join(pd, "popup.pid")), 15)
+        prompt = bool(os.listdir(tmpdir))  # the state directory exists while the prompt waits
+        target = int(open(os.path.join(pd, "popup.pid")).read())
+        t0 = _time.time()
+        try:
+            os.kill(target, sig)
+        except ProcessLookupError:
+            pass  # it had already left: the checks below say so
+        rc, t_exit = popup_exit(pid, fd, pd, leader, 5)
+        took = (t_exit - t0) if t_exit else None
+        left = (sorted(os.listdir(root)), sorted(os.listdir(tmpdir)))
+        if rc is None:
+            os.write(fd, b"\r")  # the old behaviour: only Enter ends it
+            popup_exit(pid, fd, pd, leader, 5)
+        finish(pid, fd, 0)
+        shutil.rmtree(pd, ignore_errors=True)
+        return prompt, rc, took, left
+
+
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    for sig, leader in ((_signal.SIGTERM, True), (_signal.SIGTERM, False), (_signal.SIGHUP, False)):
+        prompt, rc, took, left = signal_at_the_prompt(sig, leader)
+        check("demo-prompt-%s-%s-ends-at-once" % ("sigterm" if sig == _signal.SIGTERM else "sighup",
+                                                  "leading" if leader else "not-leading"),
+              prompt and rc == 128 + sig and took is not None and took < PROMPT_FAST and left == ([], []),
+              (prompt, rc, took, left))
+
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    tmpdir = private_tmp(d, "tmp")
+    code61 = ("import importlib.machinery, importlib.util, signal, sys\n"
+              "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+              "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+              "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+              "def cut_short():\n"
+              "    for s in (signal.SIGHUP, signal.SIGTERM):\n"
+              "        signal.signal(s, signal.SIG_IGN)\n"
+              "    raise SystemExit(128 + signal.SIGTERM)\n"
+              "sb.hold_signals = cut_short\n"
+              "sys.exit(sb.main(['--demo', '--rows']))\n")
+    r61 = subprocess.run([sys.executable, "-c", code61, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, timeout=30, env=dict(os.environ, TMPDIR=tmpdir))
+    check("demo-state-dir-goes-when-a-signal-cuts-main-short", r61.returncode == 128 + 15 and os.listdir(tmpdir) == [],
+          (r61.returncode, os.listdir(tmpdir)))
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
