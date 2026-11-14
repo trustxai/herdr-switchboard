@@ -2418,22 +2418,39 @@ def jump(label, kind, pane, tab, query, rename, old_label, keys=None, wait=0.15,
     """Runs on the Mac of the window, while the popup closes.
 
     tty and osa come ready from --jump-server: the window's tty and an osascript already
-    started and waiting for the script on stdin."""
+    started and waiting for the script on stdin.
+
+    What it would type is checked before anything changes. With keys, a query or a tty
+    outside their closed sets, or no window to type into, nothing is renamed or typed and
+    only the API focus goes out (the popup sent one already: the pane is ready on its
+    machine). A rename that had to be undone after a refused script would leave the pane
+    with the temporary name."""
+    keys = keys or JUMP_KEYS
+    refused = not typeable(query, keys)
+    tty = None if refused else (tty or local_tui_tty())
+    script = None
+    if tty:
+        try:
+            script = ghostty_keys_script(tty, query, keys)
+        except ValueError:  # the tty
+            refused = True
     time.sleep(wait)
     api = [] if label == local_label() else ["--machine", label]
     focus = api + (["agent", "focus", pane] if kind == "a" else ["tab", "focus", tab])
+    if script is None:
+        if osa is not None:
+            osa.kill()
+        run_out([HERDR] + focus, timeout=10)
+        return 2 if refused else 0
     if rename:
         run_out([HERDR] + api + ["pane", "rename", pane, query], timeout=10)
         time.sleep(0.8)  # let the new name reach the window
-    tty = tty or local_tui_tty()
-    if tty:
-        script = ghostty_keys_script(tty, query, keys)
-        if osa is not None:
-            osa.communicate(script.encode("utf-8"), timeout=10)
-        else:
-            subprocess.run([OSASCRIPT, "-e", script], stdin=subprocess.DEVNULL,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        time.sleep(0.6)
+    if osa is not None:
+        osa.communicate(script.encode("utf-8"), timeout=10)
+    else:
+        subprocess.run([OSASCRIPT, "-e", script], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    time.sleep(0.6)
     if rename:
         # The label goes as it is: herdr takes a label that starts with "-" as text, and a
         # "--" in front would become part of the label (checked against herdr 0.9.5).
@@ -2471,10 +2488,12 @@ def jump_server(stdin=None):
         args = json.loads(line) if line.strip() else None
     except ValueError:
         args = None
-    if not (isinstance(args, list) and len(args) == 9 and args[0] == "--jump"):
+    if not (isinstance(args, list) and len(args) == 9 and args[0] == "--jump"
+            and all(isinstance(a, str) for a in args)):
         if osa is not None:
             osa.kill()
         return 0
+    # jump() checks the query and the keys before it renames or types anything.
     return jump(args[1], args[2], args[3], args[4], args[5], args[6] == "1", args[7], keys=args[8],
                 wait=0.05, tty=tty, osa=osa)
 

@@ -1926,8 +1926,18 @@ sb.run_out = lambda argv, timeout=5: calls.append(argv[1:]) or ""
 sb.local_tui_tty = lambda ps_text=None: None
 sb.time.sleep = lambda s: None
 sb.local_label = lambda: "mac1"
+
+
+class _QuietOsa:
+    def communicate(self, data, timeout=None):
+        pass
+
+    def kill(self):
+        pass
+
+
 try:
-    sb.jump("box1", "a", "w1:p1", "w1:t1", "sbjabc", True, "-logs")
+    sb.jump("box1", "a", "w1:p1", "w1:t1", "sbjabc", True, "-logs", tty="/dev/ttys000", osa=_QuietOsa())
     # herdr 0.9.5 keeps a "--" as part of the label, so a dash-leading label goes as it is.
     check("jump-dash-label-as-is", ["--machine", "box1", "pane", "rename", "w1:p1", "-logs"] in calls, calls)
 finally:
@@ -2775,6 +2785,78 @@ for _name in ("0123abcd-ef.jsonl", "0123abcd-ef\n.jsonl"):
 check("transcript-id-whole", sb.transcript_path("0123abcd-ef\n") is None
       and sb.transcript_path("0123abcd-ef") == os.path.join(_proj, "0123abcd-ef.jsonl"), sb.transcript_path("0123abcd-ef\n"))
 shutil.rmtree(os.path.join(os.environ["HOME"], ".agent"))
+
+# 44. The jump checks what it would type before it renames anything.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    calls = os.path.join(d, "calls")
+    fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\necho "$*" >> "%s"\n' % calls)
+
+    def took_calls():
+        if not os.path.exists(calls):
+            return []
+        lines = open(calls).read().splitlines()
+        os.remove(calls)
+        return lines
+
+    class Osa44:
+        def __init__(self):
+            self.killed, self.script = False, None
+
+        def kill(self):
+            self.killed = True
+
+        def communicate(self, data, timeout=None):
+            self.script = data
+
+    saved_herdr = sb.HERDR
+    sb.HERDR = str(fh)
+    try:
+        good = dict(label="box1", kind="a", pane="w1:p1", tab="w1:t1", query="sbjabc", rename=True, old_label="logs",
+                    keys="\\x02g/", wait=0, tty="/dev/ttys000")
+        for what, bad in (("keys", dict(keys="\\x02g/\n")), ("query", dict(query="sbjabc\n")),
+                          ("tty", dict(tty="/dev/ttys000\n")), ("keys-type", dict(keys=7))):
+            osa = Osa44()
+            rc = sb.jump(osa=osa, **dict(good, **bad))
+            lines = took_calls()
+            check("jump-refused-%s-renames-nothing" % what, rc == 2 and lines == ["--machine box1 agent focus w1:p1"]
+                  and osa.killed and osa.script is None, (rc, lines))
+        osa = Osa44()
+        rc = sb.jump(osa=osa, **good)
+        lines = took_calls()
+        check("jump-good-renames-types-restores", rc == 0 and lines == [
+            "--machine box1 pane rename w1:p1 sbjabc", "--machine box1 pane rename w1:p1 logs",
+            "--machine box1 agent focus w1:p1"] and osa.script and b"sbjabc" in osa.script, (rc, lines))
+        # Through --jump-server, a line with a refused query.
+        orig44 = (sb.local_tui_tty, sb.subprocess.Popen)
+        osa = Osa44()
+        sb.local_tui_tty = lambda ps_text=None: "/dev/ttys000"
+        sb.subprocess.Popen = lambda argv, **kw: osa if argv[0] == sb.OSASCRIPT else orig44[1](argv, **kw)
+        try:
+            rc = sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", "sbjabc\n", "1", "logs",
+                                                         "\\x02g/"]) + "\n"))
+        finally:
+            sb.local_tui_tty, sb.subprocess.Popen = orig44
+        lines = took_calls()
+        check("jump-server-refused-renames-nothing", rc == 2 and osa.killed and not any("rename" in l for l in lines),
+              (rc, lines))
+        osa = Osa44()
+        sb.local_tui_tty = lambda ps_text=None: "/dev/ttys000"
+        sb.subprocess.Popen = lambda argv, **kw: osa if argv[0] == sb.OSASCRIPT else orig44[1](argv, **kw)
+        try:
+            sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", 5, "1", "logs", "\\x02g/"])
+                                        + "\n"))
+        finally:
+            sb.local_tui_tty, sb.subprocess.Popen = orig44
+        check("jump-server-non-text-argument", osa.killed and took_calls() == [])
+    finally:
+        sb.HERDR = saved_herdr
+    # Through main's --jump, in a process of its own.
+    r = subprocess.run([sys.executable, str(TOOL), "--jump", "box1", "a", "w1:p1", "w1:t1", "sbjabc", "1", "logs", "x/"],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+                       env=dict(os.environ, HERDR_BIN_PATH=str(fh)), timeout=30)
+    lines = took_calls()
+    check("jump-main-refused-renames-nothing", r.returncode == 2 and lines == ["--machine box1 agent focus w1:p1"]
+          and "Traceback" not in r.stderr, (r.returncode, lines, r.stderr[-200:]))
 
 # 45. The other machines' rows show up even when fzf opens --listen late (they answered
 # before it listened). The demo, behind an fzf that starts listening 0.3 s late.
