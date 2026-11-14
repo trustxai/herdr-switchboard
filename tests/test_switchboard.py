@@ -193,6 +193,93 @@ def check(name, cond, detail=""):
         FAILS.append("%s %s" % (name, detail))
 
 
+# A stuck test must fail, and say where, well inside CI's job timeout. Each block announces
+# itself on stderr and gets BLOCK_LIMIT seconds; past that, faulthandler prints the stack of
+# every thread (file, line, function: never a variable, so never the environment) and ends
+# the process. stdout is block-buffered in CI, so nothing else would show where it stopped.
+import faulthandler as _faulthandler
+import select as _sel
+import signal as _signal
+import time as _time
+
+BLOCK_LIMIT = 120.0
+_T0 = _time.time()
+_faulthandler.enable()
+
+
+def block(name):
+    sys.stderr.write("[%6.1f s] %s\n" % (_time.time() - _T0, name))
+    sys.stderr.flush()
+    _faulthandler.dump_traceback_later(BLOCK_LIMIT, exit=True)
+
+
+block("setup")
+
+
+def finish(pid, fd, timeout=10.0):
+    """Wait for a child started with pty.fork, without ever blocking: returns its exit code,
+    or None when it had to be killed.
+
+    The terminal is read the whole time. An exiting session leader waits for its terminal's
+    output to drain on macOS, and a program writing to a full terminal blocks: a wait that
+    stops reading can wait forever. Past `timeout` the child's whole process group is
+    killed (fzf included) and reaped within 5 s more. Whatever is left of the group after
+    it exits is killed too, and fd is closed. fd may be None when the terminal is closed
+    already."""
+    end, killed, status = _time.time() + timeout, False, None
+    while True:
+        try:
+            done, st = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            done, st = pid, 0
+        if done:
+            status = st
+            break
+        if _time.time() > end:
+            if killed:
+                break  # not reaped within 5 s of SIGKILL: give up rather than block
+            for kill in (lambda: os.killpg(pid, _signal.SIGKILL), lambda: os.kill(pid, _signal.SIGKILL)):
+                try:
+                    kill()
+                except OSError:
+                    pass
+            killed, end = True, _time.time() + 5
+        try:
+            r, _, _ = _sel.select([fd], [], [], 0.05) if fd is not None else ([], [], [])
+            if fd is None or (r and not os.read(fd, 65536)):
+                _time.sleep(0.05)
+        except OSError:
+            _time.sleep(0.05)
+    try:
+        os.killpg(pid, _signal.SIGKILL)  # what the child left in its group (an orphaned fzf)
+    except OSError:
+        pass
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    if killed or status is None:
+        return None
+    return os.waitstatus_to_exitcode(status)
+
+
+def read_until(fd, pred, timeout):
+    """Read fd into a buffer until pred(buffer) or timeout; returns the buffer. Never blocks."""
+    buf, end = b"", _time.time() + timeout
+    while _time.time() < end and not pred(buf):
+        try:
+            r, _, _ = _sel.select([fd], [], [], 0.05)
+            if r:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                buf += chunk
+        except OSError:
+            break
+    return buf
+
+
 def executable(path, text):
     path = pathlib.Path(path)
     path.write_text(text)
@@ -223,6 +310,7 @@ def order(entries):
 
 
 # 1. Priority.
+block('1. Priority')
 s = snap(
     panes=[pane(p) for p in ("idle", "unk", "blk", "done", "wrk", "sh", "idle2")],
     agents=[agent("idle", "idle", 10), agent("unk", "unknown", 99), agent("blk", "blocked", 1),
@@ -237,6 +325,7 @@ check("unknown-status-is-unknown", weird[0]["status"] == "unknown", weird[0]["st
 
 # 2. No history: local before remote with the same status; a remote blocked still beats a
 # local done.
+block('2. No history: local before remote with the same status; a remote blocked')
 local = sb.entries_from(snap([pane("L")], [agent("L", "done", 1)]))
 remote = sb.entries_from(snap([pane("R"), pane("RB")], [agent("R", "done", 999), agent("RB", "blocked", 1)]),
                          "m1", "box1", 1)
@@ -248,6 +337,7 @@ got = order(term + runk)
 check("local-terminal-after-remote-agent", got == ["RU", "T"], got)
 
 # 3. Actions.
+block('3. Actions')
 labels = {"m1": "box1"}
 check("enter-agent", sb.action_for(sb.make_id("", "a", "w1:p2", "w1:t1"), labels) == ["agent", "focus", "w1:p2"])
 check("enter-terminal", sb.action_for(sb.make_id("", "t", "w1:p3", "w1:t4"), labels) == ["tab", "focus", "w1:t4"])
@@ -260,6 +350,7 @@ check("enter-header", sb.action_for("-", labels) is None)
 check("enter-broken-id", sb.action_for("m1|x|w1:p2|w1:t1", labels) is None)
 
 # 4. Paths.
+block('4. Paths')
 home = os.path.expanduser("~")
 check("tilde-local", sb.tilde(home + "/src/x", remote=False) == "~/src/x")
 check("tilde-remote-linux", sb.tilde("/home/someone/src/x", remote=True) == "~/src/x")
@@ -270,6 +361,7 @@ check("tilde-not-rootfs", sb.tilde("/rootfs/x", remote=True) == "/rootfs/x")
 check("tilde-local-not-a-prefix", sb.tilde(home + "x/y", remote=False) == home + "x/y")
 
 # 5. Columns: status, machine, workspace, tab, pane and the dimmed tail.
+block('5. Columns: status, machine, workspace, tab, pane and the dimmed tail')
 WIDTHS = (10, sb.MACHINE_WIDTH, 15, 26, 42)
 
 
@@ -312,6 +404,7 @@ c = cols(sb.entries_from(snap([pane("a")], [agent("a", "idle", 1)]), "m1", "work
 check("long-machine-name-fits", c[1] == "workstation", c)
 
 # 6. The machine always; the agent kind only when it is not claude.
+block('6. The machine always; the agent kind only when it is not claude')
 e3 = sb.entries_from(snap([pane("a")], [agent("a", "idle", 1)]), "", "here", 0)[0]
 check("machine-column-always", cols(e3)[1] == "here" and "here" in sb.render([e3], []))
 check("claude-not-shown", "claude" not in cols(e3)[5], cols(e3))
@@ -323,6 +416,7 @@ colors = dict(kv.split(":", 1) for kv in argv[argv.index("--color") + 1].split("
 check("selected-row-has-background", colors.get("bg+") not in (None, "-1"), colors)
 
 # 8. The preview without the agent's input box and status bar.
+block("8. The preview without the agent's input box and status bar")
 BOX = ["agent text", "last paragraph", "",
        "\x1b[2m" + "─" * 40 + " my-session ─\x1b[0m", "❯ \x1b[2mhalf typed\x1b[0m", "─" * 50,
        "  box1 | model | repo | ctx 15%", "  ⏵⏵ auto mode on"]
@@ -339,6 +433,7 @@ check("old-box-higher-up-untouched", sb.trim_footer("\n".join(far)) == "\n".join
 check("normal-indent-stays", "  - (c) an item" in sb.trim_footer("\n".join(["  - (c) an item"] + BOX[3:])))
 
 # 7. End to end, with a fake herdr.
+block('7. End to end, with a fake herdr')
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
     (d / "local.json").write_text(json.dumps({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "working", 3)])}}))
@@ -370,6 +465,7 @@ with tempfile.TemporaryDirectory() as d:
     check("e2e-disabled-not-asked", "disabled" not in r.stdout and "must not" not in r.stderr)
 
 # 9. Live.
+block('9. Live')
 import socket as _socket
 import threading as _threading
 import time as _time
@@ -492,7 +588,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     lv = sb.Live(machines, sb.entries_from(fake_fetch(), "", "here", 0), fetch=fake_fetch, cache=False)
     lv.changed()  # what fzf gets on its stdin: the other machine still loading
     stop = _threading.Event()
-    t = _threading.Thread(target=sb.watch, args=(lv, late, os.path.join(d, "rows"), stop))
+    t = _threading.Thread(target=sb.watch, args=(lv, late, os.path.join(d, "rows"), stop), daemon=True)
     t.start()
     _time.sleep(0.6)  # the other machine answered, and passes ran with nobody listening
     fz = FakeFzf(late)
@@ -507,6 +603,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
 
 # 10. Copy and terminals.
+block('10. Copy and terminals')
 argv = sb.fzf_argv("fzf", "self", "/tmp/s.sock")
 joined = " ".join(argv)
 check("preview-half", "down,50%" in joined, joined)
@@ -515,7 +612,7 @@ check("ctrl-t-terminals", any(a.startswith("ctrl-t:transform-query:") for a in a
 check("posix-shell", "--with-shell" in argv and argv[argv.index("--with-shell") + 1] == "sh -c")
 for q, want in (("", "^› "), ("api", "^› "), ("^› ", ""), ("^› docs", "")):
     out = subprocess.run(["sh", "-c", sb.TOGGLE_TERMINALS], env=dict(os.environ, FZF_QUERY=q),
-                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, universal_newlines=True).stdout
+                         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, universal_newlines=True, timeout=20).stdout
     check("toggle-terminals %r" % q, out == want, repr(out))
 check("terminal-glyph-own", sb.MARK["shell"][1] != sb.MARK["unknown"][1])
 check("footer-cleared-on-move", "focus:change-footer()" in argv and not any("prefix+w" in a for a in argv), argv)
@@ -575,6 +672,7 @@ with tempfile.TemporaryDirectory() as d:
     check("copy-header-nothing", out == "", out)
 
 # 11. Jump to another machine.
+block('11. Jump to another machine')
 PS = "\n".join([
     " 367912 /usr/local/bin/herdr remote-client-bridge --idle-timeout-v1",
     " 97790 ssh -C -T box1 exec /usr/local/bin/herdr remote-client-bridge --idle-timeout-v1",
@@ -666,6 +764,7 @@ check("launches-over-ssh-detached", launched and argv[0] == sb.SSH and "mac1" in
       and argv[-1].startswith("python3 /opt/sb/bin/switchboard --jump box1 a w1:p1"), argv)
 
 # 12. Select with the mouse.
+block('12. Select with the mouse')
 rows = sb.wrap_rows(["abcdefghij", "", "xy"], 4)
 check("wrap", rows == [(0, 0, 4), (0, 4, 8), (0, 8, 10), (1, 0, 0), (2, 0, 2)], rows)
 check("wrap-wide", sb.wrap_rows(["a中b"], 3) == [(0, 0, 2), (0, 2, 3)], sb.wrap_rows(["a中b"], 3))
@@ -692,7 +791,6 @@ check("only-spaces-not-copied", S3.mouse(0, 3, 1, True) is None)
 check("frame-inverts-selection", "\x1b[7mline" in S.frame())
 
 import pty as _pty
-import select as _sel
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
     (d / "pane.txt").write_text("hello world\nsecond line of the agent\n")
@@ -728,6 +826,7 @@ with tempfile.TemporaryDirectory() as d:
     os.write(fd, b"\x1b")
     pump(0.6)
     done, st = os.waitpid(pid, os.WNOHANG)
+    finish(pid, fd, 5)
     m = re.search(rb"\x1b\]52;c;([A-Za-z0-9+/=]+)\x07", out)
     copied = base64.b64decode(m.group(1)).decode() if m else None
     check("pty-copies-the-drag", copied == "world\nsecond", repr(copied))
@@ -735,6 +834,7 @@ with tempfile.TemporaryDirectory() as d:
     check("pty-restores-the-terminal", out.rstrip().endswith(b"\x1b[?1049l") or b"\x1b[?1006l" in out[-200:])
 
 # 13. The fast jump.
+block('13. The fast jump')
 ents2 = [ent("m1", "w1:p1", title="Plugin docs"), ent("m2", "w1:p1", title="something else"),
          ent("m1", "w2:p2", title="Fix (deploy)"), ent("m2", "w2:p2", title="x")]
 check("goto-title-when-id-repeats", sb.goto_query({"machine": "m1", "pane": "w1:p1"}, ents2) == "plugin docs",
@@ -806,6 +906,7 @@ finally:
     sb.jump, sb.local_tui_tty, sb.subprocess.Popen = orig
 
 # 14. No child reads the popup's terminal.
+block("14. No child reads the popup's terminal")
 tree = ast.parse(SOURCE)
 no_stdin = []
 for node in ast.walk(tree):
@@ -816,6 +917,7 @@ for node in ast.walk(tree):
 check("every-child-states-its-stdin", not no_stdin, "lines without stdin: %s" % no_stdin)
 
 # 15. Another machine, fast.
+block('15. Another machine, fast')
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
     calls_ssh = d / "ssh-calls"
@@ -859,6 +961,7 @@ with tempfile.TemporaryDirectory() as d:
 
 
 # 16. The order across machines.
+block('16. The order across machines')
 def ents16(machine, idx, *ags):
     """The entries of a machine with those agents: (pane, status, seq[, title])."""
     return sb.entries_from(snap([pane(a[0]) for a in ags], [agent(*a) for a in ags]),
@@ -942,6 +1045,7 @@ with tempfile.TemporaryDirectory() as d:
     sb.STATE_DIR = STATE
 
 # 17. done: finished and not seen.
+block('17. done: finished and not seen')
 T1, T2 = "w1:t1", "w1:t2"
 TABS17 = [{"tab_id": T1, "label": "one", "number": 1, "workspace_id": "w1"},
           {"tab_id": T2, "label": "two", "number": 2, "workspace_id": "w1"}]
@@ -1064,6 +1168,7 @@ with tempfile.TemporaryDirectory() as d:
 check("done-enter-acks", "live.recency.ack_tab(target[\"machine\"], target[\"tab\"], live.entries())" in SOURCE)
 
 # 18. Config.
+block('18. Config')
 check("config-path-plugin-dir", sb.config_path({"HERDR_PLUGIN_CONFIG_DIR": "/x"}) == "/x/config.toml")
 check("config-path-xdg", sb.config_path({"XDG_CONFIG_HOME": "/y", "HOME": "/h"}) == "/y/herdr-switchboard/config.toml")
 check("config-path-home", sb.config_path({"HOME": "/h"}) == "/h/.config/herdr-switchboard/config.toml")
@@ -1179,6 +1284,7 @@ sb.configure(sb.load_config()[0])
 sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
 
 # 19. State and the herdr binary.
+block('19. State and the herdr binary')
 check("state-plugin-dir", sb.state_dir({"HERDR_PLUGIN_STATE_DIR": "/s"}) == "/s")
 check("state-xdg", sb.state_dir({"XDG_STATE_HOME": "/x", "HOME": "/h"}) == "/x/herdr-switchboard")
 check("state-home", sb.state_dir({"HOME": "/h"}) == "/h/.local/state/herdr-switchboard")
@@ -1210,6 +1316,7 @@ sb.save_cache("box1", {"x": 1})
 check("cache-under-state", os.path.exists(os.path.join(STATE, "snapshots", "box1.json")))
 
 # 20. Language.
+block('20. Language')
 en, es = sb.STRINGS["en"], sb.STRINGS["es"]
 check("strings-same-keys", set(en) == set(es), sorted(set(en) ^ set(es)))
 ph = re.compile(r"%[sd]")
@@ -1246,6 +1353,7 @@ for node in ast.walk(tree):
 check("no-literal-text-to-the-user", not literal_out, literal_out)
 
 # 21. Colours.
+block('21. Colours')
 default_colors = sb.fzf_colors(sb.DEFAULTS["colors"])
 check("default-colors-ansi-only", "#" not in default_colors and "bg+:magenta" in default_colors, default_colors)
 theme = "[colors]\n" + "\n".join(l[2:] for l in EXAMPLE.splitlines()
@@ -1258,6 +1366,7 @@ check("example-theme-still-works", not tproblems and "bg+:#bd93f9" in themed and
 check("fzf-extra-appended", sb.fzf_colors(dict(sb.DEFAULTS["colors"], fzf="info:8")).endswith(",info:8"))
 
 # 22. Dependencies.
+block('22. Dependencies')
 check("deps-ok", sb.dependency_problems(python=(3, 9, 0), fzf=False) == [])
 p38 = sb.dependency_problems(python=(3, 8, 10), fzf=False, platform="linux", executable="/usr/bin/python3")
 check("deps-old-python", len(p38) == 2 and "3.8.10" in p38[0] and "3.9" in p38[0] and "package manager" in p38[1], p38)
@@ -1301,6 +1410,7 @@ if old_py:
           (old_py, r.returncode, r.stdout, r.stderr[-300:]))
 
 # 23. Demo.
+block('23. Demo')
 demo = sb.Demo()
 check("demo-machines", demo.local == "laptop" and [m["label"] for m in demo.machines] == ["workstation", "server"],
       (demo.local, demo.machines))
@@ -1388,15 +1498,18 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                 except OSError:
                     chunk = b""
                 if not chunk:  # the child closed the terminal: reap it
-                    _, status = os.waitpid(pid, 0)
-                    return buf, os.waitstatus_to_exitcode(status), missing
+                    return buf, finish(pid, fd, 5), missing
                 buf += chunk
+            else:
+                done, st = os.waitpid(pid, os.WNOHANG)
+                if done:  # exited while something still holds the terminal
+                    finish(pid, fd, 0)  # reaped already: only sweeps its group and closes fd
+                    return buf, os.waitstatus_to_exitcode(st), missing
             if missing is None and not demo_missing(buf):
                 missing = []
                 _time.sleep(0.3)
                 os.write(fd, keys)
-        os.kill(pid, 9)
-        os.waitpid(pid, 0)
+        finish(pid, fd, 0)
         return buf, None, demo_missing(buf) if missing is None else missing
     screen, rc, missing = run_demo(b"\x1b")
     check("demo-pty-renders", missing == [], missing)
@@ -1413,6 +1526,7 @@ else:
     print("note: no fzf %s or newer here; the demo was not run in a terminal" % sb.version_text(sb.MIN_FZF))
 
 # 24. The jump is opt-in.
+block('24. The jump is opt-in')
 check("jump-off-by-default", sb.DEFAULTS["jump"]["enabled"] is False and sb.JUMP_ENABLED is False)
 check("enter-mode-off", sb.enter_mode([{"id": "m1"}]) == (False, True))
 check("enter-mode-no-machines", sb.enter_mode([]) == (False, False))
@@ -1577,6 +1691,7 @@ check("no-fixed-helper-path", "REMOTE_SELF" not in SOURCE and "~/.local/bin/swit
       and "~/.local/bin/herdr" not in SOURCE)
 
 # 25. The manifest, and the program file itself.
+block('25. The manifest, and the program file itself')
 MANIFEST = (ROOT / "herdr-plugin.toml").read_text()
 if HAVE_TOMLLIB:
     man = sb.tomllib.loads(MANIFEST)
@@ -1643,6 +1758,7 @@ check("demo-only-generic-machine-names", names <= {"laptop", "workstation", "ser
                                                    "logs", "load-test", "db", "2", "4"}, names)
 
 # 26. The ssh control sockets go only in a directory that is provably this user's.
+block('26. The ssh control sockets go only in a directory that is provably this u')
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
     fresh = os.path.join(d, "fresh")
     check("ctl-dir-created-private", sb.private_dir(fresh) and stat.S_IMODE(os.lstat(fresh).st_mode) == 0o700)
@@ -1703,6 +1819,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         sb._SSH_DIR[:] = saved_dir
 
 # 27. A config can never crash the program, and reads the same on every Python.
+block('27. A config can never crash the program, and reads the same on every Pyth')
 PARSERS = [False, True] if HAVE_TOMLLIB else [False]
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
@@ -1800,6 +1917,7 @@ check("builtin-reads-special-floats", special["a"] == float("inf") and special["
       and special["c"] != special["c"], special)
 
 # 28. Colours fzf accepts, and a popup that never vanishes on an fzf error.
+block('28. Colours fzf accepts, and a popup that never vanishes on an fzf error')
 for v in ("magenta", "bright-black", "bright-white", "gray", "grey", "0", "16", "99", "255", "-1", "#bd93f9"):
     check("color-accepted %s" % v, sb.COLOR_VALUE.fullmatch(v) is not None)
 for v in ("purple", "256", "999", "01", "#bd93f", "Magenta", "bright-gray", "", "-2", "red,blue"):
@@ -1851,6 +1969,7 @@ with tempfile.TemporaryDirectory() as d:
           in r.stdout and "Press Enter" in r.stdout, (r.returncode, r.stdout[-300:], r.stderr[-300:]))
 
 # 29. Untrusted snapshot text.
+block('29. Untrusted snapshot text')
 EVIL = {
     "workspaces": [{"workspace_id": "w1", "label": "ws\tx\x1b]0;title\x07", "number": "1"},
                    {"workspace_id": ["list"], "label": "odd"}],
@@ -1944,6 +2063,7 @@ finally:
     sb.run_out, sb.local_tui_tty, sb.time.sleep, sb.local_label = orig
 
 # 30. ssh destinations.
+block('30. ssh destinations')
 argv = sb.ssh_argv("mac1", "uname -s", mux=False)
 check("ssh-double-dash-before-host", argv and argv[-3:] == ["--", "mac1", "uname -s"], argv)
 for bad in ("-oProxyCommand=touch /tmp/x", "-x", "", "mac 1", "mac1\n", "mac\x001", None, ["mac1"]):
@@ -1967,7 +2087,7 @@ with tempfile.TemporaryDirectory() as d:
         link.send(["--jump"] * 8)
         link.proc.wait(5)
         orig_popen = sb.subprocess.Popen
-        sb.subprocess.Popen = lambda argv, **kw: orig_popen(argv, **kw).wait() and None
+        sb.subprocess.Popen = lambda argv, **kw: orig_popen(argv, **kw).wait(20) and None
         try:
             sb.launch_jump(["--jump"] * 8, ("ssh", "mac1"), helper="sb-helper")
         finally:
@@ -1996,6 +2116,7 @@ with tempfile.TemporaryDirectory() as d:
         sb.SSH, sb.HERDR, sb.JUMP_HELPER = saved
 
 # 31. A remote Enter that never blocks, acks that are never lost, a quiet close.
+block('31. A remote Enter that never blocks, acks that are never lost, a quiet cl')
 check("fzf-action-plain", sb.fzf_action("execute", "a --b {1}") == "execute(a --b {1})")
 check("fzf-action-avoids-its-delimiter", sb.fzf_action("execute", "/opt/my (x)/sb {1}") == "execute[/opt/my (x)/sb {1}]")
 check("fzf-action-none-when-impossible", sb.fzf_action("x", "".join(sb.FZF_DELIMITERS)) is None)
@@ -2035,7 +2156,7 @@ with tempfile.TemporaryDirectory() as d:
         FakeFzf(sock)
         stop = _threading.Event()
         lv.changed()
-        t = _threading.Thread(target=sb.watch, args=(lv, sock, str(gone / "rows"), stop, None))
+        t = _threading.Thread(target=sb.watch, args=(lv, sock, str(gone / "rows"), stop, None), daemon=True)
         t.start()
         shutil.rmtree(str(gone))
         vivid["local"] = snap17(T1, ag17("p1", "blocked", 7, T1))
@@ -2078,8 +2199,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                 except OSError:
                     chunk = b""
                 if not chunk:
-                    _, status = os.waitpid(pid, 0)
-                    rc = os.waitstatus_to_exitcode(status)
+                    rc = finish(pid, fd, 5)
                     break
                 buf += chunk
             plain = sb.ANSI.sub("", buf.decode("utf-8", "replace"))
@@ -2093,14 +2213,14 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                 marks["ready"] = _time.time()
                 os.write(fd, b"\x1b")
         if rc is None:
-            os.kill(pid, 9)
-            os.waitpid(pid, 0)
+            finish(pid, fd, 0)
         check("enter-pty-footer-at-once", "focusing" in marks and marks["focusing"] - marks["enter"] < 1.5, marks)
         check("enter-pty-focus-arrives-later", "ready" in marks and marks["ready"] - marks["enter"] >= 1.5, marks)
         check("enter-pty-popup-stays-then-esc", rc == 0, rc)
         check("enter-pty-focused-through-herdr", "--machine m1 agent focus w1:p7" in (d / "log").read_text())
 
 # 32. Enter on a remote row, then Esc at once: the focus still happens, the ack is kept.
+block('32. Enter on a remote row, then Esc at once: the focus still happens, the ')
 if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
     with tempfile.TemporaryDirectory() as d:
         d = pathlib.Path(d)
@@ -2137,8 +2257,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                 except OSError:
                     chunk = b""
                 if not chunk:
-                    _, status = os.waitpid(pid, 0)
-                    rc, exited_at = os.waitstatus_to_exitcode(status), _time.time()
+                    rc, exited_at = finish(pid, fd, 5), _time.time()
                     break
                 buf += chunk
             plain = sb.ANSI.sub("", buf.decode("utf-8", "replace"))
@@ -2150,8 +2269,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                 os.write(fd, b"\x1b")
                 sent.add("esc")
         if rc is None:
-            os.kill(pid, 9)
-            os.waitpid(pid, 0)
+            finish(pid, fd, 0)
         check("close-after-enter-exits-at-once", rc == 0 and "esc" in sent and not (d / "focused").exists(),
               (rc, sorted(sent), (d / "focused").exists()))
         waited = 0.0
@@ -2166,6 +2284,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
         check("close-after-enter-ack-kept", isinstance(ledger, list) and ledger[3] == 5, ledger)
 
 # 33. Malformed snapshots everywhere.
+block('33. Malformed snapshots everywhere')
 BAD_SNAPSHOTS = ['{"result":{"snapshot":[]}}', "[]", '{"result":[]}', '"x"', '{"result":{"snapshot":"x"}}', "null",
                  '{"result":{"snapshot":null}}', "not json", "{}"]
 with tempfile.TemporaryDirectory() as d:
@@ -2244,7 +2363,7 @@ try:
         lv3.refresh_remote = broken_remote
         lv3.changed = broken_changed
         stop = _threading.Event()
-        t = _threading.Thread(target=sb.watch, args=(lv3, sock, os.path.join(d, "rows"), stop, None))
+        t = _threading.Thread(target=sb.watch, args=(lv3, sock, os.path.join(d, "rows"), stop, None), daemon=True)
         t.start()
         _time.sleep(0.5)
         alive = t.is_alive()
@@ -2281,6 +2400,7 @@ with tempfile.TemporaryDirectory() as d:
           and "Traceback" not in r.stderr, (r.returncode, r.stdout[-200:], r.stderr[-300:]))
 
 # 34. The selection viewer tells a split arrow key from a lone Esc.
+block('34. The selection viewer tells a split arrow key from a lone Esc')
 def viewer_alive_after(chunks, gap):
     """Run --select in a pty, write the chunks `gap` seconds apart, and say whether the viewer
     is still running 0.4 s later; then quit it."""
@@ -2314,8 +2434,7 @@ def viewer_alive_after(chunks, gap):
         # before drawing it, and raw mode (TCSAFLUSH) throws away anything typed earlier.
         drain(15.0, until=b"\x1b[?1049h")
         if b"\x1b[?1049h" not in seen[0]:
-            os.kill(pid, 9)
-            os.waitpid(pid, 0)
+            finish(pid, fd, 0)
             return None
         for i, chunk in enumerate(chunks):
             if i:
@@ -2326,11 +2445,7 @@ def viewer_alive_after(chunks, gap):
         alive = done == 0
         if alive:
             os.write(fd, b"q")
-            drain(0.5)
-            done, _ = os.waitpid(pid, os.WNOHANG)
-            if done == 0:
-                os.kill(pid, 9)
-                os.waitpid(pid, 0)
+        finish(pid, fd, 2)
         return alive
 
 
@@ -2338,6 +2453,7 @@ check("viewer-split-arrow-keeps-it-open", viewer_alive_after([b"\x1b", b"[A"], 0
 check("viewer-lone-esc-closes-it", viewer_alive_after([b"\x1b"], 0) is False)
 
 # 35. The run directory: descriptors, not names.
+block('35. The run directory: descriptors, not names')
 def private_tmp(base, name):
     path = os.path.join(base, name)
     os.mkdir(path, 0o700)
@@ -2432,7 +2548,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     lv = sb.Live([], [], fetch=lambda m="", t=None, i=None: snap([pane("w1:p1")], [agent("w1:p1", "idle", feed35["n"])]),
                  cache=False)
     stop = _threading.Event()
-    t = _threading.Thread(target=sb.watch, args=(lv, sock, os.path.join(rows_dir, "rows"), stop, None))
+    t = _threading.Thread(target=sb.watch, args=(lv, sock, os.path.join(rows_dir, "rows"), stop, None), daemon=True)
     t.start()
     _time.sleep(0.3)
     feed35["n"] = 2
@@ -2478,6 +2594,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("attack-worker-env-has-no-path", worker_flags == ["has_run_fd"], worker_flags)
 
 # 36. --focus-wait outlasts the slowest worker.
+block('36. --focus-wait outlasts the slowest worker')
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
     run = private_tmp(d, "run")
     env = dict(os.environ, SWITCHBOARD_RUN_DIR=run, SWITCHBOARD_REMOTE_TIMEOUT="2",
@@ -2492,6 +2609,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("focus-wait-outlasts-a-double-timeout", out.strip() == "ready on box1: late but fine", out)
 
 # 37. A hung local herdr.
+block('37. A hung local herdr')
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
     slow = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n  "api snapshot") exec sleep 6 ;;\n'
@@ -2549,11 +2667,14 @@ for bad in (0.5, 121, "fast"):
     check("local-timeout-out-of-range %r" % (bad,), cfg["refresh"]["local_timeout"] == 5.0 and warn, (cfg["refresh"], warn))
 
 # 38. Closing always removes the run directory.
-def close_popup(local_seconds, slow, signals=False):
+block('38. Closing always removes the run directory')
+def close_popup(local_seconds, slow, signals=False, leader=True):
     """Open the popup over a fake herdr, press Esc, and return (rc, seconds from Esc to exit,
     what is left in the popup's run root, whether a process still names that root). slow:
     every snapshot after the first hangs. signals: instead of Esc, SIGTERM and 0.4 s later
-    SIGHUP, while a refresh hangs (the cleanup is then under way)."""
+    SIGHUP, while a refresh hangs (the cleanup is then under way). leader=False: a parent
+    leads the terminal's session and outlives the popup, so the kernel hangs nothing up
+    when the popup exits; whatever ends fzf then is the popup itself."""
     import signal as _sig8
     with tempfile.TemporaryDirectory(dir="/tmp") as d:
         root = private_tmp(d, "runs")
@@ -2569,11 +2690,29 @@ def close_popup(local_seconds, slow, signals=False):
                         '#!/bin/sh\ncase "$*" in\n  "machine list --json") echo "[]" ;;\n'
                         '  "api snapshot") if [ -e "%(d)s/once" ]; then %(hang)s; fi; touch "%(d)s/once"; cat "%(s)s" ;;\n'
                         '  *) exit 0 ;;\nesac\n' % {"d": d, "hang": hang, "s": snapfile})
+        popup_pid, popup_rc = os.path.join(d, "popup.pid"), os.path.join(d, "popup.rc")
         pid, fd = _pty.fork()
         if pid == 0:
             os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), HERDR_PLUGIN_CONFIG_DIR=cfg,
                               HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"), SWITCHBOARD_RUN_ROOT=root)
-            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+            if leader:
+                os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+            inner = os.fork()
+            if inner == 0:
+                os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+            with open(popup_pid + ".tmp", "w") as f:
+                f.write(str(inner))
+            os.rename(popup_pid + ".tmp", popup_pid)
+            done, st, quit_at = 0, 0, _time.time() + 60
+            while not done and _time.time() < quit_at:
+                done, st = os.waitpid(inner, os.WNOHANG)
+                _time.sleep(0.02)
+            ec = os.waitstatus_to_exitcode(st) if done else -9
+            with open(popup_rc + ".tmp", "w") as f:
+                f.write(str(ec))
+            os.rename(popup_rc + ".tmp", popup_rc)
+            _time.sleep(30)  # still leading the session; the test kills this group when done
+            os._exit(0)
         import fcntl as _f6
         import struct as _st6
         import termios as _tm6
@@ -2587,38 +2726,38 @@ def close_popup(local_seconds, slow, signals=False):
                 except OSError:
                     chunk = b""
                 if not chunk:
-                    _, status = os.waitpid(pid, 0)
-                    rc = os.waitstatus_to_exitcode(status)
+                    rc = finish(pid, fd, 5)
                     break
                 buf += chunk
-            else:  # exited while a child still holds the terminal open
+            elif leader:  # exited while a child still holds the terminal open
                 done, status = os.waitpid(pid, os.WNOHANG)
                 if done:
                     rc = os.waitstatus_to_exitcode(status)
                     break
+            if not leader and os.path.exists(popup_rc):
+                rc = int(open(popup_rc).read())
+                break
             if t_esc is None and b"only-row" in buf:
-                # With a slow snapshot, wait until a refresh is hanging before closing.
-                deadline = _time.time() + 5
-                while slow and not os.path.exists(os.path.join(d, "hung")) and _time.time() < deadline:
-                    _time.sleep(0.05)
+                # With a slow snapshot, wait until a refresh is hanging before closing; the
+                # terminal is read all along (see finish).
+                buf += read_until(fd, lambda _b: not slow or os.path.exists(os.path.join(d, "hung")), 5)
+                buf += read_until(fd, lambda _b: leader or os.path.exists(popup_pid), 5)
+                target = pid if leader else int(open(popup_pid).read())
                 t_esc = _time.time()
                 if signals:
-                    os.kill(pid, _sig8.SIGTERM)
-                    _time.sleep(0.4)
-                    os.kill(pid, _sig8.SIGHUP)
+                    os.kill(target, _sig8.SIGTERM)
+                    buf += read_until(fd, lambda _b: False, 0.4)
+                    os.kill(target, _sig8.SIGHUP)
                 else:
                     os.write(fd, b"\x1b")
-        if rc is None:
-            os.kill(pid, 9)
-            os.waitpid(pid, 0)
         took = _time.time() - t_esc if t_esc else None
         left = sorted(os.listdir(root))
         # fzf's command line names its socket under the run root: yes/no, from the command
-        # lines only.
+        # lines only, before anything else here ends what is left.
         ps = subprocess.run(["ps", "-axo", "command="], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            universal_newlines=True).stdout
+                            universal_newlines=True, timeout=20).stdout
         lingering = any(root in line and "ps -axo" not in line for line in ps.splitlines())
-        os.close(fd)
+        finish(pid, fd, 0)  # reaps, or kills, what is left of the terminal's session, and closes fd
         if os.path.exists(os.path.join(d, "hung")):  # the hanging fake herdr outlives the popup
             try:
                 os.kill(int(open(os.path.join(d, "hung")).read().strip()), 9)
@@ -2640,6 +2779,10 @@ rc, took, left, lingering = close_popup(1, True, signals=True)
 check("second-signal-does-not-cut-the-cleanup", rc == 128 + 15 and left == [] and took is not None and took < 5,
       (rc, took, left))
 check("signal-leaves-no-fzf", not lingering)
+# The same with a parent leading the terminal's session: no hang-up from the kernel, so only
+# the popup's own kill ends fzf (on macOS the kernel's hang-up could not be counted on).
+rc, took, left, lingering = close_popup(1, True, signals=True, leader=False)
+check("signal-popup-ends-its-own-fzf", rc == 128 + 15 and left == [] and not lingering, (rc, took, left, lingering))
 
 
 # A popup whose terminal goes away (SIGHUP) still removes its directories: the run directory
@@ -2667,15 +2810,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                     break
         seen_before = (sorted(os.listdir(root)), sorted(os.listdir(tmpdir)))
         os.close(fd)  # the terminal goes away: the session leader gets SIGHUP
-        done = 0
-        for _ in range(100):
-            done, _status = os.waitpid(pid, os.WNOHANG)
-            if done:
-                break
-            _time.sleep(0.05)
-        if not done:
-            os.kill(pid, 9)
-            os.waitpid(pid, 0)
+        done = pid if finish(pid, None, 5) is not None else 0
         # The run directory, and at least the demo's state directory (a preview child has its own).
         check("hangup-was-really-mid-run", len(seen_before[0]) == 1 and len(seen_before[1]) >= 1, seen_before)
         check("hangup-removes-every-directory", done == pid and os.listdir(root) == [] and os.listdir(tmpdir) == [],
@@ -2688,7 +2823,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         lv = sb.Live([], [], fetch=lambda m="", t=None, i=None: snap([], []), cache=False)
         stop = _threading.Event()
         t = _threading.Thread(target=sb.watch, args=(lv, short_sock("none"), os.path.join(rows_dir, "rows"),
-                                                    stop, None))
+                                                    stop, None), daemon=True)
         t.start()
         _time.sleep(0.5)
         t0 = _time.time()
@@ -2699,6 +2834,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         sb.LOCAL_EVERY = saved_every
 
 # 39. The worker re-checks the name and the directory it inherits.
+block('39. The worker re-checks the name and the directory it inherits')
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
     (pathlib.Path(d) / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
     fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%s/machines.json" ;;\n'
@@ -2727,6 +2863,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("worker-refuses-a-directory-that-is-not-private", os.listdir(loose) == [], os.listdir(loose))
 
 # 40. A readable selected row.
+block('40. A readable selected row')
 argv = sb.fzf_argv("fzf", "self", "/tmp/s.sock")
 check("blank-gutter", "--gutter" in argv and argv[argv.index("--gutter") + 1] == " ", argv)
 colors = dict(kv.split(":", 1) for kv in sb.fzf_colors(sb.DEFAULTS["colors"]).split(","))
@@ -2744,6 +2881,7 @@ check("terminals-still-start-with-their-glyph", sum(1 for x in plain_rows if x.s
       [x[:12] for x in plain_rows])
 
 # 41. The jump's keys are configurable and cannot escape the AppleScript string.
+block("41. The jump's keys are configurable and cannot escape the AppleScript str")
 check("jump-keys-default-is-herdrs", sb.DEFAULTS["jump"]["prefix"] == "ctrl+b" and sb.DEFAULTS["jump"]["goto"] == "prefix+g"
       and sb.JUMP_KEYS == "\\x02g/", sb.JUMP_KEYS)
 check("jump-keys-custom", sb.goto_keys("ctrl+a", "prefix+/") == "\\x01//" and sb.goto_keys("ctrl+z", "prefix+;") == "\\x1a;/")
@@ -2770,6 +2908,7 @@ for bad in ('\\x02g/" & do shell script "touch x', "\\x02g/\\r", "\\x00g/", "\\x
 
 # 42. A refused jump key turns the jump off, instead of typing herdr's default keys into a
 # herdr bound differently. Enter then works as with enabled = false.
+block("42. A refused jump key turns the jump off, instead of typing herdr's defau")
 cfg, problems = sb.merge_config({"jump": {"enabled": True, "goto": "prefix+shift+g"}})
 check("jump-refused-goto-turns-it-off", cfg["jump"]["enabled"] is False
       and any("jump.goto" in p and "jump is off" in p for p in problems), (cfg["jump"], problems))
@@ -2828,6 +2967,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("jump-good-key-enter-accepts", out.strip() == "accept" and "jump" not in header, (out, header))
 
 # 43. What the jump types is matched whole: a final newline is not let through.
+block('43. What the jump types is matched whole: a final newline is not let throu')
 for tty, query in (("/dev/ttys000", "w1:p1\n"), ("/dev/ttys000", "w1:p1\r"), ("/dev/ttys000\n", "w1:p1"),
                    ("/dev/ttys\u00e9", "w1:p1"), ('/dev/ttys000"', "w1:p1")):
     try:
@@ -2848,6 +2988,7 @@ check("transcript-id-whole", sb.transcript_path("0123abcd-ef\n") is None
 shutil.rmtree(os.path.join(os.environ["HOME"], ".agent"))
 
 # 44. The jump checks what it would type before it renames anything.
+block('44. The jump checks what it would type before it renames anything')
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
     calls = os.path.join(d, "calls")
     fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\necho "$*" >> "%s"\n' % calls)
@@ -2921,6 +3062,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
 
 # 45. The other machines' rows show up even when fzf opens --listen late (they answered
 # before it listened). The demo, behind an fzf that starts listening 0.3 s late.
+block("45. The other machines' rows show up even when fzf opens --listen late (th")
 if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
     with tempfile.TemporaryDirectory(dir="/tmp") as d:
         slow_fzf = executable(os.path.join(d, "fzf"), '#!/bin/sh\nsleep 0.3\nexec "%s" "$@"\n' % fzf_real)
@@ -2947,22 +3089,41 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
             if "rate-limiter-review" in plain and "terraform-plan-staging" in plain:  # one row of each other machine
                 seen = _time.time() - t0
         os.write(fd, b"\x1b")
-        for _ in range(60):
-            done, _status = os.waitpid(pid, os.WNOHANG)
-            if done:
-                break
-            _time.sleep(0.05)
-        else:
-            os.kill(pid, 9)
-            os.waitpid(pid, 0)
-        os.close(fd)
+        # Read the terminal while it exits: on macOS, fzf restoring the screen into a terminal
+        # nobody reads blocks, and so does a session leader exiting with output not drained.
+        rc = finish(pid, fd, 10)
         # Before: they showed only with the demo's first change, at about 9 s.
         check("late-listen-rows-arrive", seen is not None and seen < 5, seen)
+        check("late-listen-esc-exits", rc == 0, rc)
+
+# 50. Nothing in the tests or the program waits without a bound on a child, a thread or a
+# terminal (the popup's wait for fzf is the user's: it ends with a key or a signal).
+block("50. bounded waits")
+for label, text in (("tests", pathlib.Path(__file__).read_text()), ("program", SOURCE)):
+    unbounded = []
+    for node in ast.walk(ast.parse(text)):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        fname = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        base = getattr(func.value, "id", "") if isinstance(func, ast.Attribute) else ""
+        kws = {k.arg for k in node.keywords}
+        if base == "subprocess" and fname in ("run", "check_output", "call", "check_call") and "timeout" not in kws:
+            unbounded.append(node.lineno)
+        elif fname in ("wait", "communicate", "join") and base not in ("os", "path") and not node.args \
+                and "timeout" not in kws and not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Constant)):
+            unbounded.append(node.lineno)
+        elif fname == "waitpid" and len(node.args) == 2 and isinstance(node.args[1], ast.Constant) \
+                and node.args[1].value == 0:
+            unbounded.append(node.lineno)
+    check("bounded-waits-%s" % label, not unbounded, unbounded)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
       and sb._SSH_DIR[0] == os.path.join(_run_root, "switchboard"), sb._SSH_DIR)
 
+# The end of the suite gets a limit too: a thread or a child left behind could hold the exit.
+block("end of the suite")
 if FAILS:
     print("FAIL %d:\n  " % len(FAILS) + "\n  ".join(str(f) for f in FAILS))
     sys.exit(1)

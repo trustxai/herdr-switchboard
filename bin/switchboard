@@ -1204,11 +1204,12 @@ def collect(with_remote):
         except Exception:
             results[i] = None
 
-    threads = [threading.Thread(target=fetch, args=(i, m)) for i, m in enumerate(machines)]
+    threads = [threading.Thread(target=fetch, args=(i, m), daemon=True) for i, m in enumerate(machines)]
     for t in threads:
         t.start()
+    deadline = time.time() + REMOTE_TIMEOUT + 5  # each read has its own timeout; this is the backstop
     for t in threads:
-        t.join()
+        t.join(max(0.0, deadline - time.time()))
     for i, m in enumerate(machines):
         if results.get(i) is None:
             down.append(m["label"])
@@ -2349,11 +2350,13 @@ def find_client(bridges=None, hosts=None, local_tty=None, idle=idle_seconds, pla
         return None
     if len(candidates) > 1:
         results = {}
-        threads = [threading.Thread(target=lambda c=c: results.__setitem__(c, idle(c))) for c in candidates]
+        threads = [threading.Thread(target=lambda c=c: results.__setitem__(c, idle(c)), daemon=True)
+                   for c in candidates]
         for t in threads:
             t.start()
+        deadline = time.time() + 10  # idle_seconds has its own 6 s timeout; this is the backstop
         for t in threads:
-            t.join()
+            t.join(max(0.0, deadline - time.time()))
         candidates.sort(key=lambda c: results.get(c, float("inf")))
     best = candidates[0]
     return ("local", None) if best is None else ("ssh", best)
@@ -2789,12 +2792,22 @@ def popup(self_cmd, demo=False):
     argv = fzf_argv(fzf, self_cmd, sock, remote_enter=remote_enter)
     labels = {m["id"]: m["label"] for m in machines}
     watcher = threading.Thread(target=watch, args=(live, sock, rows_file, stop, acks), daemon=True)
+    proc = None
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True,
                                 env=dict(os.environ, SWITCHBOARD_RUN_DIR=tmp, SWITCHBOARD_LABELS=json.dumps(labels)))
         watcher.start()
         out, _ = proc.communicate(first)
     finally:
+        if proc is not None and proc.poll() is None:
+            # Leaving on a signal: fzf goes too. Nothing else is sure to end it: the kernel
+            # hangs it up only when this process leads the terminal's session, and macOS
+            # first waits for the terminal's output to drain.
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
         stop.set()
         if watcher.is_alive():
             watcher.join(2)  # stop wakes it; a pass already under way may take a moment
@@ -2837,8 +2850,11 @@ def popup(self_cmd, demo=False):
     if link:
         link.close()
     if cmd:
-        subprocess.run([HERDR] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run([HERDR] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
     return 0
 
 
