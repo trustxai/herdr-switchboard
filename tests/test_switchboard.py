@@ -2449,9 +2449,10 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     (pathlib.Path(d) / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
     fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%(d)s/machines.json" ;;\n'
                                              '  *"agent focus"*) { [ -n "${SWITCHBOARD_RUN_DIR+x}" ] && echo has_run_dir; '
-                                             '[ -n "${SWITCHBOARD_RUN_FD+x}" ] && echo has_run_fd; } > "%(d)s/worker-flags"; '
+                                             '[ -n "${SWITCHBOARD_RUN_FD+x}" ] && echo has_run_fd; '
+                                             'env | grep -qF -- "%(run)s" && echo has_path; } > "%(d)s/worker-flags"; '
                                              'sleep 1.5; touch "%(d)s/focused" ;;\n'
-                                             'esac\n' % {"d": d})
+                                             'esac\n' % {"d": d, "run": run})
     env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=run, SWITCHBOARD_LABELS=json.dumps({"m1": "box1"}))
     out = subprocess.run([sys.executable, str(TOOL), "--enter", "m1|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=20).stdout
@@ -2471,7 +2472,8 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("attack-decoy-unchanged", open(decoy).read() == "precious\n", open(decoy).read())
     check("attack-nothing-written-in-the-new-directory", sorted(os.listdir(run)) == sorted([name, name + ".tmp"]),
           os.listdir(run))
-    # The fake herdr records two yes/no flags, never the environment itself (it can hold secrets).
+    # The fake herdr records yes/no flags, never the environment itself (it can hold secrets):
+    # neither variable that names the directory, and its path under no name at all.
     worker_flags = open(os.path.join(d, "worker-flags")).read().split() if os.path.exists(os.path.join(d, "worker-flags")) else None
     check("attack-worker-env-has-no-path", worker_flags == ["has_run_fd"], worker_flags)
 
