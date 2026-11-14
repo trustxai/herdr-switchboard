@@ -138,12 +138,25 @@ anywhere else: its writes go through the removed directory's descriptor and fail
 socket is contacted only after such a write succeeded.
 
 The popup also closes this way when its window or session goes away: SIGHUP and SIGTERM exit
-through the same cleanup, which ends the popup's own fzf (SIGTERM, so fzf puts the terminal
-back, and a wait of up to two seconds; SIGKILL and another two seconds only if it is still
-there) and removes the run directory (and, for `--demo`, its temporary state directory). A
-second SIGHUP or SIGTERM during that cleanup is ignored, so it finishes. The detached focus
-worker and the jump's connection run in sessions of their own and do not get the popup's
-hangup.
+through the same cleanup, which ends the popup's own fzf and removes the run directory (and,
+for `--demo`, its temporary state directory). fzf gets SIGTERM, so it puts the terminal back,
+and up to two seconds to leave; fzf does not act on it while it waits for `--copy` or
+`--select` to finish, so then the popup kills the process groups of the commands fzf started,
+waits up to two more seconds, and only then sends fzf SIGKILL. A second SIGHUP or SIGTERM
+during that cleanup is ignored, so it finishes.
+
+The detached focus worker and the jump's connection run in sessions of their own and do not
+get the popup's hangup. So does every helper that the popup itself, `--rows`, the worker or
+the jump's helper runs and waits for (herdr, ssh, `ps`, `ioreg`, `tailscale`): each gets a
+session and process group of its own, killed whole when its timeout passes and when the
+process that started it exits, SIGHUP and SIGTERM included. The helpers of the commands fzf
+runs (`--preview`, `--copy`, `--select`) stay instead in that command's process group, which
+fzf kills with SIGKILL when it is done with the command: for a preview when the next one
+starts, for all of them when fzf exits. A helper that times out there is killed on its own.
+`--enter` starts only the focus worker, and `--focus-wait` starts nothing. Nothing ends a
+helper in a session of its own once the process that started it was killed with SIGKILL,
+which skips that cleanup: it runs until it ends by itself (ssh's `ConnectTimeout=5` bounds
+only the connection, not a remote herdr that stops answering).
 
 ### Enter on another machine's row
 

@@ -123,6 +123,8 @@ What it has to get right, and how it fails otherwise:
    finds the terminals by their glyph.
 41. The keys the jump types come from [jump] prefix and goto, herdr's defaults unless set, and
    are checked against closed character sets in the config, on the way and in the AppleScript.
+53. Reads started by the commands fzf runs (--preview, --copy, --select) end when fzf ends those
+   commands, with the real fzf: cursor moves and Esc, or the popup told to leave while one hangs.
 
     python3 tests/test_switchboard.py
 """
@@ -3494,6 +3496,120 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
           (orphan, alive, reader.returncode))
     if alive:
         os.kill(orphan, _signal.SIGKILL)
+
+# 53. Reads started by the commands fzf runs end when fzf ends those commands. fzf runs each
+# command in a process group of its own and ends it by killing that group with SIGKILL (the
+# next preview replaces it; fzf exits), so a read that left the group would outlive it. A
+# popup over a remote machine whose `pane read` over ssh hangs; the fake ssh records each
+# such read's pid (yes/no checks only).
+block("53. reads under fzf end with fzf")
+
+
+def popup_with_hung_reads(drive, remote_timeout="60"):
+    """Open the popup on remote rows whose pane reads hang; drive(fd, popup_pid, reads_file)
+    does the keys. Returns (the pids of the hung reads still alive after the popup left,
+    how many there were, the popup's exit code)."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = private_tmp(d, "runs")
+        reads = os.path.join(d, "reads")
+        with open(os.path.join(d, "machines.json"), "w") as f:
+            json.dump([{"id": "m1", "label": "box1", "enabled": True, "target": "box1-host"}], f)
+        with open(os.path.join(d, "local.json"), "w") as f:
+            json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="here")])}}, f)
+        remote = [pane("w1:p%d" % i, tab="w1:t%d" % i) for i in range(1, 6)]
+        with open(os.path.join(d, "m1.json"), "w") as f:
+            json.dump({"result": {"snapshot": snap(remote, [agent("w1:p%d" % i, "blocked", 9 - i, title="far-%d" % i,
+                                                                   tab="w1:t%d" % i) for i in range(1, 6)])}}, f)
+        fake_ssh = executable(os.path.join(d, "ssh"), '#!/bin/sh\ncase "$*" in\n'
+                              '  *"pane read"*) echo $$ >> "%(d)s/reads"; exec sleep 120 ;;\n'
+                              '  *"api snapshot"*) cat "%(d)s/m1.json" ;;\n'
+                              '  *) exit 1 ;;\nesac\n' % {"d": d})
+        fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n'
+                        '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                        '  "api snapshot") cat "%(d)s/local.json" ;;\n'
+                        '  *) exit 1 ;;\nesac\n' % {"d": d})
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), SWITCHBOARD_SSH=str(fake_ssh),
+                              SWITCHBOARD_REMOTE_TIMEOUT=remote_timeout, SWITCHBOARD_RUN_ROOT=root,
+                              HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+        import fcntl as _f53
+        import struct as _st53
+        import termios as _tm53
+        _f53.ioctl(fd, _tm53.TIOCSWINSZ, _st53.pack("HHHH", 30, 160, 0, 0))
+        read_until(fd, lambda b: b"far-1" in sb.ANSI.sub("", b.decode("utf-8", "replace")).encode(), 15)
+        read_until(fd, lambda _b: os.path.exists(reads), 10)  # the first remote preview is hanging
+        drive(fd, pid, reads)
+        rc = finish(pid, fd, 15)
+        pids = [int(x) for x in open(reads).read().split()] if os.path.exists(reads) else []
+        left, end = list(pids), _time.time() + 3
+        while left and _time.time() < end:
+            _time.sleep(0.1)
+            left = [p for p in left if _alive(p)]
+        for p in left:  # never leave them behind, whatever the result
+            try:
+                os.kill(p, _signal.SIGKILL)
+            except OSError:
+                pass
+        return left, len(pids), rc
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def moves_then_esc(fd, pid, reads):
+    for _ in range(3):
+        os.write(fd, b"\x1b[B")
+        read_until(fd, lambda _b: False, 1.0)
+    os.write(fd, b"\x1b")
+
+
+def key_then_sigterm(key):
+    def drive(fd, pid, reads):
+        os.write(fd, key)
+        read_until(fd, lambda _b: False, 1.5)  # the command's read is hanging now
+        os.kill(pid, _signal.SIGTERM)
+    return drive
+
+
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    left, started, rc = popup_with_hung_reads(moves_then_esc)
+    check("preview-reads-end-with-fzf", started >= 3 and not left and rc == 0, (started, len(left), rc))
+    left, started, rc = popup_with_hung_reads(key_then_sigterm(b"\x19"))  # ctrl-y: --copy
+    check("copy-read-ends-with-fzf", started >= 2 and not left and rc == 128 + 15, (started, len(left), rc))
+    left, started, rc = popup_with_hung_reads(key_then_sigterm(b"\x0f"))  # ctrl-o: --select
+    check("select-read-ends-with-fzf", started >= 2 and not left and rc == 128 + 15, (started, len(left), rc))
+    # A read that times out inside a preview is killed then, with the popup still open and the
+    # cursor where it was (only the read itself: its group is the preview's own).
+    timed_out = []
+
+    def wait_past_the_timeout(fd, pid, reads):
+        read_until(fd, lambda _b: False, 1.5 + 1.5)  # remote_timeout 1.5 s, then a margin
+        timed_out.extend(int(x) for x in open(reads).read().split())
+        timed_out[:] = [p for p in timed_out if _alive(p)]
+        os.write(fd, b"\x1b")
+    popup_with_hung_reads(wait_past_the_timeout, remote_timeout="1.5")
+    check("preview-read-killed-at-its-timeout", not timed_out, timed_out)
+# --enter starts one thing, the --focus worker, in a session of its own on purpose (the focus
+# must land after Esc; herdr_on_bound bounds it, block 54); --focus-wait starts nothing.
+_defs = {n.name: n for n in ast.walk(ast.parse(SOURCE)) if isinstance(n, ast.FunctionDef)}
+_starts = ("Popen", "run", "run_child", "run_out", "herdr", "herdr_on", "snapshot", "machine_info", "saved_machines")
+_focus_wait_calls = {(c.func.attr if isinstance(c.func, ast.Attribute) else getattr(c.func, "id", ""))
+                     for c in ast.walk(_defs["focus_wait"]) if isinstance(c, ast.Call)}
+check("focus-wait-starts-nothing", not (_focus_wait_calls & set(_starts)), sorted(_focus_wait_calls & set(_starts)))
+_enter_starts = [c for c in ast.walk(_defs["enter"]) if isinstance(c, ast.Call)
+                 and (c.func.attr if isinstance(c.func, ast.Attribute) else getattr(c.func, "id", "")) in _starts]
+check("enter-starts-only-the-detached-worker", len(_enter_starts) == 1
+      and any(k.arg == "start_new_session" and getattr(k.value, "value", None) is True for k in _enter_starts[0].keywords),
+      len(_enter_starts))
+check("fzf-commands-flagged", "FZF_COMMANDS = ([\"--preview\"], [\"--copy\"], [\"--select\"], [\"--enter\"], "
+      "[\"--focus-wait\"])" in SOURCE and "FZF_COMMAND = argv[:1] in FZF_COMMANDS" in SOURCE)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
