@@ -1334,12 +1334,18 @@ class Live:
         self.last = t
         return t
 
+    def unsent(self):
+        """The text changed() last returned never reached fzf: return it again next time,
+        even if nothing changes in between."""
+        self.last = None
+
 
 def fzf_request(sock, method, body=b""):
     """One HTTP request to fzf's --listen (a unix socket: no port, no key).
 
-    The response body, or None when fzf does not answer. fzf rejects a GET that carries a
-    Content-Length, even 0, with "invalid content length".
+    The response body, or None when fzf does not answer or does not answer with a 2xx: the
+    request did not reach fzf. fzf rejects a GET that carries a Content-Length, even 0, with
+    "invalid content length".
     """
     head = "%s %s HTTP/1.1\r\nHost: fzf\r\n" % (method, "/?limit=0" if method == "GET" else "/")
     if method == "POST":
@@ -1356,6 +1362,8 @@ def fzf_request(sock, method, body=b""):
                 break
             data += chunk
         hdr, _, rest = data.partition(b"\r\n\r\n")
+        if not re.match(rb"HTTP/1\.[01] 2[0-9][0-9] ", hdr):
+            return None
         m = re.search(rb"(?i)content-length:\s*(\d+)", hdr)
         while m and len(rest) < int(m.group(1)):
             chunk = s.recv(65536)
@@ -1419,12 +1427,21 @@ def watch(live, sock, rows_file, stop, acks=None):
         text = live.changed()
         if text is None or rows_dir is None:
             return
-        fd = os.open(rows_name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
-                     dir_fd=rows_dir)
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-        os.replace(rows_name + ".tmp", rows_name, src_dir_fd=rows_dir, dst_dir_fd=rows_dir)
-        fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
+        # A change counts as shown only once fzf took the reload. Until then (fzf has not
+        # opened --listen yet, or a write failed) the next pass sends it again, even with
+        # nothing new: otherwise a machine that answered before fzf listened would stay
+        # "loading" until something else changed.
+        sent = None
+        try:
+            fd = os.open(rows_name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
+                         dir_fd=rows_dir)
+            with os.fdopen(fd, "w") as f:
+                f.write(text)
+            os.replace(rows_name + ".tmp", rows_name, src_dir_fd=rows_dir, dst_dir_fd=rows_dir)
+            sent = fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
+        finally:
+            if sent is None:
+                live.unsent()
 
     def nap():
         """Until the next local pass is due, a machine answers, or stop is set. stop is

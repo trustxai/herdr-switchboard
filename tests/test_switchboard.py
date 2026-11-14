@@ -411,8 +411,8 @@ check("reload-lower-tracks", sb.reload_action("/tmp/r", 3).startswith("track-cur
 class FakeFzf:
     """A fzf --listen on a unix socket: records each request and answers like fzf."""
 
-    def __init__(self, path, position=0):
-        self.reqs, self.position = [], position
+    def __init__(self, path, position=0, status=b"200 OK"):
+        self.reqs, self.position, self.status = [], position, status
         self.srv = _socket.socket(_socket.AF_UNIX)
         self.srv.bind(path)
         self.srv.listen(8)
@@ -432,7 +432,7 @@ class FakeFzf:
                 body = json.dumps({"position": self.position}).encode()
             else:
                 body = b""
-            c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+            c.sendall(b"HTTP/1.1 %s\r\nContent-Length: %d\r\n\r\n" % (self.status, len(body)) + body)
             c.close()
 
 
@@ -476,6 +476,34 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     _time.sleep(0.6)
     check("watch-remote-reloads-now", len([r for r in fz.reqs if b"reload-sync" in r]) > before)
     stop2.set()
+    sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
+
+# A change that happens before fzf opens --listen (a machine that answers at once) reaches
+# fzf as soon as it listens, even if nothing changes again; and a reload fzf refuses counts
+# as not sent.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    sock = short_sock("refuses")
+    FakeFzf(sock, status=b"400 Bad Request")
+    check("http-refused-is-not-sent", sb.fzf_request(sock, "POST", b"reload(x)") is None)
+    late = short_sock("late")
+    sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.1, 0.1
+    data.update(local=snap([pane("w1:p1")], [agent("w1:p1", "working", 1)]),
+                m1=snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)]))
+    lv = sb.Live(machines, sb.entries_from(fake_fetch(), "", "here", 0), fetch=fake_fetch, cache=False)
+    lv.changed()  # what fzf gets on its stdin: the other machine still loading
+    stop = _threading.Event()
+    t = _threading.Thread(target=sb.watch, args=(lv, late, os.path.join(d, "rows"), stop))
+    t.start()
+    _time.sleep(0.6)  # the other machine answered, and passes ran with nobody listening
+    fz = FakeFzf(late)
+    _time.sleep(0.6)
+    posts = [r for r in fz.reqs if r.startswith(b"POST") and b"reload-sync" in r]
+    check("watch-sends-what-fzf-missed", len(posts) == 1 and "loading" not in open(os.path.join(d, "rows")).read(),
+          len(posts))
+    _time.sleep(0.4)
+    check("watch-sends-it-only-once", len([r for r in fz.reqs if b"reload-sync" in r]) == 1)
+    stop.set()
+    t.join(3)
     sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
 
 # 10. Copy and terminals.
@@ -2701,6 +2729,46 @@ for bad in ('\\x02g/" & do shell script "touch x', "\\x02g/\\r", "\\x00g/", "\\x
         check("applescript-refuses-keys %r" % bad, False)
     except ValueError:
         pass
+
+# 45. The other machines' rows show up even when fzf opens --listen late (they answered
+# before it listened). The demo, behind an fzf that starts listening 0.3 s late.
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        slow_fzf = executable(os.path.join(d, "fzf"), '#!/bin/sh\nsleep 0.3\nexec "%s" "$@"\n' % fzf_real)
+        root = private_tmp(d, "runs")
+        t0 = _time.time()
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH="/bin/false", SWITCHBOARD_FZF=str(slow_fzf),
+                              SWITCHBOARD_RUN_ROOT=root)
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL), "--demo"])
+        import fcntl as _f45
+        import struct as _st45
+        import termios as _tm45
+        _f45.ioctl(fd, _tm45.TIOCSWINSZ, _st45.pack("HHHH", 40, 180, 0, 0))
+        buf, seen, end = b"", None, _time.time() + 8
+        while _time.time() < end and seen is None:
+            r, _, _ = _sel.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    buf += os.read(fd, 65536)
+                except OSError:
+                    break
+            plain = sb.ANSI.sub("", buf.decode("utf-8", "replace"))
+            if "rate-limiter-review" in plain and "terraform-plan-staging" in plain:  # one row of each other machine
+                seen = _time.time() - t0
+        os.write(fd, b"\x1b")
+        for _ in range(60):
+            done, _status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            _time.sleep(0.05)
+        else:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        os.close(fd)
+        # Before: they showed only with the demo's first change, at about 9 s.
+        check("late-listen-rows-arrive", seen is not None and seen < 5, seen)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
