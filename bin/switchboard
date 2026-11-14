@@ -1060,11 +1060,16 @@ def herdr_on(machine, args, timeout=None, info=None, need_output=True):
     return herdr(["--machine", machine] + args, timeout)
 
 
+SPAWN_MARGIN = 3  # seconds for starting the processes involved (Python, herdr, ssh)
+
+
 def herdr_on_bound(timeout):
-    """The longest herdr_on() can take with that timeout: the ssh for all of it, then the
-    `herdr --machine` fallback for all of it again, plus 3 s for starting both. Anything
-    that waits for a herdr_on() from outside derives its wait from here."""
-    return 2 * timeout + 3
+    """The longest herdr_on() can take with that timeout, from the timeouts it uses:
+    machine_info()'s `herdr machine list` when no profile is passed (the --focus worker),
+    MACHINE_LIST_TIMEOUT; the ssh, then the `herdr --machine` fallback, `timeout` each; after
+    each of those three, run_child's KILL_WAIT for a killed child's pipe; and SPAWN_MARGIN.
+    Anything that waits for a herdr_on() from outside derives its wait from here."""
+    return (MACHINE_LIST_TIMEOUT + KILL_WAIT) + 2 * (timeout + KILL_WAIT) + SPAWN_MARGIN
 
 
 def snapshot(machine=LOCAL, timeout=None, info=None):
@@ -1088,10 +1093,13 @@ def focused_tab(snap):
     return tab if isinstance(tab, str) else None
 
 
+MACHINE_LIST_TIMEOUT = 3  # seconds for `herdr machine list` (saved_machines)
+
+
 def saved_machines():
     """The enabled saved machines, with ids herdr would produce and labels made plain."""
     try:
-        ms = json.loads(herdr(["machine", "list", "--json"], 3))
+        ms = json.loads(herdr(["machine", "list", "--json"], MACHINE_LIST_TIMEOUT))
     except Exception:
         return []
     return [dict(m, label=clean(m.get("label")) or m["id"]) for m in (ms if isinstance(ms, list) else [])
@@ -1730,8 +1738,9 @@ def focus_wait(name, row_id):
     """`--focus-wait NAME ROW`, fzf's background transform: wait for the worker's result file
     NAME in the popup's run directory and print it as the new footer. The directory is opened
     once, at the start, while the popup owns it, and only a regular file is read, never
-    through a symlink. It gives up a little after the longest the worker can take: herdr_on
-    may spend the remote timeout on ssh and then the same again on `herdr --machine`."""
+    through a symlink. Its deadline is herdr_on_bound() of the remote timeout, the longest
+    the worker's herdr_on() can take (the worker passes no profile, so that includes its
+    `herdr machine list`)."""
     target = parse_id(row_id)
     label = (machine_labels().get(target["machine"]) or target["machine"]) if target else ""
     dir_fd = open_private_dir(os.environ.get("SWITCHBOARD_RUN_DIR")) if RESULT_NAME.fullmatch(name) else None

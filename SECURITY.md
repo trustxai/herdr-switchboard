@@ -169,8 +169,9 @@ the popup still owned the directory; its environment is the cleaned one describe
 programs it runs*, plus the descriptor's number; and its command line holds only the bare name
 of its result file, which must match `focus-<digits>-<digits>`. If the popup has already removed
 the directory, the worker writes nothing; the focus has happened all the same. In the popup, a
-background fzf action waits for that file for up to twice the remote timeout plus three seconds
-and shows it in the footer.
+background fzf action waits for that file as long as the worker can take (its `herdr machine
+list`, then ssh and `herdr --machine` with the remote timeout each, plus the waits after a
+timeout: twice the remote timeout plus twelve seconds) and shows it in the footer.
 
 ### The state directory
 

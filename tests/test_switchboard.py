@@ -109,8 +109,9 @@ What it has to get right, and how it fails otherwise:
    files are created new and never through a symlink, and the worker gets a descriptor,
    not the directory's path. A removed and recreated directory with planted links catches
    nothing.
-36. --focus-wait waits as long as the worker can take (ssh, then herdr --machine, each with the
-   remote timeout), so the footer never says it failed before a slow focus lands.
+36. --focus-wait waits as long as the worker can take (its herdr machine list, then ssh and
+   herdr --machine with the remote timeout each, and the waits after a timeout), so the footer
+   never says it failed before a slow focus lands.
 37. A hung local herdr cannot freeze anything: the local snapshot has a timeout at open and in
    every refresh, the refresh keeps the last rows, and the popup says what failed.
 38. Closing the popup always removes its run directory, whatever local_seconds is and however
@@ -125,6 +126,8 @@ What it has to get right, and how it fails otherwise:
    are checked against closed character sets in the config, on the way and in the AppleScript.
 53. Reads started by the commands fzf runs (--preview, --copy, --select) end when fzf ends those
    commands, with the real fzf: cursor moves and Esc, or the popup told to leave while one hangs.
+54. herdr_on_bound covers the worker's lookup, both reads and the waits after a kill, from the
+   named timeouts, and --focus-wait waits that long.
 
     python3 tests/test_switchboard.py
 """
@@ -348,6 +351,43 @@ _late = subprocess.Popen([sys.executable, str(TOOL), "--rows"], stdin=subprocess
                          stderr=subprocess.DEVNULL, universal_newlines=True, start_new_session=True,
                          env=dict(os.environ, HERDR_BIN_PATH=str(_late_herdr), SWITCHBOARD_SSH=str(_late_ssh),
                                   SWITCHBOARD_REMOTE_TIMEOUT="6", HERDR_PLUGIN_STATE_DIR=os.path.join(_late_dir, "state")))
+
+# Also started here, checked in block 54: the --focus worker's worst case (a slow `herdr
+# machine list`, an ssh that hangs and leaves its pipe held from another session, then a
+# fallback that focuses), against --focus-wait's deadline. About 7.5 s with remote_timeout
+# 1.5, beyond the old deadline (twice the timeout plus 3 s).
+_slowfocus_dir = tempfile.mkdtemp(prefix="slowfocus-", dir=_tmp_root)
+_slowfocus_run = os.path.join(_slowfocus_dir, "run")
+os.mkdir(_slowfocus_run, 0o700)
+with open(os.path.join(_slowfocus_dir, "machines.json"), "w") as _f:
+    json.dump([{"id": "m1", "label": "box1", "enabled": True, "target": "box1-host"}], _f)
+_slowfocus_ssh = executable(os.path.join(_slowfocus_dir, "ssh"),
+                            '#!/bin/sh\n"%(py)s" -c "import os, time; os.setsid(); time.sleep(60)" &\n'
+                            'echo $! > "%(d)s/holder.pid"\nexec sleep 60\n' % {"py": sys.executable, "d": _slowfocus_dir})
+_slowfocus_herdr = executable(os.path.join(_slowfocus_dir, "herdr"),
+                              '#!/bin/sh\ncase "$*" in\n  "machine list --json") sleep 2.6; cat "%(d)s/machines.json" ;;\n'
+                              '  "--machine m1 agent focus w1:p1") sleep 1.2 ;;\n  *) exit 1 ;;\nesac\n'
+                              % {"d": _slowfocus_dir})
+_slowfocus_env = dict(os.environ, HERDR_BIN_PATH=str(_slowfocus_herdr), SWITCHBOARD_SSH=str(_slowfocus_ssh),
+                      SWITCHBOARD_REMOTE_TIMEOUT="1.5", SWITCHBOARD_RUN_DIR=_slowfocus_run,
+                      SWITCHBOARD_LABELS=json.dumps({"m1": "box1"}))
+_slowfocus_enter = subprocess.run([sys.executable, str(TOOL), "--enter", "m1|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE, universal_newlines=True, env=_slowfocus_env, timeout=20).stdout
+_slowfocus_name = re.search(r"--focus-wait (focus-[0-9]+-[0-9]+) ", _slowfocus_enter)
+_slowfocus_wait = subprocess.Popen([sys.executable, str(TOOL), "--focus-wait",
+                                    _slowfocus_name.group(1) if _slowfocus_name else "focus-0-0", "m1|a|w1:p1|w1:t1"],
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   universal_newlines=True, env=_slowfocus_env)
+
+
+def _slowfocus_cleanup():
+    try:
+        os.kill(int(open(os.path.join(_slowfocus_dir, "holder.pid")).read()), _signal.SIGKILL)
+    except (OSError, ValueError):
+        pass
+
+
+_atexit.register(_slowfocus_cleanup)
 
 # 1. Priority.
 block('1. Priority')
@@ -1597,8 +1637,10 @@ with tempfile.TemporaryDirectory() as d:
                    SWITCHBOARD_REMOTE_TIMEOUT=kw.get("timeout", "8"))
         if kw.get("cfg_dir"):
             env["HERDR_PLUGIN_CONFIG_DIR"] = str(kw["cfg_dir"])
+        # Past --focus-wait's own deadline, which comes from the program's bound.
+        cap = sb.herdr_on_bound(float(env["SWITCHBOARD_REMOTE_TIMEOUT"])) + 10
         r = subprocess.run([sys.executable, str(TOOL), mode] + list(args), stdin=subprocess.DEVNULL,
-                           stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
+                           stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=cap)
         return r.stdout.strip()
 
     def wait_for(path, seconds=6.0):
@@ -3610,6 +3652,27 @@ check("enter-starts-only-the-detached-worker", len(_enter_starts) == 1
       len(_enter_starts))
 check("fzf-commands-flagged", "FZF_COMMANDS = ([\"--preview\"], [\"--copy\"], [\"--select\"], [\"--enter\"], "
       "[\"--focus-wait\"])" in SOURCE and "FZF_COMMAND = argv[:1] in FZF_COMMANDS" in SOURCE)
+
+# 54. herdr_on_bound covers everything herdr_on() can do, from the timeouts it uses, and
+# --focus-wait waits that long: the focus above lands after the old deadline and is reported.
+block("54. herdr_on's bound")
+try:
+    slowfocus_out, _ = _slowfocus_wait.communicate(timeout=60)
+except subprocess.TimeoutExpired:
+    _slowfocus_wait.kill()
+    slowfocus_out, _ = _slowfocus_wait.communicate(timeout=10)
+check("focus-wait-covers-the-workers-worst-case", _slowfocus_name is not None
+      and slowfocus_out.strip().startswith("ready on box1"), slowfocus_out.strip())
+_bound_def = next(n for n in ast.walk(ast.parse(SOURCE)) if isinstance(n, ast.FunctionDef) and n.name == "herdr_on_bound")
+_bound_names = {n.id for n in ast.walk(_bound_def) if isinstance(n, ast.Name)}
+_bound_numbers = [n.value for n in ast.walk(_bound_def) if isinstance(n, ast.Constant) and isinstance(n.value, (int, float))
+                  and not isinstance(n.value, bool)]
+check("bound-built-from-the-named-timeouts", {"MACHINE_LIST_TIMEOUT", "KILL_WAIT", "SPAWN_MARGIN", "timeout"} <= _bound_names
+      and _bound_numbers == [2], (sorted(_bound_names), _bound_numbers))
+check("bound-timeouts-are-the-ones-used", 'herdr(["machine", "list", "--json"], MACHINE_LIST_TIMEOUT)' in SOURCE
+      and "p.communicate(timeout=KILL_WAIT)" in SOURCE and SOURCE.count("herdr_on_bound(REMOTE_TIMEOUT)") == 2)
+check("bound-covers-lookup-two-reads-and-kill-waits",
+      sb.herdr_on_bound(8) >= sb.MACHINE_LIST_TIMEOUT + sb.KILL_WAIT + 2 * (8 + sb.KILL_WAIT), sb.herdr_on_bound(8))
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
