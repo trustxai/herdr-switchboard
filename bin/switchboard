@@ -2358,6 +2358,34 @@ def mark_closing(run_dir):
             os.close(fd)
 
 
+REMOVE_WAIT = 0.5  # seconds the removal of the run directory goes on while something writes in it
+
+
+def remove_run_dir(path, dir_fd):
+    """Remove the run directory, also when another process writes into it meanwhile.
+
+    The focus worker can outlive the popup, and it writes its result file through a
+    descriptor of this directory whenever its focus is done. If that lands during a removal,
+    the final rmdir finds the directory not empty and the directory stays. So the removal is
+    repeated, for at most REMOVE_WAIT seconds, while `path` is still that directory: the one
+    `dir_fd` (held open since it was created, so its inode cannot be reused) refers to. Once
+    it is gone, nothing can be created in it: a write through a descriptor of a removed
+    directory fails. True when it is gone."""
+    end = time.time() + REMOVE_WAIT
+    ours = os.fstat(dir_fd)
+    while True:
+        shutil.rmtree(path, ignore_errors=True)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return True
+        if (st.st_dev, st.st_ino) != (ours.st_dev, ours.st_ino):
+            return True  # gone; what is there now is another directory
+        if time.time() >= end:
+            return False
+        time.sleep(0.01)
+
+
 def popup_closing():
     """True in a command fzf starts once the popup has begun ending fzf. end_fzf signals what
     is below fzf when it looks; a preview fzf starts after that is found by nothing, and fzf
@@ -3106,6 +3134,9 @@ def popup(self_cmd, demo=False):
     # The socket and the reloadable rows go in a private (0700), short directory: on macOS
     # a unix socket path cannot exceed 104 bytes.
     tmp = tempfile.mkdtemp(prefix="switchboard-", dir=os.environ.get("SWITCHBOARD_RUN_ROOT") or "/tmp")
+    # Held until the directory is removed: while it is open its inode cannot be reused, so the
+    # removal can tell this directory from a new one under the same name.
+    run_fd = os.open(tmp, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW)
     sock, rows_file, acks = os.path.join(tmp, "fzf.sock"), os.path.join(tmp, "rows"), os.path.join(tmp, "acks")
     stop = threading.Event()
     argv = fzf_argv(fzf, self_cmd, sock, remote_enter=remote_enter)
@@ -3122,6 +3153,10 @@ def popup(self_cmd, demo=False):
         hold_signals()  # the close starts: a SIGHUP or SIGTERM from here on waits for its end
     finally:
         hold_signals()  # (after a signal they are ignored anyway)
+        # No rows write, and so no reload or preview refresh asked of fzf, starts from here on;
+        # one under way finishes under `writes`, which the removal below waits for. watch() is
+        # not waited for: a pass may be waiting for a machine that does not answer.
+        stop.set()
         if proc is not None and proc.poll() is None:
             # Leaving on a signal: fzf goes too. Nothing else is sure to end it: the kernel
             # hangs it up only when this process leads the terminal's session, and macOS
@@ -3131,8 +3166,6 @@ def popup(self_cmd, demo=False):
             end_fzf(proc, terminal)
         if terminal is not None:
             os.close(terminal[0])
-        # watch() is not waited for: a pass may be waiting for a machine that does not answer.
-        stop.set()
         live.consume_acks(acks)  # an Enter on a remote row just before Esc
         # Always removed, and never while watch() writes into it: it writes only under
         # `writes` and only before stop, which is set. A pass still running after this cannot
@@ -3141,11 +3174,14 @@ def popup(self_cmd, demo=False):
         # directory that open_private_dir accepts as ours.
         held = writes.acquire(timeout=WRITE_WAIT)
         try:
-            shutil.rmtree(tmp, ignore_errors=True)
+            remove_run_dir(tmp, run_fd)
         finally:
             if held:
                 writes.release()
-    release_signals()  # the run directory is gone: a signal held meanwhile acts now
+            os.close(run_fd)
+    if not demo:
+        release_signals()  # the run directory is gone: a signal held meanwhile acts now
+    # (In --demo main acts on it, once the temporary state directory is gone too.)
     if proc.returncode == 2:
         # fzf refused its command line and drew nothing: say why instead of vanishing.
         reason = fzf_rejects(fzf, [a for a in argv[1:] if not a.startswith("--listen")]) or "exit 2"
@@ -3195,8 +3231,9 @@ def _exit_on_signal(signum, frame):
     """The first SIGHUP or SIGTERM exits through the finally blocks. Any later one is ignored:
     raised again inside a finally block, it would cut the cleanup short (a window that closes
     sends SIGHUP right after SIGTERM, for example). For the same reason, during a close that
-    already started (hold_signals()) a signal is only noted, and release_signals() acts on it
-    once the temporary directories are gone."""
+    already started (hold_signals(), once fzf has returned) a signal is only noted, and
+    release_signals() acts on it: the popup's call once its run directory is gone, or in
+    --demo main's call, once the temporary state directory is gone too."""
     if _HOLDING[0]:
         _HELD.append(signum)
         return

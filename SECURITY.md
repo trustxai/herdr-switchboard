@@ -133,14 +133,23 @@ because a Unix socket path is limited to 104 bytes on macOS; the tests move it w
 The parts of Switchboard that use the directory after the popup has started open it once, check
 that it is a real directory (not a symlink) owned by you with no access for group or others, and
 from then on work only through that descriptor: files are created with `O_NOFOLLOW` and mode
-0600, result files also with `O_EXCL`, and only regular files are read. The popup always
-removes the directory when it closes, and does not wait for a refresh still under way (a
-machine that does not answer can take the whole remote timeout). The rows are written only
-under a lock and only until the close starts, and the popup removes the directory holding that
-lock, so nothing is written into it while it is removed. A refresh that ends later cannot write
-anywhere else: its writes go through the removed directory's descriptor and fail, and fzf's
-socket is contacted only after such a write succeeded. A SIGHUP or SIGTERM that arrives once the
-close has started waits until the directory is gone, then ends the popup with its usual status.
+0600, result files also with `O_EXCL`, and only regular files are read. The popup always removes
+the directory when it closes, without waiting for a refresh still under way (a machine that does
+not answer can take the whole remote timeout) or for the focus worker. The close starts when fzf
+returns, or when a SIGHUP or SIGTERM arrives before that. From then on no rows write starts, so
+fzf is asked for no further reload; one already under way finishes under a lock, and the popup
+removes the directory once it holds that lock, or after two seconds without it (by then fzf is
+gone, so a write's requests to it fail at once). A refresh that ends later cannot write anywhere
+else: its writes go through the removed directory's descriptor and fail, and fzf's socket is
+contacted only after such a write succeeded. Another process can still write into the directory
+while it is being removed: the focus worker, whose result file (below) comes whenever its focus
+is done. The last step of the removal then finds the directory not empty, so the popup repeats
+the removal, for at most half a second, while the name is still that same directory (it keeps it
+open, so a new directory under the same name cannot be taken for it); nothing in Switchboard
+writes there for that long, and once the directory is gone nothing can be created in it any
+more. A SIGHUP or SIGTERM that arrives once the close has started waits until the directory is
+gone (in `--demo`, until its temporary state directory is gone too), then ends the popup with
+its usual status.
 
 The popup also closes this way when its window or session goes away: SIGHUP and SIGTERM exit
 through the same cleanup, which ends the popup's own fzf and removes the run directory (and, for
@@ -155,7 +164,8 @@ and fzf get SIGKILL. Whenever fzf did not leave on the first SIGTERM, whether it
 second step or was killed, the popup then also puts the terminal back itself (the settings it
 saved before starting fzf, and the sequences that leave the alternate screen and turn the mouse
 off). Ending fzf takes at most ten seconds: three waits of two seconds and two `ps` runs of up
-to two seconds each. Before its first SIGTERM to fzf the popup creates `closing` in the run
+to two seconds each. The removal of the run directory that follows adds at most two and a half
+seconds (above). Before its first SIGTERM to fzf the popup creates `closing` in the run
 directory, and a preview that fzf starts from then on reads nothing, nor does one that finds the
 run directory already gone: the popup's search for what is below fzf may be over by then, and
 fzf need not kill it on its way out. Only processes below the popup's fzf at that moment are

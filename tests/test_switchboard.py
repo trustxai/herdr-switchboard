@@ -144,6 +144,9 @@ What it has to get right, and how it fails otherwise:
    nothing more is written into the state directory.
 59. No ps line the program matches is cut by $COLUMNS, which fzf sets for its commands: every
    ps it runs asks for whole lines.
+60. The run directory goes also when another process (the focus worker) writes into it during
+   the removal, and a directory made under the same name afterwards is left alone. Once a close
+   by signal starts, no rows are written and fzf is asked for no reload.
 
     python3 tests/test_switchboard.py
 """
@@ -3765,7 +3768,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("closer-waits-for-a-write-in-progress", not early and got, (early, got))
     check("no-rows-write-after-stop", writes_done[0] == 1 and not t.is_alive(), writes_done[0])
 check("popup-removes-the-run-dir-under-the-lock", "held = writes.acquire(timeout=WRITE_WAIT)\n        try:\n"
-      "            shutil.rmtree(tmp, ignore_errors=True)" in SOURCE)
+      "            remove_run_dir(tmp, run_fd)" in SOURCE)
 
 # 56. Reads started by the commands fzf runs end with those commands, with the real fzf: a
 # popup over a remote machine whose `pane read` over ssh hangs. The fake ssh records each
@@ -4447,6 +4450,123 @@ _ps_calls = [n for n in ast.walk(ast.parse(SOURCE)) if isinstance(n, ast.List) a
 check("every-ps-asks-for-whole-lines", len(_ps_calls) >= 4 and all(
     any(isinstance(e, ast.Constant) and isinstance(e.value, str) and e.value.startswith("-ww") for e in n.elts)
     for n in _ps_calls), [ast.get_source_segment(SOURCE, n) for n in _ps_calls])
+
+# 60. The run directory goes, also when another process writes into it during the removal,
+# and nothing more is written into it once the close starts. The focus worker (Enter on
+# another machine's row, then Esc) writes its result file through a descriptor of the run
+# directory whenever its focus is done: forced here to land just before the removal's last
+# rmdir, which then finds the directory not empty. And a close by signal: no rows write, and
+# no reload asked of fzf, after the signal (a stand-in fzf that ignores SIGTERM keeps the
+# close in end_fzf for 4 s and logs every request it gets), leading the session and not.
+block("60. the run directory goes, whoever writes in it")
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    run60 = private_tmp(d, "run")
+    open(os.path.join(run60, "rows"), "w").close()
+    made60 = os.lstat(run60)
+    worker_fd = sb.open_private_dir(run60)  # what the focus worker holds
+    popup_fd = sb.open_private_dir(run60)  # what the popup holds
+    real_rmdir, wrote60 = os.rmdir, []
+
+    def rmdir_after_a_worker_write(path, *a, **kw):
+        try:
+            st = os.stat(path, dir_fd=kw.get("dir_fd"), follow_symlinks=False)
+        except OSError:
+            st = None
+        if st is not None and (st.st_dev, st.st_ino) == (made60.st_dev, made60.st_ino) and not wrote60:
+            wrote60.append(sb.write_new(worker_fd, "focus-1-1", "ready"))
+        return real_rmdir(path, *a, **kw)
+    remove60 = getattr(sb, "remove_run_dir", None) or (lambda path, fd: sb.shutil.rmtree(path, ignore_errors=True))
+    os.rmdir = rmdir_after_a_worker_write
+    try:
+        remove60(run60, popup_fd)
+    finally:
+        os.rmdir = real_rmdir
+        os.close(worker_fd)
+        os.close(popup_fd)
+    check("run-dir-goes-despite-a-worker-writing-in-it", wrote60 == [True] and not os.path.lexists(run60),
+          (wrote60, sorted(os.listdir(run60)) if os.path.isdir(run60) else None))
+    # Once it is gone, a directory someone else makes under the same name is not touched.
+    run60b = private_tmp(d, "run-b")
+    fd60b = sb.open_private_dir(run60b)
+
+    stranger = []
+
+    def rmdir_then_a_stranger(path, *a, **kw):
+        result = real_rmdir(path, *a, **kw)
+        if not stranger and not os.path.lexists(run60b):
+            stranger.append(True)
+            os.mkdir(run60b, 0o700)
+            open(os.path.join(run60b, "theirs"), "w").close()
+        return result
+    os.rmdir = rmdir_then_a_stranger
+    try:
+        if hasattr(sb, "remove_run_dir"):
+            sb.remove_run_dir(run60b, fd60b)
+    finally:
+        os.rmdir = real_rmdir
+        os.close(fd60b)
+    check("removal-leaves-a-new-directory-of-the-same-name-alone", stranger == [True]
+          and os.path.exists(os.path.join(run60b, "theirs")), stranger)
+check("popup-removes-its-run-dir-with-remove-run-dir", "            remove_run_dir(tmp, run_fd)" in SOURCE
+      and "shutil.rmtree(tmp" not in SOURCE)
+
+
+def requests_after_a_signal(leader):
+    """A popup over a stand-in fzf that answers its socket, logs each request's time, and
+    ignores SIGTERM; the local snapshot changes at every read, so every local pass (0.2 s)
+    writes the rows and asks fzf to reload. SIGTERM once requests flow. Returns (requests
+    received more than 0.5 s after the signal, rc, what is left in the run root)."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = private_tmp(d, "runs")
+        log, ready, count = (os.path.join(d, n) for n in ("requests", "ready", "count"))
+        stand_in = executable(os.path.join(d, "fzf"), "#!%s\nimport os, signal, socket, sys, time\n"
+                              "if '--version' in sys.argv:\n    print('0.74.2')\n    sys.exit(0)\n"
+                              "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                              "sock = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--listen='))\n"
+                              "srv = socket.socket(socket.AF_UNIX)\nsrv.bind(sock)\nsrv.listen(8)\n"
+                              "open(%r, 'w').close()\n"
+                              "while True:\n"
+                              "    c, _ = srv.accept()\n"
+                              "    data = c.recv(65536)\n"
+                              "    open(%r, 'a').write('%%f %%s\\n' %% (time.time(), data.split(b' ', 1)[0].decode()))\n"
+                              "    body = b'{\"position\": 0}' if data.startswith(b'GET') else b''\n"
+                              "    c.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: %%d\\r\\n\\r\\n' %% len(body) + body)\n"
+                              "    c.close()\n" % (sys.executable, ready, log))
+        fh = executable(os.path.join(d, "herdr"), "#!%s\nimport json, os, sys\n"
+                        "args = ' '.join(sys.argv[1:])\n"
+                        "if args == 'machine list --json':\n    print('[]')\n"
+                        "elif args == 'api snapshot':\n"
+                        "    n = int(open(%r).read()) + 1 if os.path.exists(%r) else 1\n"
+                        "    open(%r, 'w').write(str(n))\n"
+                        "    print(json.dumps({'result': {'snapshot': %r}}).replace('TITLE', 'row-%%d' %% n))\n"
+                        "else:\n    sys.exit(1)\n"
+                        % (sys.executable, count, count, count,
+                           snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="TITLE")])))
+        env = dict(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), SWITCHBOARD_FZF=str(stand_in),
+                   SWITCHBOARD_LOCAL_EVERY="0.2", SWITCHBOARD_RUN_ROOT=root, HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
+        pid, fd, pd = popup_in_pty(env, leader)
+        read_until(fd, lambda _b: os.path.exists(log) and len(open(log).read().split("\n")) > 4
+                   and os.path.exists(os.path.join(pd, "popup.pid")), 15)
+        target = int(open(os.path.join(pd, "popup.pid")).read())
+        t_sig = _time.time()
+        os.kill(target, _signal.SIGTERM)
+        rc, _ = popup_exit(pid, fd, pd, leader, 20)
+        late = [l for l in open(log).read().splitlines() if float(l.split()[0]) > t_sig + 0.5]
+        left = sorted(os.listdir(root))
+        finish(pid, fd, 0)
+        shutil.rmtree(pd, ignore_errors=True)
+        return late, rc, left
+
+
+for leader in (True, False):
+    late, rc, left = requests_after_a_signal(leader)
+    check("no-reload-asked-of-fzf-once-the-close-starts-%s" % ("leading" if leader else "not-leading"),
+          not late and rc == 128 + 15 and not left, (len(late), late[:3], rc, left))
+
+# In --demo the signal held during the close is acted on by main, after the temporary state
+# directory is gone too: popup() leaves it to main.
+check("demo-signals-released-after-the-state-dir", "    if not demo:\n        release_signals()" in SOURCE
+      and "            shutil.rmtree(STATE_DIR, ignore_errors=True)\n            release_signals()" in SOURCE)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
