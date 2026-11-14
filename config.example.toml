@@ -77,7 +77,14 @@ helper = ""
 # then the navigator's key, then "/" (which focuses the navigator's search; herdr fixes that
 # one). They must match the window's herdr config, [keys] prefix and [keys] goto. These are
 # herdr's own defaults (prefix "ctrl+b", goto "prefix+g"); with other bindings, the jump
-# would type into the pane instead. Accepted: prefix "ctrl+" and a letter; goto "prefix+"
-# and one key out of a-z, 0-9 and / ? ; , . = [ ] ' ` -.
+# would type into the pane instead. Accepted, exactly:
+#   prefix  "ctrl+" and one lower-case letter a-z.
+#   goto    "prefix+" and one key: a lower-case letter a-z, a digit 0-9, or one of
+#           / ? ; , . = [ ] ' ` -
+#           or herdr's name for one of those: minus, comma, period, slash, quote,
+#           semicolon, backtick (any case, like herdr).
+# Nothing else: no other modifier (shift, alt, cmd), no upper-case letter, no other named
+# key. A value that is not accepted turns the jump off for that run, the header says which,
+# and Enter then works as with enabled = false.
 prefix = "ctrl+b"
 goto = "prefix+g"

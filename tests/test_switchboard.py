@@ -2766,6 +2766,65 @@ for bad in ('\\x02g/" & do shell script "touch x', "\\x02g/\\r", "\\x00g/", "\\x
     except ValueError:
         pass
 
+# 42. A refused jump key turns the jump off, instead of typing herdr's default keys into a
+# herdr bound differently. Enter then works as with enabled = false.
+cfg, problems = sb.merge_config({"jump": {"enabled": True, "goto": "prefix+shift+g"}})
+check("jump-refused-goto-turns-it-off", cfg["jump"]["enabled"] is False
+      and any("jump.goto" in p and "jump is off" in p for p in problems), (cfg["jump"], problems))
+cfg, problems = sb.merge_config({"jump": {"prefix": "f12", "enabled": True}})  # enabled comes after the bad key
+check("jump-refused-prefix-turns-it-off", cfg["jump"]["enabled"] is False
+      and any("jump.prefix" in p and "jump is off" in p for p in problems), (cfg["jump"], problems))
+cfg, problems = sb.merge_config({"lang": "es", "jump": {"enabled": True, "goto": 7}})
+check("jump-off-message-in-spanish", cfg["jump"]["enabled"] is False
+      and any("jump.goto" in p and "salto queda apagado" in p for p in problems), problems)
+cfg, problems = sb.merge_config({"jump": {"enabled": True, "client": 7}})
+check("jump-other-bad-value-keeps-it-on", cfg["jump"]["enabled"] is True and problems, (cfg["jump"], problems))
+untypeable = json.loads(json.dumps(sb.DEFAULTS))
+untypeable["jump"].update(enabled=True, goto="prefix+\\")  # not through merge_config
+sb.configure(untypeable)
+try:
+    check("jump-configure-refuses-untypeable-keys", sb.JUMP_ENABLED is False and sb.enter_mode([{"id": "m1"}]) == (False, True),
+          sb.JUMP_ENABLED)
+finally:
+    sb.configure(sb.load_config()[0])
+    sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
+# herdr's named punctuation, for the characters the jump already types, in any case.
+for name, ch in (("minus", "-"), ("comma", ","), ("period", "."), ("slash", "/"), ("quote", "'"), ("semicolon", ";"),
+                 ("backtick", "`")):
+    check("jump-named-key %s" % name, sb.goto_keys("ctrl+b", "prefix+" + name) == "\\x02%s/" % ch
+          and sb.goto_keys("ctrl+b", "prefix+" + name.upper()) == "\\x02%s/" % ch, sb.goto_keys("ctrl+b", "prefix+" + name))
+for name in ("backslash", "double_quote", "double-quote", "colon", "percent", "ampersand", "plus", "space", "enter",
+             "f1", "G", "bac\u212atick", "m\u0131nus", "minus\n"):
+    check("jump-named-key-refused %r" % name, sb.goto_keys("ctrl+b", "prefix+" + name) is None)
+check("jump-named-keys-closed", all(len(c) == 1 and sb.KEYS_TEXT.fullmatch("\\x02%s/" % c) for c in sb.NAMED_KEYS.values()),
+      sb.NAMED_KEYS)
+check("jump-named-key-in-the-script", '"text:\\\\x02,/w1:p1\\\\r"'
+      in sb.ghostty_keys_script("/dev/ttys000", "w1:p1", sb.goto_keys("ctrl+b", "prefix+comma")))
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    (pathlib.Path(d) / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
+    fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%s/machines.json" ;;\n'
+                                             '  *) exit 0 ;;\nesac\n' % d)
+    cfg_dir = os.path.join(d, "cfg")
+    os.mkdir(cfg_dir)
+
+    def enter_with(jump_toml):
+        with open(os.path.join(cfg_dir, "config.toml"), "w") as f:
+            f.write("[jump]\n" + jump_toml)
+        env = dict(os.environ, HERDR_BIN_PATH=str(fh), HERDR_PLUGIN_CONFIG_DIR=cfg_dir,
+                   SWITCHBOARD_RUN_DIR=private_tmp(d, "run-%d" % len(os.listdir(d))),
+                   SWITCHBOARD_LABELS=json.dumps({"m1": "box1"}))
+        out = subprocess.run([sys.executable, str(TOOL), "--enter", "m1|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=20).stdout
+        rows = subprocess.run([sys.executable, str(TOOL), "--demo", "--rows"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=20).stdout
+        return out, rows.splitlines()[0] if rows else ""
+
+    out, header = enter_with('enabled = true\ngoto = "prefix+shift+g"\n')
+    check("jump-refused-key-enter-is-api-focus", out.startswith("change-footer") and "accept" not in out, out)
+    check("jump-refused-key-says-so-in-the-header", "jump.goto" in header and "jump is off" in header, header)
+    out, header = enter_with('enabled = true\ngoto = "prefix+slash"\n')
+    check("jump-good-key-enter-accepts", out.strip() == "accept" and "jump" not in header, (out, header))
+
 # 43. What the jump types is matched whole: a final newline is not let through.
 for tty, query in (("/dev/ttys000", "w1:p1\n"), ("/dev/ttys000", "w1:p1\r"), ("/dev/ttys000\n", "w1:p1"),
                    ("/dev/ttys\u00e9", "w1:p1"), ('/dev/ttys000"', "w1:p1")):

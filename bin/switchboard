@@ -170,6 +170,7 @@ STRINGS = {
             "Config: %s\n"),
         "cfg_unknown": "unknown option %s",
         "cfg_bad_value": "bad value for %s",
+        "cfg_jump_off": "bad value for %s, so the jump is off",
         "cfg_not_table": "[%s] must be a table",
         "toml_bad_escape": "line %d: bad escape sequence",
         "toml_control": "line %d: control character in a string",
@@ -248,6 +249,7 @@ STRINGS = {
             "Config: %s\n"),
         "cfg_unknown": "opción desconocida %s",
         "cfg_bad_value": "valor inválido para %s",
+        "cfg_jump_off": "valor inválido para %s, así que el salto queda apagado",
         "cfg_not_table": "[%s] tiene que ser una tabla",
         "toml_bad_escape": "línea %d: secuencia de escape inválida",
         "toml_control": "línea %d: carácter de control dentro de un texto",
@@ -326,19 +328,36 @@ NUMBER_RANGES = {
 # the prefix (ctrl plus a letter) and the navigator's key after it (one plain key). They end
 # up inside an AppleScript string and Ghostty's text: action, so only these characters.
 PREFIX_KEY = re.compile(r"ctrl\+([a-z])")
-GOTO_KEY = re.compile(r"prefix\+([a-z0-9/?;,.=\[\]'`-])")
+# herdr's names for punctuation keys (parse_key_combo in src/config/keybinds.rs, herdr
+# 0.9.5, which compares them in lower case), only those whose character is already in the
+# set above. Each name types exactly that one character; herdr's other names (backslash,
+# double_quote, colon, percent, ampersand, plus) stay refused.
+NAMED_KEYS = {"minus": "-", "comma": ",", "period": ".", "slash": "/", "quote": "'", "semicolon": ";",
+              "backtick": "`"}
+# One character of the set, or an ASCII word looked up in NAMED_KEYS (in lower case, after
+# the match: a case-insensitive regex would also take non-ASCII look-alikes).
+GOTO_KEY = re.compile(r"prefix\+(?:([a-z0-9/?;,.=\[\]'`-])|([A-Za-z]+))")
 # The text Ghostty is asked to type: the prefix as \xNN, the navigator key, and "/" (the key
 # that focuses the navigator's search, fixed in herdr).
 KEYS_TEXT = re.compile(r"\\x(0[1-9a-f]|1[0-9a])[a-z0-9/?;,.=\[\]'`-]/")
 
 
+def goto_char(goto):
+    """The character herdr's navigator key `goto` types, or None when the jump does not
+    accept it."""
+    g = GOTO_KEY.fullmatch(goto) if isinstance(goto, str) else None
+    if not g:
+        return None
+    return g.group(1) or NAMED_KEYS.get(g.group(2).lower())
+
+
 def goto_keys(prefix, goto):
     """The Ghostty text for these herdr keys, or None when either is not accepted."""
-    p = PREFIX_KEY.fullmatch(prefix or "")
-    g = GOTO_KEY.fullmatch(goto or "")
-    if not p or not g:
+    p = PREFIX_KEY.fullmatch(prefix) if isinstance(prefix, str) else None
+    key = goto_char(goto)
+    if not p or key is None:
         return None
-    return "\\x%02x%s/" % (ord(p.group(1)) - 96, g.group(1))
+    return "\\x%02x%s/" % (ord(p.group(1)) - 96, key)
 
 
 COLOR_VALUE = re.compile(r"(-1|#[0-9a-fA-F]{6}|25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]"
@@ -573,7 +592,7 @@ def _check(default, value, where=None):
 def merge_config(raw):
     """DEFAULTS with the user's values on top, and the problems found on the way (in the
     language the file asks for, when it asks for a valid one)."""
-    cfg, problems = copymod.deepcopy(DEFAULTS), []
+    cfg, problems, jump_refused = copymod.deepcopy(DEFAULTS), [], False
     lang = raw.get("lang") if isinstance(raw.get("lang"), str) and raw.get("lang") in STRINGS else None
     for key, value in raw.items():
         if key not in DEFAULTS:
@@ -594,9 +613,14 @@ def merge_config(raw):
                     got = None
                 if key == "jump" and got is not None and (
                         sub == "prefix" and not PREFIX_KEY.fullmatch(got)
-                        or sub == "goto" and not GOTO_KEY.fullmatch(got)):
+                        or sub == "goto" and goto_char(got) is None):
                     got = None
-                if got is None:
+                if got is None and key == "jump" and sub in ("prefix", "goto"):
+                    # The default keys would be typed into a herdr bound differently: the
+                    # jump stays off instead (Enter focuses through the API).
+                    jump_refused = True
+                    problems.append(tr("cfg_jump_off", key + "." + sub, lang=lang))
+                elif got is None:
                     problems.append(tr("cfg_bad_value", key + "." + sub, lang=lang))
                 else:
                     cfg[key][sub] = got
@@ -608,6 +632,8 @@ def merge_config(raw):
             problems.append(tr("cfg_bad_value", key, lang=lang))
         else:
             cfg[key] = got
+    if jump_refused:
+        cfg["jump"]["enabled"] = False
     return cfg, problems
 
 
@@ -672,11 +698,12 @@ def configure(cfg, warning=None):
     CACHE_MAX_AGE = refresh["cache_max_age"]
     REMOTE_HERDR = os.environ.get("SWITCHBOARD_REMOTE_HERDR") or cfg["remote"]["herdr"]
     COLORS = dict(cfg["colors"])
-    JUMP_ENABLED = cfg["jump"]["enabled"]
     JUMP_CLIENT = cfg["jump"]["client"]
     JUMP_HELPER = cfg["jump"]["helper"]
-    JUMP_KEYS = goto_keys(cfg["jump"]["prefix"], cfg["jump"]["goto"]) or goto_keys(
-        DEFAULTS["jump"]["prefix"], DEFAULTS["jump"]["goto"])
+    keys = goto_keys(cfg["jump"]["prefix"], cfg["jump"]["goto"])
+    # Keys that cannot be typed turn the jump off; never the default keys in their place.
+    JUMP_ENABLED = bool(cfg["jump"]["enabled"]) and keys is not None
+    JUMP_KEYS = keys or goto_keys(DEFAULTS["jump"]["prefix"], DEFAULTS["jump"]["goto"])
 
 
 try:
