@@ -2490,22 +2490,38 @@ def jump(label, kind, pane, tab, query, rename, old_label, keys=None, wait=0.15,
             osa.kill()
         run_out([HERDR] + focus, timeout=10)
         return 2 if refused else 0
-    if rename:
-        run_out([HERDR] + api + ["pane", "rename", pane, query], timeout=10)
-        time.sleep(0.8)  # let the new name reach the window
-    if osa is not None:
-        osa.communicate(script.encode("utf-8"), timeout=10)
-    else:
-        subprocess.run([OSASCRIPT, "-e", script], stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, env=child_env())
-    time.sleep(0.6)
-    if rename:
-        # The label goes as it is: herdr takes a label that starts with "-" as text, and a
-        # "--" in front would become part of the label (checked against herdr 0.9.5).
-        run_out([HERDR] + api + ["pane", "rename", pane] + ([old_label] if old_label else ["--clear"]), timeout=10)
-    # In case the Goto landed on another pane of that machine, this puts it right.
-    run_out([HERDR] + focus, timeout=10)
-    return 0
+    # Once the pane may carry the temporary name, the name comes back and the focus goes
+    # out whatever happens to the typing: osascript timing out (macOS asking for the
+    # Automation permission), osascript missing, or a SIGHUP, which main turns into an exit.
+    renamed, typed = False, False
+    try:
+        if rename:
+            renamed = True
+            run_out([HERDR] + api + ["pane", "rename", pane, query], timeout=10)
+            time.sleep(0.8)  # let the new name reach the window
+        if osa is not None:
+            osa.communicate(script.encode("utf-8"), timeout=10)
+        else:
+            subprocess.run([OSASCRIPT, "-e", script], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=10, env=child_env())
+        time.sleep(0.6)
+        typed = True
+    except (OSError, subprocess.SubprocessError):
+        pass
+    finally:
+        if osa is not None:
+            try:
+                osa.kill()  # still waiting after a timeout; nothing when it already finished
+            except Exception:
+                pass
+        if renamed:
+            # The label goes as it is: herdr takes a label that starts with "-" as text, and
+            # a "--" in front would become part of the label (checked against herdr 0.9.5).
+            run_out([HERDR] + api + ["pane", "rename", pane] + ([old_label] if old_label else ["--clear"]),
+                    timeout=10)
+        # In case the Goto landed on another pane of that machine, this puts it right.
+        run_out([HERDR] + focus, timeout=10)
+    return 0 if typed else 2
 
 
 def jump_argv(target, label, entries):

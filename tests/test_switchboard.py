@@ -3174,6 +3174,52 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         os.environ.update(saved_env)
     check("child-env-keeps-the-rest", sorted(got) == ["KEEP", "PATH"], sorted(got))
 
+# 48. Once the pane may carry the temporary name, the name comes back and the focus goes out,
+# whatever happens to the typing.
+block("48. jump restores the name")
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    calls48 = os.path.join(d, "calls")
+    fh48 = executable(os.path.join(d, "herdr"), '#!/bin/sh\necho "$*" >> "%s"\n' % calls48)
+
+    def calls_taken():
+        lines = open(calls48).read().splitlines() if os.path.exists(calls48) else []
+        if os.path.exists(calls48):
+            os.remove(calls48)
+        return lines
+
+    class Osa48:
+        def __init__(self, exc):
+            self.exc, self.killed = exc, False
+
+        def communicate(self, data, timeout=None):
+            raise self.exc
+
+        def kill(self):
+            self.killed = True
+
+    restored = ["--machine box1 pane rename w1:p1 sbjabc", "--machine box1 pane rename w1:p1 logs",
+                "--machine box1 agent focus w1:p1"]
+    saved48 = (sb.HERDR, sb.OSASCRIPT)
+    sb.HERDR = str(fh48)
+    try:
+        args48 = dict(label="box1", kind="a", pane="w1:p1", tab="w1:t1", query="sbjabc", rename=True,
+                      old_label="logs", keys="\\x02g/", wait=0, tty="/dev/ttys000")
+        osa = Osa48(subprocess.TimeoutExpired(["osascript"], 10))
+        rc = sb.jump(osa=osa, **args48)
+        check("jump-osascript-timeout-restores", rc == 2 and calls_taken() == restored and osa.killed, rc)
+        osa = Osa48(SystemExit(129))  # what main's handler raises on SIGHUP
+        try:
+            sb.jump(osa=osa, **args48)
+            check("jump-hangup-propagates", False)
+        except SystemExit:
+            pass
+        check("jump-hangup-restores", calls_taken() == restored and osa.killed)
+        sb.OSASCRIPT = os.path.join(d, "no-such-osascript")
+        rc = sb.jump(**args48)
+        check("jump-no-osascript-restores", rc == 2 and calls_taken() == restored, rc)
+    finally:
+        sb.HERDR, sb.OSASCRIPT = saved48
+
 # 50. Nothing in the tests or the program waits without a bound on a child, a thread or a
 # terminal (the popup's wait for fzf is the user's: it ends with a key or a signal).
 block("50. bounded waits")
