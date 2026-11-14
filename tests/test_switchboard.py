@@ -128,6 +128,7 @@ What it has to get right, and how it fails otherwise:
    commands, with the real fzf: cursor moves and Esc, or the popup told to leave while one hangs.
 54. herdr_on_bound covers the worker's lookup, both reads and the waits after a kill, from the
    named timeouts, and --focus-wait waits that long.
+55. Nothing the watch loop started writes into a directory while it is removed.
 
     python3 tests/test_switchboard.py
 """
@@ -628,7 +629,8 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     lv = sb.Live(machines, sb.entries_from(fake_fetch(), "", "here", 0), fetch=fake_fetch)
     lv.changed()
     rows_file, stop = os.path.join(d, "rows"), _threading.Event()
-    _threading.Thread(target=sb.watch, args=(lv, sock, rows_file, stop), daemon=True).start()
+    w9a = _threading.Thread(target=sb.watch, args=(lv, sock, rows_file, stop), daemon=True)
+    w9a.start()
     _time.sleep(0.5)
     posts = [r for r in fz.reqs if r.startswith(b"POST") and b"reload-sync" in r]
     check("watch-reloads-when-remote-arrives", len(posts) == 1, len(posts))
@@ -640,6 +642,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     _time.sleep(0.4)
     check("watch-reloads-on-change", len([r for r in fz.reqs if b"reload-sync" in r]) == 2)
     stop.set()
+    w9a.join(5)  # each watch loop is done before its directory goes
     # With a slow local tick (5 s), a machine arriving still reloads at once.
     _time.sleep(0.2)
     sb.LOCAL_EVERY, sb.REMOTE_EVERY = 5.0, 5.0
@@ -648,10 +651,13 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     lv2.changed()
     before = len([r for r in fz.reqs if b"reload-sync" in r])
     stop2 = _threading.Event()
-    _threading.Thread(target=sb.watch, args=(lv2, sock, os.path.join(d, "rows2"), stop2), daemon=True).start()
+    w9b = _threading.Thread(target=sb.watch, args=(lv2, sock, os.path.join(d, "rows2"), stop2), daemon=True)
+    w9b.start()
     _time.sleep(0.6)
     check("watch-remote-reloads-now", len([r for r in fz.reqs if b"reload-sync" in r]) > before)
     stop2.set()
+    w9b.join(5)
+    check("watch-loops-done-before-the-directory-goes", not w9a.is_alive() and not w9b.is_alive())
     sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
 
 # A change that happens before fzf opens --listen (a machine that answers at once) reaches
@@ -2245,9 +2251,11 @@ with tempfile.TemporaryDirectory() as d:
         FakeFzf(sock)
         stop = _threading.Event()
         lv.changed()
-        t = _threading.Thread(target=sb.watch, args=(lv, sock, str(gone / "rows"), stop, None), daemon=True)
+        writes31 = _threading.Lock()  # as the popup does: the directory goes only while no rows write runs
+        t = _threading.Thread(target=sb.watch, args=(lv, sock, str(gone / "rows"), stop, None, writes31), daemon=True)
         t.start()
-        shutil.rmtree(str(gone))
+        with writes31:
+            shutil.rmtree(str(gone))
         vivid["local"] = snap17(T1, ag17("p1", "blocked", 7, T1))
         _time.sleep(0.4)
         stop.set()
@@ -3679,6 +3687,73 @@ check("bound-timeouts-are-the-ones-used", 'herdr(["machine", "list", "--json"], 
       and "p.communicate(timeout=KILL_WAIT)" in SOURCE and SOURCE.count("herdr_on_bound(REMOTE_TIMEOUT)") == 2)
 check("bound-covers-lookup-two-reads-and-kill-waits",
       sb.herdr_on_bound(8) >= sb.MACHINE_LIST_TIMEOUT + sb.KILL_WAIT + 2 * (8 + sb.KILL_WAIT), sb.herdr_on_bound(8))
+
+# 55. Nothing the watch loop started writes into a directory while it is removed: watch()
+# returns only after its remote reads (bounded), writes the rows only under the lock the popup
+# holds while it removes the run directory, and never after stop.
+block("55. the watch loop and the directories it writes")
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    rows55 = private_tmp(d, "rows55")
+    inflight = [0]
+
+    def slow_fetch(m="", t=None, i=None):
+        if m:
+            inflight[0] += 1
+            _time.sleep(0.6)
+            inflight[0] -= 1
+        return snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)])
+    lv = sb.Live([{"id": "m1", "label": "box1"}], sb.entries_from(slow_fetch(), "", "here", 0), fetch=slow_fetch,
+                 cache=False)
+    stop = _threading.Event()
+    t = _threading.Thread(target=sb.watch, args=(lv, short_sock("w55"), os.path.join(rows55, "rows"), stop), daemon=True)
+    t.start()
+    _time.sleep(0.2)  # a remote read is under way
+    stop.set()
+    t.join(5)
+    check("watch-waits-for-its-remote-reads", not t.is_alive() and inflight[0] == 0, inflight[0])
+
+    # A rows write in progress holds the lock; the closer gets it only after; after stop, none.
+    data55 = {"n": 1}
+    lv = sb.Live([], sb.entries_from(snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)]), "", "here", 0),
+                 fetch=lambda m="", t=None, i=None: snap([pane("w1:p1")], [agent("w1:p1", "idle", data55["n"])]),
+                 cache=False)
+    lv.changed()
+    entered, release, writes_done = _threading.Event(), _threading.Event(), [0]
+    real_replace = sb.os.replace
+
+    def held_replace(src, dst, *a, **kw):
+        if "rows" in str(dst) and kw.get("dst_dir_fd") is not None:
+            entered.set()
+            release.wait(5)
+            writes_done[0] += 1
+        return real_replace(src, dst, *a, **kw)
+    writes = _threading.Lock()
+    stop = _threading.Event()
+    sb.os.replace = held_replace
+    try:
+        t = _threading.Thread(target=sb.watch, args=(lv, short_sock("w55b"), os.path.join(rows55, "rows"), stop,
+                                                     None, writes), daemon=True)
+        t.start()
+        data55["n"] = 2
+        entered.wait(5)  # a pass is writing the rows
+        early = writes.acquire(timeout=0.3)
+        if early:
+            writes.release()
+        release.set()
+        got = writes.acquire(timeout=5)
+        data55["n"] = 3  # the next pass has something to write, and waits for the lock
+        _time.sleep(0.4)
+        stop.set()
+        if got:
+            writes.release()
+        t.join(5)
+    finally:
+        sb.os.replace = real_replace
+    check("closer-waits-for-a-write-in-progress", not early and got, (early, got))
+    check("no-rows-write-after-stop", writes_done[0] == 1 and not t.is_alive(), writes_done[0])
+check("popup-removes-the-run-dir-under-the-lock", "held = writes.acquire(timeout=WATCH_JOIN)\n        try:\n"
+      "            shutil.rmtree(tmp, ignore_errors=True)" in SOURCE)
+
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]

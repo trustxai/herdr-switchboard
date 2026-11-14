@@ -1530,13 +1530,23 @@ def reload_action(rows_file, position):
     return action if not position else "track-current+" + action
 
 
-def watch(live, sock, rows_file, stop, acks=None):
+WATCH_JOIN = 2  # seconds watch() waits for its remote threads on the way out
+
+
+def watch(live, sock, rows_file, stop, acks=None, writes=None):
     """Until the popup closes: whenever something changed, have fzf reload `rows_file`.
 
     Without `track-current` the cursor stays at the same position and lands on another
     agent (see reload_action). The reload reads a file already written: while tracking,
     fzf blocks input until the load finishes, and asking a remote machine takes long.
+
+    The rows are written only under `writes` and only while `stop` is not set, so whoever
+    removes the run directory holding `writes` after setting stop (the popup) never races a
+    write. On the way out it waits up to WATCH_JOIN seconds for its remote threads, so when
+    it returns nothing it started is still writing (the snapshot cache, the recency file),
+    unless a remote read outlasts that wait.
     """
+    writes = writes or threading.Lock()
     # When a machine answers, reload at once instead of on the next local tick.
     kick = threading.Event()
 
@@ -1569,16 +1579,19 @@ def watch(live, sock, rows_file, stop, acks=None):
         # nothing new: otherwise a machine that answered before fzf listened would stay
         # "loading" until something else changed.
         sent = None
-        try:
-            fd = os.open(rows_name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
-                         dir_fd=rows_dir)
-            with os.fdopen(fd, "w") as f:
-                f.write(text)
-            os.replace(rows_name + ".tmp", rows_name, src_dir_fd=rows_dir, dst_dir_fd=rows_dir)
-            sent = fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
-        finally:
-            if sent is None:
-                live.unsent()
+        with writes:
+            if stop.is_set():
+                return  # closing: the directory may be on its way out
+            try:
+                fd = os.open(rows_name + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600,
+                             dir_fd=rows_dir)
+                with os.fdopen(fd, "w") as f:
+                    f.write(text)
+                os.replace(rows_name + ".tmp", rows_name, src_dir_fd=rows_dir, dst_dir_fd=rows_dir)
+                sent = fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
+            finally:
+                if sent is None:
+                    live.unsent()
 
     def nap():
         """Until the next local pass is due, a machine answers, or stop is set. stop is
@@ -1590,8 +1603,9 @@ def watch(live, sock, rows_file, stop, acks=None):
                 break
         kick.clear()
 
-    for i, m in enumerate(live.machines):
-        threading.Thread(target=remote_loop, args=(i, m), daemon=True).start()
+    remotes = [threading.Thread(target=remote_loop, args=(i, m), daemon=True) for i, m in enumerate(live.machines)]
+    for t in remotes:
+        t.start()
     try:
         while not stop.is_set():
             nap()
@@ -1604,6 +1618,9 @@ def watch(live, sock, rows_file, stop, acks=None):
     finally:
         if rows_dir is not None:
             os.close(rows_dir)
+        deadline = time.time() + WATCH_JOIN
+        for t in remotes:
+            t.join(max(0.0, deadline - time.time()))
 
 
 # --- actions ----------------------------------------------------------------------------
@@ -2963,7 +2980,8 @@ def popup(self_cmd, demo=False):
     stop = threading.Event()
     argv = fzf_argv(fzf, self_cmd, sock, remote_enter=remote_enter)
     labels = {m["id"]: m["label"] for m in machines}
-    watcher = threading.Thread(target=watch, args=(live, sock, rows_file, stop, acks), daemon=True)
+    writes = threading.Lock()  # held by watch() while it writes the rows, by us while we remove them
+    watcher = threading.Thread(target=watch, args=(live, sock, rows_file, stop, acks, writes), daemon=True)
     proc = None
     try:
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True,
@@ -2980,11 +2998,17 @@ def popup(self_cmd, demo=False):
         if watcher.is_alive():
             watcher.join(2)  # stop wakes it; a pass already under way may take a moment
         live.consume_acks(acks)  # an Enter on a remote row just before Esc
-        # Always removed. A pass of watch() still running after this cannot reach anything
-        # else: the rows go through the old descriptor (now ENOENT), fzf's socket is only
-        # contacted after a rows write succeeded, and the acks only through a directory
-        # that open_private_dir accepts as ours.
-        shutil.rmtree(tmp, ignore_errors=True)
+        # Always removed, and never while watch() writes into it: it writes only under
+        # `writes` and only before stop, which is set. A pass still running after this cannot
+        # reach anything else: the rows go through the old descriptor (now ENOENT), fzf's
+        # socket is only contacted after a rows write succeeded, and the acks only through a
+        # directory that open_private_dir accepts as ours.
+        held = writes.acquire(timeout=WATCH_JOIN)
+        try:
+            shutil.rmtree(tmp, ignore_errors=True)
+        finally:
+            if held:
+                writes.release()
     if proc.returncode == 2:
         # fzf refused its command line and drew nothing: say why instead of vanishing.
         reason = fzf_rejects(fzf, [a for a in argv[1:] if not a.startswith("--listen")]) or "exit 2"
