@@ -3246,6 +3246,27 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     finally:
         sb.HERDR, sb.OSASCRIPT = saved48
 
+# 49. The header says what happens with each value it refused, and nothing untrue: a refused
+# jump key does not mean the default keys are in use.
+block("49. config header wording")
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "config.toml")
+    with open(path, "w") as f:
+        f.write('[jump]\nenabled = true\ngoto = "prefix+shift+g"\n')
+    _, warn = sb.load_config(path)
+    check("header-refused-jump-key", warn == "config %s: bad value for jump.goto, so the jump is off" % path, warn)
+    with open(path, "w") as f:
+        f.write('lang = "es"\n[jump]\nenabled = true\ngoto = "prefix+shift+g"\n')
+    _, warn = sb.load_config(path)
+    check("header-refused-jump-key-es",
+          warn == "config %s: valor inválido para jump.goto, así que el salto queda apagado" % path, warn)
+    with open(path, "w") as f:
+        f.write('nope = 1\n[refresh]\nlocal_seconds = 999\n')
+    _, warn = sb.load_config(path)
+    check("header-each-problem-says-what-happens",
+          warn == "config %s: unknown option nope (ignored); bad value for refresh.local_seconds (default used)" % path,
+          warn)
+
 # 50. Nothing in the tests or the program waits without a bound on a child, a thread or a
 # terminal (the popup's wait for fzf is the user's: it ends with a key or a signal).
 block("50. bounded waits")

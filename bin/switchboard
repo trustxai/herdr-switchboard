@@ -144,6 +144,7 @@ STRINGS = {
         "remote_ready": "ready on %s: switch to that machine to see it · esc closes",
         "remote_failed": "could not focus it on %s · esc closes",
         "config_warning": "config %s: %s (defaults in use)",
+        "config_problems": "config %s: %s",
         "need_python": "switchboard needs Python %s or newer; found Python %s (%s).",
         "install_python_macos": "Install the Command Line Tools (xcode-select --install) for"
                                 " /usr/bin/python3, or a newer Python with Homebrew.",
@@ -168,10 +169,10 @@ STRINGS = {
             "    switchboard --rows          print the rows without fzf\n"
             "    switchboard --version\n\n"
             "Config: %s\n"),
-        "cfg_unknown": "unknown option %s",
-        "cfg_bad_value": "bad value for %s",
+        "cfg_unknown": "unknown option %s (ignored)",
+        "cfg_bad_value": "bad value for %s (default used)",
         "cfg_jump_off": "bad value for %s, so the jump is off",
-        "cfg_not_table": "[%s] must be a table",
+        "cfg_not_table": "[%s] must be a table (defaults used)",
         "toml_bad_escape": "line %d: bad escape sequence",
         "toml_control": "line %d: control character in a string",
         "toml_unterminated": "line %d: unterminated string",
@@ -222,6 +223,7 @@ STRINGS = {
         "remote_ready": "lista en %s: pasá a esa máquina para verla · esc cierra",
         "remote_failed": "no se pudo enfocar en %s · esc cierra",
         "config_warning": "config %s: %s (se usan los valores por defecto)",
+        "config_problems": "config %s: %s",
         "need_python": "switchboard necesita Python %s o más nuevo; se encontró Python %s (%s).",
         "install_python_macos": "Instalá las Command Line Tools (xcode-select --install) para"
                                 " tener /usr/bin/python3, o un Python más nuevo con Homebrew.",
@@ -247,10 +249,10 @@ STRINGS = {
             "    switchboard --rows          las filas, sin fzf\n"
             "    switchboard --version\n\n"
             "Config: %s\n"),
-        "cfg_unknown": "opción desconocida %s",
-        "cfg_bad_value": "valor inválido para %s",
+        "cfg_unknown": "opción desconocida %s (se ignora)",
+        "cfg_bad_value": "valor inválido para %s (se usa el valor por defecto)",
         "cfg_jump_off": "valor inválido para %s, así que el salto queda apagado",
-        "cfg_not_table": "[%s] tiene que ser una tabla",
+        "cfg_not_table": "[%s] tiene que ser una tabla (se usan los valores por defecto)",
         "toml_bad_escape": "línea %d: secuencia de escape inválida",
         "toml_control": "línea %d: carácter de control dentro de un texto",
         "toml_unterminated": "línea %d: texto sin cerrar",
@@ -656,7 +658,9 @@ def load_config(path=None, use_tomllib=None):
         return copymod.deepcopy(DEFAULTS), tr("config_warning", path, reason)
     if not problems:
         return cfg, None
-    return cfg, tr("config_warning", path, "; ".join(problems), lang=cfg["lang"])
+    # Each problem says what happens with it: a refused jump key does not mean the default
+    # keys are in use, so the line as a whole claims nothing about defaults.
+    return cfg, tr("config_problems", path, "; ".join(problems), lang=cfg["lang"])
 
 
 def _env_float(name, default):
