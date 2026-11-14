@@ -76,18 +76,10 @@ jobs:
           print("python3", sys.version.split()[0], "| fzf", out.strip())
           EOF
 
-      # Guard: bin/switchboard and tests/test_switchboard.py arrive with the port
-      # pull request. These two steps are skipped only while NEITHER file exists;
-      # as soon as either one does, they run, and `make test` fails when the
-      # program is there without its test file. Remove both `if:` lines, and the
-      # skip branch of the Makefile's test target, once the port has landed on
-      # main, so a missing file always fails the build.
       - name: Byte-compile with Python ${{ matrix.python }}
-        if: hashFiles('bin/switchboard', 'tests/test_switchboard.py') != ''
         run: make compile
 
       - name: Run the tests
-        if: hashFiles('bin/switchboard', 'tests/test_switchboard.py') != ''
         run: make test
 
   lint:

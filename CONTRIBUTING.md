@@ -37,6 +37,13 @@ real herdr, never opens an ssh connection and never touches your clipboard: it r
 against a fake `herdr` and fake fixtures. Keep it that way. A test that focuses or renames
 panes in your real herdr session would move you around while you work.
 
+The suite must not hang either. Each block announces itself on stderr and has a 120-second
+watchdog: past it, the run ends with every thread's stack (file, line, function) and the
+block's name. A child started on a pseudo-terminal is reaped through `finish()`, which keeps
+reading its terminal while it waits and kills its process group past a bound: a wait that stops
+reading can block forever on macOS, where an exiting session leader first waits for its
+terminal's output to drain.
+
 CI runs the suite on Ubuntu and macOS with Python 3.9 and the newest stable Python, plus
 `make lint` and a gitleaks scan of the whole history. `make check` runs the same targets
 locally; ruff and gitleaks are skipped with a message when they are not installed.
@@ -47,8 +54,21 @@ locally; ruff and gitleaks are skipped with a message when they are not installe
 - **Python 3.9 syntax.** No `match`, no `X | Y` in annotations that are evaluated (use
   `Optional[X]` or `Union[X, Y]`), no parenthesised context managers, no `from __future__`.
   ruff (`make lint`) and the 3.9 CI jobs catch most of it.
-- **Every child process gets `stdin=subprocess.DEVNULL`.** The popup owns the terminal; a child
-  that reads from it swallows keystrokes, and fzf closes as if Esc had been pressed.
+- **Every child process states its stdin**: `subprocess.DEVNULL`, or a pipe the program writes
+  to. The popup owns the terminal; a child that reads from it swallows keystrokes, and fzf
+  closes as if Esc had been pressed. The tests check that every `subprocess` call says it.
+- **Anything started outside fzf gets `env=child_env()`**: no `FZF_*` variable and nothing that
+  holds the run directory's path. Block 51 checks every `subprocess` call in the program; the
+  only ones without it are fzf itself (in `popup`), `fzf_rejects` (it runs before the run
+  directory exists) and the `--focus` worker in `enter`, whose `env` starts from
+  `child_env(run_dir)`.
+- **Every wait has a bound**. Block 50 checks, with the AST, in the program and in the tests:
+  every `subprocess.run`, `check_output`, `call` and `check_call` (also through an attribute,
+  such as `sb.subprocess.run`) passes `timeout=`; every `communicate()` passes a timeout; every
+  `wait()` and `join()` passes an argument or `timeout=`; every `select()` passes its timeout;
+  and nothing calls `os.wait()`, or `os.waitpid`, `os.wait3` or `os.wait4` with options `0`. The
+  one exemption, pinned to its site, is the popup's `proc.communicate(first)`, its wait for
+  fzf, which the user ends with a key or a signal.
 - **Every user-visible string goes through the translation table**, in English and Spanish.
 - **No bytecode in the tree.** The tests must not write `__pycache__`; `make lint` fails if they
   do.
@@ -70,13 +90,17 @@ Use the names the demo uses. Machines are `laptop`, `workstation` and `server`; 
 `api`, `web`, `infra` and `docs`. The same rule applies to commit messages, pull request text and
 issue reports: describe your setup with those names, not your own.
 
+The README images are made from the demo data, never from a real session: after a change to
+what the popup draws, run `docs/render.sh` and commit the new `docs/assets/` files with it.
+
 ## Commits and pull requests
 
 - Commits follow [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`,
   `docs:`, `test:`, `ci:`, `chore:`, `refactor:`. Say in the body why the change is needed.
 - Keep pull requests small and focused, and fill in the template.
 - `make check` must pass before you ask for a review.
-- A change users will notice gets a line under `## [Unreleased]` in `CHANGELOG.md`.
+- A change users will notice gets a line in `CHANGELOG.md`: under `## [Unreleased]`, except
+  before the first tag (see [Releases](#releases)).
 
 ## Releases
 
@@ -101,9 +125,13 @@ release of version `X.Y.Z` is these steps, in this order:
 4. Create the GitHub release from the tag (`gh release create vX.Y.Z --verify-tag --title vX.Y.Z`)
    and paste that version's `CHANGELOG.md` section as its notes.
 
-The first release is the exception to step 1: `herdr-plugin.toml` already says `0.1.0` and its
-`CHANGELOG.md` entry is already written, so its pull request only changes the date of
-`## [0.1.0]` to the day of the tag.
+The first release is the exception. `herdr-plugin.toml` already says `0.1.0` and
+`## [0.1.0]` in `CHANGELOG.md` is written, so until the `v0.1.0` tag exists that section is the
+unreleased one: **a change merged before the first tag gets its line under `## [0.1.0]`**, and
+`## [Unreleased]` stays empty. The release pull request then changes the date of `## [0.1.0]`
+to the day of the tag, after checking that `## [Unreleased]` is still empty (anything found
+there moves into `## [0.1.0]`, or it would be left out of the release). From the tag on, every
+change goes under `## [Unreleased]` as above.
 
 The tools CI downloads are pinned by hand: fzf and gitleaks in
 `.github/scripts/install-pinned.sh` (version and SHA-256 of each archive), uv in

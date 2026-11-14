@@ -23,6 +23,8 @@ platforms = ["linux", "macos"]
 # A session-modal popup over the current layout. Commands are argv arrays run without a
 # shell, so the program path is built from HERDR_PLUGIN_ROOT inside `sh -c`: it works
 # whatever the working directory and whether or not the file kept its executable bit.
+# Without a python3 on the PATH herdr's server runs with, the program cannot say what is
+# missing, so the shell says it and waits for Enter instead of closing at once.
 [[panes]]
 id = "switchboard"
 title = "Switchboard"
@@ -30,7 +32,7 @@ platforms = ["linux", "macos"]
 placement = "popup"
 width = "96%"
 height = "85%"
-command = ["sh", "-c", "exec python3 \"${HERDR_PLUGIN_ROOT:-.}/bin/switchboard\""]
+command = ["sh", "-c", "command -v python3 >/dev/null 2>&1 || { printf '%s\\n' 'switchboard needs Python 3.9 or newer, run as python3, and there is no python3 on the PATH the herdr server runs with.' 'Install it, or add its directory to that PATH, then restart the herdr server.'; printf 'Press Enter to close. '; read -r _; exit 127; }; exec python3 \"${HERDR_PLUGIN_ROOT:-.}/bin/switchboard\""]
 
 [[actions]]
 id = "open"
