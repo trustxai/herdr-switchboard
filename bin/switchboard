@@ -2989,8 +2989,10 @@ def end_fzf(proc, terminal=None):
     below it (its commands and what they started, by parent pid) gets SIGTERM: a command
     leaves through its own clean-up, which ends its reads, fzf returns from it, acts on its
     SIGTERM and leaves as above. Only if fzf is still there then, everything below it and
-    fzf itself get SIGKILL, and the terminal is put back from `terminal` (saved_terminal(),
-    taken before fzf started). Nothing that is not below this popup's fzf is touched."""
+    fzf itself get SIGKILL. Whenever fzf did not leave on that first SIGTERM (it left after
+    the second step, or it was killed), the terminal is then also put back from `terminal`
+    (saved_terminal(), taken before fzf started). Nothing that is not below this popup's fzf
+    is touched."""
     proc.terminate()
     if _waited(proc):
         return

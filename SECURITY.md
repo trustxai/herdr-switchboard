@@ -150,13 +150,14 @@ ctrl-o, `--enter`), it does not act on SIGTERM, and those commands share fzf's p
 which fzf never kills. So if fzf is still there, every process below it, found by parent pid,
 gets SIGTERM: the command leaves through its own cleanup, which ends its helpers, and fzf, back
 from it, leaves as above. Only if fzf is still there two seconds later do everything below it
-and fzf get SIGKILL, and the popup puts the terminal back itself (the settings it saved before
-starting fzf, and the sequences that leave the alternate screen and turn the mouse off). All of
-it takes at most ten seconds: three waits of two seconds and two `ps` runs of up to two seconds
-each. Only processes below the popup's fzf at that moment are signalled; one that has already
-left that tree (its parent died) is not found, and a pid that ends and is reused between the
-`ps` and the signal is the one exception. A second SIGHUP or SIGTERM during that cleanup is
-ignored, so it finishes.
+and fzf get SIGKILL. Whenever fzf did not leave on the first SIGTERM, whether it left after the
+second step or was killed, the popup then also puts the terminal back itself (the settings it
+saved before starting fzf, and the sequences that leave the alternate screen and turn the mouse
+off). Ending fzf takes at most ten seconds: three waits of two seconds and two `ps` runs of up
+to two seconds each. Only processes below the popup's fzf at that moment are signalled; one that
+has already left that tree (its parent died) is not found, and a pid that ends and is reused
+between the `ps` and the signal is the one exception. A second SIGHUP or SIGTERM during that
+cleanup is ignored, so it finishes.
 
 Which children get a session of their own. Every helper that goes through `run_child` does,
 with its own process group, killed whole when its timeout passes and when the process that
@@ -172,8 +173,9 @@ preview's process group, which fzf kills only if the preview is still running th
 outlive the preview and fzf until it ends by itself.
 
 These are waited for, with a timeout, without a session of their own: the herdr that focuses a
-row of this machine after Enter, the `fzf --filter` that checks the configured colours, the `ps`
-that lists what is below fzf or below a preview's helper, and osascript in the jump's helper
+row of this machine after Enter, the `fzf --filter` that checks the configured colours and, when
+fzf refuses its command line (exit status 2), says why, the `ps` that lists what is below fzf or
+below a preview's helper, and osascript in the jump's helper
 (`--jump` and `--jump-server`). On a timeout, or an exit of the process waiting for it, that
 child alone is killed. fzf runs in the popup's own process group and ends as described above.
 Started and not waited for, each in a session of its own on purpose: the focus worker, the herdr
