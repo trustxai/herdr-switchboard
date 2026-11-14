@@ -2520,7 +2520,7 @@ def find_client(bridges=None, hosts=None, local_tty=None, idle=idle_seconds, pla
                    for c in candidates]
         for t in threads:
             t.start()
-        deadline = time.time() + IDLE_TIMEOUT + 3  # each probe bounds itself; this covers the worst
+        deadline = time.time() + IDLE_TIMEOUT + KILL_WAIT + SPAWN_MARGIN  # a probe's worst, as in herdr_on_bound
         for t in threads:
             t.join(max(0.0, deadline - time.time()))
         candidates.sort(key=lambda c: results.get(c, float("inf")))

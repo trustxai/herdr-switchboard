@@ -3697,6 +3697,11 @@ check("bound-timeouts-are-the-ones-used", 'herdr(["machine", "list", "--json"], 
       and "p.communicate(timeout=KILL_WAIT)" in SOURCE and SOURCE.count("herdr_on_bound(REMOTE_TIMEOUT)") == 2)
 check("bound-covers-lookup-two-reads-and-kill-waits",
       sb.herdr_on_bound(8) >= sb.MACHINE_LIST_TIMEOUT + sb.KILL_WAIT + 2 * (8 + sb.KILL_WAIT), sb.herdr_on_bound(8))
+# find_client's wait for its HIDIdleTime probes, from the same constants: one probe's timeout,
+# the wait after killing it, and the margin for starting it.
+check("find-client-backstop-from-the-named-constants",
+      "deadline = time.time() + IDLE_TIMEOUT + KILL_WAIT + SPAWN_MARGIN" in SOURCE
+      and "run_out(argv, timeout=IDLE_TIMEOUT)" in SOURCE)
 
 # 55. Nothing the watch loop started writes into a directory while it is removed: watch()
 # returns only after its remote reads (bounded), writes the rows only under the lock the popup
