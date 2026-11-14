@@ -3775,19 +3775,22 @@ check("popup-removes-the-run-dir-under-the-lock", "held = writes.acquire(timeout
 # (yes/no checks only). Previews: cursor moves and Esc leave none, and a preview's read is
 # killed at its timeout. ctrl-y (--copy) and ctrl-o (--select), which fzf waits for in its
 # own process group: the popup told to leave (SIGTERM, SIGHUP) while one hangs ends the
-# command and its read, fzf puts the terminal back, and it is quick, whether the popup leads
-# its terminal's session or a parent does (then the kernel's hang-up ends nothing).
+# command, its read and a helper the read left behind, fzf puts the terminal back, and it is
+# quick, whether the popup leads its terminal's session or a parent does (then the kernel's
+# hang-up ends nothing).
 block("56. reads under fzf end with fzf")
 
 
 def popup_with_hung_reads(drive, remote_timeout="60", leader=True):
     """Open the popup on remote rows whose pane reads hang; drive(fd, pump, popup_pid, reads,
     leave) does the keys: pump(pred, seconds) reads the terminal, leave(sig) signals the popup.
-    leader=False: a parent leads the terminal's session and outlives the popup. Returns a
-    dict: rc; took, seconds from leave() to the popup's exit; terminal, what fzf left on the
-    way out (and, with a parent leading, the terminal's echo and signal keys); started and
-    left, {command: [pid, ...]} of the hung reads and of the commands that started them, and
-    of those still alive 3 s after the popup left."""
+    A read of --copy or --select also leaves a helper that is no longer below it (its parent
+    exited), as a daemon does. leader=False: a parent leads the terminal's session and
+    outlives the popup. Returns a dict: rc; took, seconds from leave() to the popup's exit;
+    terminal, what fzf left on the way out (and, with a parent leading, the terminal's echo
+    and signal keys); started and left, {command: [pid, ...]} of the hung reads and of the
+    commands that started them ("helper": those helpers), and of those still alive 3 s after
+    the popup left."""
     import fcntl as _f56
     import struct as _st56
     import termios as _tm56
@@ -3806,6 +3809,9 @@ def popup_with_hung_reads(drive, remote_timeout="60", leader=True):
                               '  *"pane read"*) k=other\n'
                               '    case "$(ps -o command= -p $PPID)" in\n'
                               '      *--copy*) k=copy ;; *--select*) k=select ;; *--preview*) k=preview ;;\n'
+                              '    esac\n'
+                              '    case $k in copy|select)\n'
+                              '      sh -c \'sleep 120 >/dev/null 2>&1 & echo "helper $!"\' >> "%(d)s/reads" ;;\n'
                               '    esac\n'
                               '    echo "$k $$ $PPID" >> "%(d)s/reads"; exec sleep 120 ;;\n'
                               '  *"api snapshot"*) cat "%(d)s/m1.json" ;;\n'
@@ -3869,8 +3875,8 @@ def popup_with_hung_reads(drive, remote_timeout="60", leader=True):
             result["terminal"].update(echo=bool(lflag & _tm56.ECHO), isig=bool(lflag & _tm56.ISIG))
         started = {}
         for line in (open(reads).read().splitlines() if os.path.exists(reads) else []):
-            kind, read_pid, cmd_pid = line.split()
-            started.setdefault(kind, []).extend([int(read_pid), int(cmd_pid)])
+            kind, *found = line.split()
+            started.setdefault(kind, []).extend(int(p) for p in found)
         everything = [p for ps in started.values() for p in ps]
         alive, end = list(everything), _time.time() + 3
         while alive and _time.time() < end:
@@ -3910,8 +3916,8 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
         for leader in (True, False):
             r = popup_with_hung_reads(key_then(key, kind, sig), leader=leader)
             name = "%s-%s" % (kind, "leading" if leader else "not-leading")
-            check(name + "-command-and-reads-end-with-the-popup", r["started"].get(kind) and not r["left"]
-                  and r["rc"] == 128 + sig, (r["rc"], sorted(r["started"]), r["left"]))
+            check(name + "-command-and-reads-end-with-the-popup", r["started"].get(kind) and r["started"].get("helper")
+                  and not r["left"] and r["rc"] == 128 + sig, (r["rc"], sorted(r["started"]), r["left"]))
             check(name + "-terminal-comes-back", all(r["terminal"].values()), r["terminal"])
             # Left before end_fzf's last step (SIGKILL) was due: fzf ended on its own SIGTERM.
             check(name + "-quick", r["took"] is not None and r["took"] < 2 * sb.FZF_END_WAIT, r["took"])
