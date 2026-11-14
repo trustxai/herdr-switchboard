@@ -133,25 +133,30 @@ The parts of Switchboard that use the directory after the popup has started open
 that it is a real directory (not a symlink) owned by you with no access for group or others, and
 from then on work only through that descriptor: files are created with `O_NOFOLLOW` and mode
 0600, result files also with `O_EXCL`, and only regular files are read. The popup always
-removes the directory when it closes. A refresh still under way at that moment cannot write
+removes the directory when it closes, and does not wait for a refresh still under way (a
+machine that does not answer can take the whole remote timeout). The rows are written only
+under a lock and only until the close starts, and the popup removes the directory holding that
+lock, so nothing is written into it while it is removed. A refresh that ends later cannot write
 anywhere else: its writes go through the removed directory's descriptor and fail, and fzf's
-socket is contacted only after such a write succeeded.
+socket is contacted only after such a write succeeded. A SIGHUP or SIGTERM that arrives once the
+close has started waits until the directory is gone, then ends the popup with its usual status.
 
 The popup also closes this way when its window or session goes away: SIGHUP and SIGTERM exit
-through the same cleanup, which ends the popup's own fzf and removes the run directory (and,
-for `--demo`, its temporary state directory). fzf gets SIGTERM, so it puts the terminal back
-(main screen, mouse off, echo), and up to two seconds to leave. While fzf waits for a command it
-runs synchronously (`--copy` on ctrl-y, `--select` on ctrl-o, `--enter`), it does not act on
-SIGTERM, and those commands share fzf's process group, which fzf never kills. So if fzf is still
-there, every process below it, found by parent pid, gets SIGTERM: the command leaves through its
-own cleanup, which ends its helpers, and fzf, back from it, leaves as above. Only if fzf is still
-there two seconds later do everything below it and fzf get SIGKILL, and the popup puts the
-terminal back itself (the settings it saved before starting fzf, and the sequences that leave
-the alternate screen and turn the mouse off). All of it takes at most ten seconds: three waits
-of two seconds and two `ps` runs of up to two seconds each. Only processes below the popup's fzf
-at that moment are signalled; one that has already left that tree (its parent died) is not
-found, and a pid that ends and is reused between the `ps` and the signal is the one exception. A
-second SIGHUP or SIGTERM during that cleanup is ignored, so it finishes.
+through the same cleanup, which ends the popup's own fzf and removes the run directory (and, for
+`--demo`, its temporary state directory, after which nothing writes there any more). fzf gets
+SIGTERM, so it puts the terminal back (main screen, mouse off, echo), and up to two seconds to
+leave. While fzf waits for a command it runs synchronously (`--copy` on ctrl-y, `--select` on
+ctrl-o, `--enter`), it does not act on SIGTERM, and those commands share fzf's process group,
+which fzf never kills. So if fzf is still there, every process below it, found by parent pid,
+gets SIGTERM: the command leaves through its own cleanup, which ends its helpers, and fzf, back
+from it, leaves as above. Only if fzf is still there two seconds later do everything below it
+and fzf get SIGKILL, and the popup puts the terminal back itself (the settings it saved before
+starting fzf, and the sequences that leave the alternate screen and turn the mouse off). All of
+it takes at most ten seconds: three waits of two seconds and two `ps` runs of up to two seconds
+each. Only processes below the popup's fzf at that moment are signalled; one that has already
+left that tree (its parent died) is not found, and a pid that ends and is reused between the
+`ps` and the signal is the one exception. A second SIGHUP or SIGTERM during that cleanup is
+ignored, so it finishes.
 
 Which children get a session of their own. Every helper that goes through `run_child` does,
 with its own process group, killed whole when its timeout passes and when the process that

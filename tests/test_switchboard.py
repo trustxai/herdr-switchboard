@@ -115,8 +115,8 @@ What it has to get right, and how it fails otherwise:
 37. A hung local herdr cannot freeze anything: the local snapshot has a timeout at open and in
    every refresh, the refresh keeps the last rows, and the popup says what failed.
 38. Closing the popup always removes its run directory, whatever local_seconds is and however
-   slow the local snapshot, and also when its terminal goes away (SIGHUP); stop wakes the
-   watch loop at once.
+   slow the local snapshot (without waiting for it), and also when its terminal goes away
+   (SIGHUP); stop wakes the watch loop at once.
 39. The detached worker checks again what it was handed: a result name that is not a plain
    focus-N-N (such as ../x) or a directory that is not ours and 0700 gets nothing written.
 40. The selected row reads well: no gutter column, a pointer in the selected row's text colour,
@@ -137,6 +137,10 @@ What it has to get right, and how it fails otherwise:
    read end, the terminal comes back, and it is quick.
 57. A read that times out leaves nothing holding its pipe, in each mode; end_fzf's last step
    ends everything below fzf and nothing else, within its bound, and puts the terminal back.
+58. A close never waits for a read that can hang: with a machine whose snapshot read hangs, Esc
+   and Enter on a local row act at once, and a signal during a close never leaves the run
+   directory behind. watch() does not wait for its remote reads, and once close_state() ran
+   nothing more is written into the state directory.
 
     python3 tests/test_switchboard.py
 """
@@ -2803,7 +2807,8 @@ def close_popup(local_seconds, slow, signals=False, leader=True):
     """Open the popup over a fake herdr, press Esc, and return (rc, seconds from Esc to exit,
     what is left in the popup's run root, whether a process still names that root). slow:
     every snapshot after the first hangs. signals: instead of Esc, SIGTERM and 0.4 s later
-    SIGHUP, while a refresh hangs (the cleanup is then under way). leader=False: a parent
+    SIGHUP, while a refresh hangs (the close no longer waits for it, so the second signal may
+    come after the exit; block 56 sends one during a close that waits). leader=False: a parent
     leads the terminal's session and outlives the popup, so the kernel hangs nothing up
     when the popup exits; whatever ends fzf then is the popup itself."""
     import signal as _sig8
@@ -2878,7 +2883,10 @@ def close_popup(local_seconds, slow, signals=False, leader=True):
                 if signals:
                     os.kill(target, _sig8.SIGTERM)
                     buf += read_until(fd, lambda _b: False, 0.4)
-                    os.kill(target, _sig8.SIGHUP)
+                    try:
+                        os.kill(target, _sig8.SIGHUP)
+                    except ProcessLookupError:
+                        pass  # the close was already over (it waits for no read)
                 else:
                     os.write(fd, b"\x1b")
         took = _time.time() - t_esc if t_esc else None
@@ -2911,7 +2919,8 @@ rc, took, left, _, _ = close_popup(10, False)
 check("close-with-a-long-interval-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 1.5,
       (rc, took, left))
 rc, took, left, _, _ = close_popup(1, True)
-check("close-during-a-slow-snapshot-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 4,
+# ...without waiting for the hung local read (it used to wait 2 s for it; now about 0.2 s).
+check("close-during-a-slow-snapshot-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 1.0,
       (rc, took, left))
 # A second signal during the cleanup is ignored: the first one's exit code and nothing left.
 # fzf does not outlive the popup either (the popup ends it, and here the kernel's hang-up of
@@ -3707,28 +3716,11 @@ check("find-client-backstop-from-the-named-constants",
       and "run_out(argv, timeout=IDLE_TIMEOUT)" in SOURCE)
 
 # 55. Nothing the watch loop started writes into a directory while it is removed: watch()
-# returns only after its remote reads (bounded), writes the rows only under the lock the popup
-# holds while it removes the run directory, and never after stop.
+# writes the rows only under the lock the popup holds while it removes the run directory, and
+# never after stop. (Its remote reads are not waited for: block 58.)
 block("55. the watch loop and the directories it writes")
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
     rows55 = private_tmp(d, "rows55")
-    inflight = [0]
-
-    def slow_fetch(m="", t=None, i=None):
-        if m:
-            inflight[0] += 1
-            _time.sleep(0.6)
-            inflight[0] -= 1
-        return snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)])
-    lv = sb.Live([{"id": "m1", "label": "box1"}], sb.entries_from(slow_fetch(), "", "here", 0), fetch=slow_fetch,
-                 cache=False)
-    stop = _threading.Event()
-    t = _threading.Thread(target=sb.watch, args=(lv, short_sock("w55"), os.path.join(rows55, "rows"), stop), daemon=True)
-    t.start()
-    _time.sleep(0.2)  # a remote read is under way
-    stop.set()
-    t.join(5)
-    check("watch-waits-for-its-remote-reads", not t.is_alive() and inflight[0] == 0, inflight[0])
 
     # A rows write in progress holds the lock; the closer gets it only after; after stop, none.
     data55 = {"n": 1}
@@ -3769,7 +3761,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         sb.os.replace = real_replace
     check("closer-waits-for-a-write-in-progress", not early and got, (early, got))
     check("no-rows-write-after-stop", writes_done[0] == 1 and not t.is_alive(), writes_done[0])
-check("popup-removes-the-run-dir-under-the-lock", "held = writes.acquire(timeout=WATCH_JOIN)\n        try:\n"
+check("popup-removes-the-run-dir-under-the-lock", "held = writes.acquire(timeout=WRITE_WAIT)\n        try:\n"
       "            shutil.rmtree(tmp, ignore_errors=True)" in SOURCE)
 
 # 56. Reads started by the commands fzf runs end with those commands, with the real fzf: a
@@ -3784,7 +3776,7 @@ check("popup-removes-the-run-dir-under-the-lock", "held = writes.acquire(timeout
 block("56. reads under fzf end with fzf")
 
 
-def popup_with_hung_reads(drive, remote_timeout="60", leader=True):
+def popup_with_hung_reads(drive, remote_timeout="60", leader=True, snapshot_hangs=False):
     """Open the popup on remote rows whose pane reads hang; drive(fd, pump, popup_pid, reads,
     leave) does the keys: pump(pred, seconds) reads the terminal, leave(sig) signals the popup.
     A read of --copy or --select also leaves a helper that is no longer below it (its parent
@@ -3793,7 +3785,8 @@ def popup_with_hung_reads(drive, remote_timeout="60", leader=True):
     terminal, what fzf left on the way out (and, with a parent leading, the terminal's echo
     and signal keys); started and left, {command: [pid, ...]} of the hung reads and of the
     commands that started them ("helper": those helpers), and of those still alive 3 s after
-    the popup left."""
+    the popup left. snapshot_hangs: after the first one, every snapshot read of that machine
+    hangs too ("snapshot"), and a read of it is under way whenever drive() acts."""
     import fcntl as _f56
     import struct as _st56
     import termios as _tm56
@@ -3817,8 +3810,10 @@ def popup_with_hung_reads(drive, remote_timeout="60", leader=True):
                               '      sh -c \'sleep 120 >/dev/null 2>&1 & echo "helper $!"\' >> "%(d)s/reads" ;;\n'
                               '    esac\n'
                               '    echo "$k $$ $PPID" >> "%(d)s/reads"; exec sleep 120 ;;\n'
-                              '  *"api snapshot"*) cat "%(d)s/m1.json" ;;\n'
-                              '  *) exit 1 ;;\nesac\n' % {"d": d})
+                              '  *"api snapshot"*) if [ -e "%(d)s/answered" ] && [ -n "%(hang)s" ]; then\n'
+                              '      echo "snapshot $$" >> "%(d)s/reads"; exec sleep 120; fi\n'
+                              '    touch "%(d)s/answered"; cat "%(d)s/m1.json" ;;\n'
+                              '  *) exit 1 ;;\nesac\n' % {"d": d, "hang": "yes" if snapshot_hangs else ""})
         fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n'
                         '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
                         '  "api snapshot") cat "%(d)s/local.json" ;;\n'
@@ -3827,7 +3822,7 @@ def popup_with_hung_reads(drive, remote_timeout="60", leader=True):
         if pid == 0:
             os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), SWITCHBOARD_SSH=str(fake_ssh),
                               SWITCHBOARD_REMOTE_TIMEOUT=remote_timeout, SWITCHBOARD_RUN_ROOT=root,
-                              HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
+                              SWITCHBOARD_REMOTE_EVERY="0.3", HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
             if leader:
                 os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
             inner = os.fork()
@@ -3856,6 +3851,8 @@ def popup_with_hung_reads(drive, remote_timeout="60", leader=True):
         _f56.ioctl(fd, _tm56.TIOCSWINSZ, _st56.pack("HHHH", 30, 160, 0, 0))
         pump(lambda b: b"far-1" in sb.ANSI.sub("", b.decode("utf-8", "replace")).encode(), 15)
         pump(lambda _b: os.path.exists(reads), 10)  # the first remote preview is hanging
+        if snapshot_hangs:
+            pump(lambda _b: any(l.startswith("snapshot ") for l in open(reads).read().splitlines()), 10)
         pump(lambda _b: leader or os.path.exists(popup_pid), 5)
         target = pid if leader else int(open(popup_pid).read())
         drive(fd, pump, target, reads, leave)
@@ -3892,6 +3889,7 @@ def popup_with_hung_reads(drive, remote_timeout="60", leader=True):
                 pass
         result["started"] = started
         result["left"] = {k: [p for p in v if p in alive] for k, v in started.items() if set(v) & set(alive)}
+        result["run_dir_left"] = sorted(os.listdir(root))
         finish(pid, fd, 0)
         return result
 
@@ -3917,13 +3915,26 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
           (r["started"].keys(), r["left"], r["rc"]))
     for key, kind, sig in ((b"\x19", "copy", _signal.SIGTERM), (b"\x0f", "select", _signal.SIGHUP)):
         for leader in (True, False):
-            r = popup_with_hung_reads(key_then(key, kind, sig), leader=leader)
+            r = popup_with_hung_reads(key_then(key, kind, sig), leader=leader, snapshot_hangs=True)
             name = "%s-%s" % (kind, "leading" if leader else "not-leading")
             check(name + "-command-and-reads-end-with-the-popup", r["started"].get(kind) and r["started"].get("helper")
-                  and not r["left"] and r["rc"] == 128 + sig, (r["rc"], sorted(r["started"]), r["left"]))
+                  and r["started"].get("snapshot") and not r["left"] and not r["run_dir_left"]
+                  and r["rc"] == 128 + sig, (r["rc"], sorted(r["started"]), r["left"], r["run_dir_left"]))
             check(name + "-terminal-comes-back", all(r["terminal"].values()), r["terminal"])
             # Left before end_fzf's last step (SIGKILL) was due: fzf ended on its own SIGTERM.
             check(name + "-quick", r["took"] is not None and r["took"] < 2 * sb.FZF_END_WAIT, r["took"])
+    # A second signal while the close waits for fzf (end_fzf, after the first SIGTERM) changes
+    # nothing: the first one's status, the run directory gone, nothing left, the terminal back.
+    def two_signals(fd, pump, pid, reads, leave):
+        key_then(b"\x19", "copy", _signal.SIGTERM)(fd, pump, pid, reads, leave)
+        pump(lambda _b: False, 0.4)
+        try:
+            os.kill(pid, _signal.SIGHUP)
+        except OSError:
+            pass
+    r = popup_with_hung_reads(two_signals, leader=False, snapshot_hangs=True)
+    check("second-signal-during-the-close-is-ignored", r["rc"] == 128 + 15 and not r["left"] and not r["run_dir_left"]
+          and all(r["terminal"].values()), (r["rc"], r["left"], r["run_dir_left"], r["terminal"]))
     # A read that times out inside a preview is killed then, with the popup still open and the
     # cursor where it was.
     timed_out = []
@@ -4088,6 +4099,249 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
           and b"\x1b[?1049l" in shown and b"\x1b[?1000l" in shown and bool(lflag & _tm57b.ECHO)
           and bool(lflag & _tm57b.ICANON), (stuck, rc, round(took, 1), shown[-40:], lflag))
     finish(pid, fd, 0)
+
+# 58. A close never waits for a read that can hang, and a signal during a close never leaves
+# the run directory behind. A saved machine whose `api snapshot` over ssh hangs: Esc leaves at
+# once, and Enter on a local row focuses it at once (both used to wait 2 s for that read). Esc
+# followed by SIGHUP while the close runs, with the popup leading its terminal's session and
+# not: the run directory goes. A close kept busy on purpose (a stand-in fzf whose socket
+# accepts and never answers, so the last rows write waits on it): a SIGHUP in the middle waits
+# for the run directory to go, then ends the popup with 129. watch() returns while a remote
+# read is still under way, and once close_state() ran nothing more is written into the state
+# directory (--demo removes it next).
+block("58. a close waits for no read")
+CLOSE_FAST = 1.0  # s: a close used to take at least 2 s here (the wait for the read); now ~0.2 s
+
+
+def popup_in_pty(env, leader=True):
+    """Start the popup in a terminal with `env` added. leader=False: a parent leads the
+    terminal's session and outlives the popup. Returns (pid of the pty child, fd, d) where d
+    holds popup.pid and popup.rc (leader=False) once known."""
+    d = tempfile.mkdtemp(prefix="pty58-", dir=_tmp_root)
+    popup_pid, popup_rc = os.path.join(d, "popup.pid"), os.path.join(d, "popup.rc")
+    pid, fd = _pty.fork()
+    if pid == 0:
+        os.environ.update(env)
+        if leader:
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+        inner = os.fork()
+        if inner == 0:
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+        with open(popup_pid + ".tmp", "w") as f:
+            f.write(str(inner))
+        os.rename(popup_pid + ".tmp", popup_pid)
+        done, st, quit_at = 0, 0, _time.time() + 60
+        while not done and _time.time() < quit_at:
+            done, st = os.waitpid(inner, os.WNOHANG)
+            _time.sleep(0.01)
+        with open(popup_rc + ".tmp", "w") as f:
+            f.write(str(os.waitstatus_to_exitcode(st) if done else -9))
+        os.rename(popup_rc + ".tmp", popup_rc)
+        _time.sleep(30)  # still leading the session; finish() ends this group
+        os._exit(0)
+    import fcntl as _f58
+    import struct as _st58
+    import termios as _tm58
+    _f58.ioctl(fd, _tm58.TIOCSWINSZ, _st58.pack("HHHH", 30, 140, 0, 0))
+    if leader:
+        with open(popup_pid, "w") as f:
+            f.write(str(pid))
+    return pid, fd, d
+
+
+def popup_exit(pid, fd, d, leader, seconds):
+    """Wait up to `seconds` for the popup's exit, reading its terminal: (rc, time) or (None, None)."""
+    end = _time.time() + seconds
+    while _time.time() < end:
+        read_until(fd, lambda _b: False, 0.01)
+        if leader:
+            done, st = os.waitpid(pid, os.WNOHANG)
+            if done:
+                return os.waitstatus_to_exitcode(st), _time.time()
+        elif os.path.exists(os.path.join(d, "popup.rc")):
+            return int(open(os.path.join(d, "popup.rc")).read()), _time.time()
+        _time.sleep(0.01)
+    return None, None
+
+
+def close_with_hung_remote(action, leader=True):
+    """The popup with one saved machine whose snapshot read hangs (it is under way when the
+    key comes). action: "esc", "enter" (on the local row), or "esc+hup" (SIGHUP 0.5 s after
+    Esc). Returns (rc, seconds from the key to the exit, seconds from the key to the local
+    focus or None, what is left in the run root, the hung read still alive 3 s later)."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = private_tmp(d, "runs")
+        hung, focused = os.path.join(d, "hung"), os.path.join(d, "focused")
+        with open(os.path.join(d, "machines.json"), "w") as f:
+            json.dump([{"id": "m1", "label": "box1", "enabled": True, "target": "box1-host"}], f)
+        with open(os.path.join(d, "local.json"), "w") as f:
+            json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="here-row")])}}, f)
+        fake_ssh = executable(os.path.join(d, "ssh"), '#!/bin/sh\ncase "$*" in\n'
+                              '  *"api snapshot"*) echo $$ >> "%(d)s/hung"; exec sleep 120 ;;\n'
+                              '  *) exit 1 ;;\nesac\n' % {"d": d})
+        fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n'
+                        '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                        '  "api snapshot") cat "%(d)s/local.json" ;;\n'
+                        '  *focus*) touch "%(d)s/focused" ;;\n'
+                        '  *) exit 1 ;;\nesac\n' % {"d": d})
+        env = dict(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), SWITCHBOARD_SSH=str(fake_ssh),
+                   SWITCHBOARD_REMOTE_TIMEOUT="60", SWITCHBOARD_RUN_ROOT=root,
+                   HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
+        pid, fd, pd = popup_in_pty(env, leader)
+        read_until(fd, lambda b: b"here-row" in sb.ANSI.sub("", b.decode("utf-8", "replace")).encode(), 15)
+        read_until(fd, lambda _b: os.path.exists(hung) and os.path.exists(os.path.join(pd, "popup.pid")), 10)
+        target = int(open(os.path.join(pd, "popup.pid")).read())
+        t0 = _time.time()
+        os.write(fd, b"\r" if action == "enter" else b"\x1b")
+        focus_at = None
+        if action == "esc+hup":
+            read_until(fd, lambda _b: False, 0.5)
+            try:
+                os.kill(target, _signal.SIGHUP)
+            except OSError:
+                pass  # already gone: the close was quicker than that
+        rc, t_exit = popup_exit(pid, fd, pd, leader, 20)
+        end = _time.time() + 5
+        while action == "enter" and focus_at is None and _time.time() < end:
+            if os.path.exists(focused):
+                focus_at = _time.time() - t0
+            _time.sleep(0.01)
+        left = sorted(os.listdir(root))
+        reads = [int(x) for x in open(hung).read().split()] if os.path.exists(hung) else []
+        alive, end = list(reads), _time.time() + 3
+        while alive and _time.time() < end:
+            _time.sleep(0.05)
+            alive = [p for p in alive if _alive(p)]
+        for p in alive:
+            try:
+                os.kill(p, _signal.SIGKILL)
+            except OSError:
+                pass
+        finish(pid, fd, 0)
+        shutil.rmtree(pd, ignore_errors=True)
+        return rc, (t_exit - t0) if t_exit else None, focus_at, left, bool(alive)
+
+
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    rc, took, _, left, alive = close_with_hung_remote("esc")
+    check("esc-does-not-wait-for-a-hung-read", rc == 0 and took is not None and took < CLOSE_FAST and not left
+          and not alive, (rc, took, left, alive))
+    rc, took, focus_at, left, alive = close_with_hung_remote("enter")
+    check("enter-focuses-without-waiting-for-a-hung-read", rc == 0 and focus_at is not None and focus_at < CLOSE_FAST
+          and not left, (rc, focus_at, left))
+    for leader in (True, False):
+        rc, took, _, left, alive = close_with_hung_remote("esc+hup", leader)
+        check("esc-then-sighup-leaves-no-run-dir-%s" % ("leading" if leader else "not-leading"),
+              rc in (0, 128 + 1) and not left and not alive, (rc, took, left, alive))
+
+
+def busy_close(leader):
+    """A close kept busy on purpose: a stand-in fzf whose --listen socket accepts and never
+    answers. The local snapshot changes once, so a rows write starts and waits on that socket
+    (2 s for the position, 2 s for the reload) while holding the rows lock. The stand-in then
+    exits like Esc, the close waits for that lock, and SIGHUP arrives 0.3 s into it. Returns
+    (rc, seconds from the stand-in's exit to the popup's, what is left in the run root)."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = private_tmp(d, "runs")
+        asked, gone, held = (os.path.join(d, n) for n in ("asked", "gone", "listener.pid"))
+        stand_in = executable(os.path.join(d, "fzf"), "#!%s\nimport os, socket, sys, time\n"
+                              "if '--version' in sys.argv:\n    print('0.74.2')\n    sys.exit(0)\n"
+                              "sock = next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--listen='))\n"
+                              "srv = socket.socket(socket.AF_UNIX)\nsrv.bind(sock)\nsrv.listen(8)\n"
+                              "if os.fork() == 0:\n"
+                              "    null = os.open(os.devnull, os.O_RDWR)\n"
+                              "    for fd in (0, 1, 2):\n        os.dup2(null, fd)\n"
+                              "    open(%r, 'w').write(str(os.getpid()))\n"
+                              "    kept = []\n"
+                              "    while True:\n"
+                              "        c, _ = srv.accept()\n        kept.append(c)\n"
+                              "        open(%r, 'a').write('x')\n"
+                              "end = time.time() + 15\n"
+                              "while not os.path.exists(%r) and time.time() < end:\n    time.sleep(0.02)\n"
+                              "open(%r, 'w').close()\nsys.exit(130)\n"
+                              % (sys.executable, held, asked, asked, gone))
+        snaps = [os.path.join(d, n) for n in ("one.json", "two.json")]
+        for i, path in enumerate(snaps):
+            with open(path, "w") as f:
+                json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1 + i,
+                                                                                title="row-%d" % i)])}}, f)
+        fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n'
+                        '  "machine list --json") echo "[]" ;;\n'
+                        '  "api snapshot") if [ -e "%(d)s/once" ]; then cat "%(d)s/two.json"; '
+                        'else touch "%(d)s/once"; cat "%(d)s/one.json"; fi ;;\n'
+                        '  *) exit 1 ;;\nesac\n' % {"d": d})
+        env = dict(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), SWITCHBOARD_FZF=str(stand_in),
+                   SWITCHBOARD_LOCAL_EVERY="0.2", SWITCHBOARD_RUN_ROOT=root, HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
+        pid, fd, pd = popup_in_pty(env, leader)
+        read_until(fd, lambda _b: os.path.exists(gone) and os.path.exists(os.path.join(pd, "popup.pid")), 15)
+        target = int(open(os.path.join(pd, "popup.pid")).read())
+        t0 = _time.time()
+        read_until(fd, lambda _b: False, 0.3)
+        try:
+            os.kill(target, _signal.SIGHUP)
+        except OSError:
+            pass
+        rc, t_exit = popup_exit(pid, fd, pd, leader, 20)
+        left = sorted(os.listdir(root))
+        try:
+            os.kill(int(open(held).read()), _signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+        finish(pid, fd, 0)
+        shutil.rmtree(pd, ignore_errors=True)
+        return rc, (t_exit - t0) if t_exit else None, left
+
+
+for leader in (True, False):
+    rc, took, left = busy_close(leader)
+    check("signal-during-a-busy-close-still-removes-the-run-dir-%s" % ("leading" if leader else "not-leading"),
+          rc == 128 + 1 and not left and took is not None and took < sb.WRITE_WAIT + 2, (rc, took, left))
+
+# watch() does not wait for a remote read under way, and once close_state() ran, that read
+# ending writes nothing into the state directory: no snapshot cache, no recency file.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    state58 = private_tmp(d, "state")
+    rows58 = private_tmp(d, "rows")
+    release58, started58 = _threading.Event(), _threading.Event()
+
+    def held_fetch(m="", t=None, i=None):
+        if m:
+            started58.set()
+            release58.wait(10)
+            return snap([pane("w1:p2")], [agent("w1:p2", "idle", 3)])
+        return snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)])
+    saved_state = sb.STATE_DIR
+    sb.STATE_DIR = state58
+    try:
+        lv = sb.Live([{"id": "m1", "label": "box1"}], sb.entries_from(held_fetch(), "", sb.local_label(), 0),
+                     fetch=held_fetch)
+        stop = _threading.Event()
+        t = _threading.Thread(target=sb.watch, args=(lv, short_sock("w58"), os.path.join(rows58, "rows"), stop),
+                              daemon=True)
+        t.start()
+        started58.wait(5)
+        t0 = _time.time()
+        stop.set()
+        t.join(5)
+        returned = _time.time() - t0
+        def contents58():
+            return {n: open(os.path.join(state58, n), "rb").read() if os.path.isfile(os.path.join(state58, n)) else None
+                    for n in os.listdir(state58)}
+        before = contents58()
+        sb.close_state()
+        release58.set()  # the read ends now, after the close
+        _time.sleep(0.5)
+        after = contents58()
+        check("watch-returns-while-a-remote-read-is-under-way", started58.is_set() and not t.is_alive() and returned < 0.5,
+              returned)
+        check("no-state-write-after-close-state", "snapshots" not in after and after == before,
+              (sorted(before), sorted(after)))
+    finally:
+        release58.set()
+        sb._STATE_CLOSED.discard(state58)
+        sb.STATE_DIR = saved_state
+check("demo-closes-its-state-before-removing-it", "            close_state()  # a refresh that outlived the popup "
+      "writes nothing from here on\n            shutil.rmtree(STATE_DIR, ignore_errors=True)" in SOURCE)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]

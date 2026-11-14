@@ -1145,17 +1145,47 @@ def _safe_name(machine):
     return re.sub(r"[^\w.-]", "_", machine) or "_"
 
 
+WRITE_WAIT = 2  # seconds a closer waits for a write under way (a small local file, never a read)
+# Every write into the state directory (the snapshot cache, recency.json) goes through
+# state_write(). In --demo that directory is temporary, and main removes it while a refresh
+# that nobody waits for (a machine that does not answer) may still be finishing in a thread:
+# close_state() waits for a write under way, then turns every later one into nothing.
+_STATE_WRITES = threading.Lock()
+_STATE_CLOSED = set()  # the state directories closed for writing
+
+
+def state_write(write):
+    """Run write() unless STATE_DIR is closed for writing."""
+    if not _STATE_WRITES.acquire(timeout=WRITE_WAIT):
+        return
+    try:
+        if STATE_DIR not in _STATE_CLOSED:
+            write()
+    finally:
+        _STATE_WRITES.release()
+
+
+def close_state():
+    """No more writes into STATE_DIR from this process, once the one under way is done."""
+    held = _STATE_WRITES.acquire(timeout=WRITE_WAIT)
+    _STATE_CLOSED.add(STATE_DIR)
+    if held:
+        _STATE_WRITES.release()
+
+
 def save_cache(machine, snap, now=None):
     """The last snapshot seen of a machine, to show it the moment the popup opens."""
-    try:
-        d = os.path.join(STATE_DIR, "snapshots")
-        os.makedirs(d, exist_ok=True)
-        path = os.path.join(d, _safe_name(machine) + ".json")
-        with open(path + ".tmp", "w") as f:
-            json.dump({"t": now or time.time(), "snapshot": snap}, f)
-        os.replace(path + ".tmp", path)
-    except OSError:
-        pass
+    def write():
+        try:
+            d = os.path.join(STATE_DIR, "snapshots")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, _safe_name(machine) + ".json")
+            with open(path + ".tmp", "w") as f:
+                json.dump({"t": now or time.time(), "snapshot": snap}, f)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+    state_write(write)
 
 
 def load_cache(machine, now=None):
@@ -1317,13 +1347,16 @@ class Recency:
     def _save(self):
         if not self.path:
             return
-        try:
-            os.makedirs(os.path.dirname(self.path), exist_ok=True)
-            with open(self.path + ".tmp", "w") as f:
-                json.dump({"v": 2, "machines": self.seen, "focus": self.focus}, f)
-            os.replace(self.path + ".tmp", self.path)
-        except OSError:
-            pass
+
+        def write():
+            try:
+                os.makedirs(os.path.dirname(self.path), exist_ok=True)
+                with open(self.path + ".tmp", "w") as f:
+                    json.dump({"v": 2, "machines": self.seen, "focus": self.focus}, f)
+                os.replace(self.path + ".tmp", self.path)
+            except OSError:
+                pass
+        state_write(write)
 
 
 def local_label():
@@ -1565,9 +1598,6 @@ def reload_action(rows_file, position):
     return action if not position else "track-current+" + action
 
 
-WATCH_JOIN = 2  # seconds watch() waits for its remote threads on the way out
-
-
 def watch(live, sock, rows_file, stop, acks=None, writes=None):
     """Until the popup closes: whenever something changed, have fzf reload `rows_file`.
 
@@ -1577,9 +1607,11 @@ def watch(live, sock, rows_file, stop, acks=None, writes=None):
 
     The rows are written only under `writes` and only while `stop` is not set, so whoever
     removes the run directory holding `writes` after setting stop (the popup) never races a
-    write. On the way out it waits up to WATCH_JOIN seconds for its remote threads, so when
-    it returns nothing it started is still writing (the snapshot cache, the recency file),
-    unless a remote read outlasts that wait.
+    write. Nobody waits for its threads, and it does not wait for them either: a read under
+    way (a machine that does not answer) may end after the popup closed. Then it writes
+    nothing into the run directory (the rows only under `writes`), and into the state
+    directory only through state_write(), which close_state() ends before that directory is
+    removed (--demo).
     """
     writes = writes or threading.Lock()
     # When a machine answers, reload at once instead of on the next local tick.
@@ -1638,9 +1670,8 @@ def watch(live, sock, rows_file, stop, acks=None, writes=None):
                 break
         kick.clear()
 
-    remotes = [threading.Thread(target=remote_loop, args=(i, m), daemon=True) for i, m in enumerate(live.machines)]
-    for t in remotes:
-        t.start()
+    for i, m in enumerate(live.machines):
+        threading.Thread(target=remote_loop, args=(i, m), daemon=True).start()
     try:
         while not stop.is_set():
             nap()
@@ -1653,9 +1684,6 @@ def watch(live, sock, rows_file, stop, acks=None, writes=None):
     finally:
         if rows_dir is not None:
             os.close(rows_dir)
-        deadline = time.time() + WATCH_JOIN
-        for t in remotes:
-            t.join(max(0.0, deadline - time.time()))
 
 
 # --- actions ----------------------------------------------------------------------------
@@ -3051,7 +3079,9 @@ def popup(self_cmd, demo=False):
                                 env=dict(os.environ, SWITCHBOARD_RUN_DIR=tmp, SWITCHBOARD_LABELS=json.dumps(labels)))
         watcher.start()
         out, _ = proc.communicate(first)
+        hold_signals()  # the close starts: a SIGHUP or SIGTERM from here on waits for its end
     finally:
+        hold_signals()  # (after a signal they are ignored anyway)
         if proc is not None and proc.poll() is None:
             # Leaving on a signal: fzf goes too. Nothing else is sure to end it: the kernel
             # hangs it up only when this process leads the terminal's session, and macOS
@@ -3059,21 +3089,21 @@ def popup(self_cmd, demo=False):
             end_fzf(proc, terminal)
         if terminal is not None:
             os.close(terminal[0])
+        # watch() is not waited for: a pass may be waiting for a machine that does not answer.
         stop.set()
-        if watcher.is_alive():
-            watcher.join(2)  # stop wakes it; a pass already under way may take a moment
         live.consume_acks(acks)  # an Enter on a remote row just before Esc
         # Always removed, and never while watch() writes into it: it writes only under
         # `writes` and only before stop, which is set. A pass still running after this cannot
         # reach anything else: the rows go through the old descriptor (now ENOENT), fzf's
         # socket is only contacted after a rows write succeeded, and the acks only through a
         # directory that open_private_dir accepts as ours.
-        held = writes.acquire(timeout=WATCH_JOIN)
+        held = writes.acquire(timeout=WRITE_WAIT)
         try:
             shutil.rmtree(tmp, ignore_errors=True)
         finally:
             if held:
                 writes.release()
+    release_signals()  # the run directory is gone: a signal held meanwhile acts now
     if proc.returncode == 2:
         # fzf refused its command line and drew nothing: say why instead of vanishing.
         reason = fzf_rejects(fzf, [a for a in argv[1:] if not a.startswith("--listen")]) or "exit 2"
@@ -3115,13 +3145,34 @@ def popup(self_cmd, demo=False):
     return 0
 
 
+_HOLDING = [False]  # a close is under way: hold_signals() .. release_signals()
+_HELD = []  # the SIGHUP or SIGTERM that arrived meanwhile
+
+
 def _exit_on_signal(signum, frame):
     """The first SIGHUP or SIGTERM exits through the finally blocks. Any later one is ignored:
     raised again inside a finally block, it would cut the cleanup short (a window that closes
-    sends SIGHUP right after SIGTERM, for example)."""
+    sends SIGHUP right after SIGTERM, for example). For the same reason, during a close that
+    already started (hold_signals()) a signal is only noted, and release_signals() acts on it
+    once the temporary directories are gone."""
+    if _HOLDING[0]:
+        _HELD.append(signum)
+        return
     for sig in (signal.SIGHUP, signal.SIGTERM):
         signal.signal(sig, signal.SIG_IGN)
     raise SystemExit(128 + signum)
+
+
+def hold_signals():
+    _HOLDING[0] = True
+
+
+def release_signals():
+    """The close is over: a SIGHUP or SIGTERM that arrived during it exits now."""
+    _HOLDING[0] = False
+    held, _HELD[:] = list(_HELD), []
+    if held:
+        _exit_on_signal(held[0], None)
 
 
 def main(argv):
@@ -3182,7 +3233,10 @@ def main(argv):
         return popup(self_cmd, demo=demo)
     finally:
         if demo:
+            hold_signals()
+            close_state()  # a refresh that outlived the popup writes nothing from here on
             shutil.rmtree(STATE_DIR, ignore_errors=True)
+            release_signals()
 
 
 if __name__ == "__main__":
