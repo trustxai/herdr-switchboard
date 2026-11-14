@@ -44,7 +44,8 @@ adds what its own section describes. All of it is the scope of this policy.
 `PATH`; `fzf` is found on `PATH`. So that a herdr server started without Homebrew's directories
 still finds them, Switchboard appends `/opt/homebrew/bin`, `/home/linuxbrew/.linuxbrew/bin`,
 `/usr/local/bin` and `~/.local/bin` to the end of its own `PATH` when they exist: they fill
-gaps and never shadow what comes first. Every child process gets `/dev/null` as its input.
+gaps and never shadow what comes first. The helpers it starts (herdr, ssh, osascript and the
+like) get `/dev/null` or one of its own pipes as their input, never the popup's terminal.
 
 ### The local herdr
 
@@ -102,7 +103,8 @@ read at that moment and not kept. Nothing is written to the clipboard unless you
 ### The run directory and the fzf socket
 
 Each popup creates a private directory, `/tmp/switchboard-XXXXXXXX` (`mkdtemp`, mode 0700; `/tmp`
-because a Unix socket path is limited to 104 bytes on macOS). It holds:
+because a Unix socket path is limited to 104 bytes on macOS; the tests move it with
+`SWITCHBOARD_RUN_ROOT`). It holds:
 
 - `fzf.sock`, the socket fzf listens on (`--listen`) so the list can update while it is open.
   It is a Unix socket in a directory only your user can open, never a TCP port: a socket other
@@ -113,9 +115,16 @@ because a Unix socket path is limited to 104 bytes on macOS). It holds:
 The parts of Switchboard that use the directory after the popup has started open it once, check
 that it is a real directory (not a symlink) owned by you with no access for group or others, and
 from then on work only through that descriptor: files are created with `O_NOFOLLOW` and mode
-0600, result files also with `O_EXCL`, and only regular files are read. The popup removes the
-directory when it closes. If a refresh is still running two seconds after fzf has exited, the
-directory is left in place instead of being removed under it; it stays 0700.
+0600, result files also with `O_EXCL`, and only regular files are read. The popup always
+removes the directory when it closes. A refresh still under way at that moment cannot write
+anywhere else: its writes go through the removed directory's descriptor and fail, and fzf's
+socket is contacted only after such a write succeeded.
+
+The popup also closes this way when its window or session goes away: SIGHUP and SIGTERM exit
+through the same cleanup, which removes the run directory (and, for `--demo`, its temporary
+state directory). A second SIGHUP or SIGTERM during that cleanup is ignored, so it finishes.
+The detached focus worker and the jump helper run in sessions of their own and do not get the
+popup's hangup.
 
 ### Enter on another machine's row
 
@@ -178,17 +187,33 @@ itself), and nothing is detected. Otherwise Switchboard looks for it:
   there, unless `[jump] helper` gives the command;
 - the plugin's own helper, `python3 <plugin directory>/bin/switchboard --jump-server`. It finds
   the terminal of the herdr window on that Mac (`ps`), starts `osascript`, and waits for one line
-  with the chosen row. Then it uses AppleScript to send keystrokes to the Ghostty terminal on
-  that tty: `ctrl+b`, `/`, `/` (herdr's prefix and the keys that open its navigator and the
-  navigator's search), a query that matches only the chosen pane, and Enter. The query may
-  hold only `a-z 0-9 : . _ -` and space, and the tty must look like `/dev/<name>`. When no
-  query matches only that pane, the helper first gives the pane a unique name with
-  `herdr pane rename` and restores the original name afterwards. Last, it asks herdr to focus
-  that pane. These herdr commands run on the Mac with `--machine <label>`, the label the server
-  knows the machine by (none when that label is the Mac's own name).
+  with the chosen row; a line that is not exactly the nine string arguments it expects is
+  dropped. Then it uses AppleScript to send keystrokes to the Ghostty terminal on that tty:
+  herdr's prefix and navigator key (`[jump] prefix` and `goto`, by default `ctrl+b` and `g`,
+  herdr's own defaults), `/` (which focuses the navigator's search), a query that matches only
+  the chosen pane, and Enter. When no query matches only that pane, the helper gives the pane a
+  unique name with `herdr pane rename` for a moment and restores the original name afterwards.
+  Last, it asks herdr to focus that pane. These herdr commands run on the Mac with
+  `--machine <label>`, the label the server knows the machine by (none when that label is the
+  Mac's own name).
 
-The server also sends the usual focus through herdr's API, so if the keystrokes do not arrive
-the pane is still focused on its machine.
+**What can be typed is a closed set.** Everything that ends up in the AppleScript is checked
+whole against a fixed pattern, so nothing can leave its `text:` string or add a line break (an
+extra Enter):
+
+- `[jump] prefix` must be `ctrl+` and one lower-case letter, and `[jump] goto` must be `prefix+`
+  and one key out of `a-z`, `0-9` and a few punctuation characters, or herdr's name for one of
+  them; `config.example.toml` lists the set. A value outside it turns the jump off for that run
+  (the popup's header says which value), and never falls back to other keys. The keys are
+  checked when the config is read and again on the Mac, when the script is built.
+- the query may hold only `a-z 0-9 : . _ -` and space, and the tty must look like `/dev/<name>`
+  (ASCII letters, digits, `_` and `.`).
+
+The helper checks all of that before it renames or types anything. When something is refused,
+or there is no herdr window on that Mac, it renames nothing, types nothing, stops the waiting
+`osascript` and only asks herdr to focus the pane. The server also sends the usual focus
+through herdr's API, so if the keystrokes do not arrive the pane is still focused on its
+machine.
 
 This is the most sensitive part of the plugin, for two reasons. The herdr server must be able to
 log in to your Mac over ssh, and anyone who controls the account that runs the herdr server can
@@ -201,8 +226,8 @@ it learned from the system, not from your herdr configuration. So:
 - give the server a key of its own for this, and restrict it in the Mac's `authorized_keys`
   (for example with a `from=` option).
 
-With the jump off, or when anything it needs is missing, Switchboard only focuses the pane
-through herdr on that pane's machine.
+With the jump off (by `enabled = false` or by a refused key), or when anything it needs is
+missing, Switchboard only focuses the pane through herdr on that pane's machine.
 
 ## Out of scope
 

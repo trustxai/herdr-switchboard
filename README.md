@@ -9,7 +9,7 @@ needs you.
 ![herdr 0.9.5 or newer](https://img.shields.io/badge/herdr-%E2%89%A5%200.9.5-7c3aed)
 ![Linux and macOS](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-555)
 
-![Switchboard over the bundled demo data: three machines, blocked agents at the top, a blocked agent on the server selected and its pane previewed below](docs/assets/hero.png)
+![Switchboard over the bundled demo data: three machines, blocked agents at the top, a blocked agent selected and its preview below, where the agent asks to run a command](docs/assets/hero.png)
 
 ## What it does
 
@@ -28,8 +28,8 @@ needs you.
   further down it follows the agent you were on.
 - **Preview** of the selected pane at the bottom, without the agent's input box and status bar.
 - **Copy from the list:** `ctrl-y` copies the agent's last reply, `ctrl-o` opens the pane in a
-  viewer where a mouse selection is copied. Both go to the clipboard of the machine
-  you are typing on, even when the pane lives elsewhere.
+  viewer where a mouse selection is copied. Both go to the clipboard of the machine you are
+  typing on, even when the pane lives elsewhere.
 - **Terminals too.** Shells without an agent are listed, and `ctrl-t` switches to just them.
   The interface is in English or Spanish.
 
@@ -54,9 +54,8 @@ You need:
 If Python or fzf is missing or too old, the popup says what to install instead of opening.
 
 **Install it on each machine you open it from.** The key runs on the herdr server of the machine
-your window is showing, so if you look at your laptop and at a server through the same window,
-install the plugin on both. Machines you just want to *see* in the list need nothing: to list
-them, Switchboard runs the herdr that is already there.
+your window is showing. Machines you just want to *see* in the list need nothing: to list them,
+Switchboard runs the herdr that is already there.
 
 ## Bind a key
 
@@ -70,8 +69,8 @@ command = "trustxai.switchboard.open"
 description = "switchboard"
 ```
 
-To open it with `cmd+k` in Ghostty, send herdr's prefix and the key as text (this assumes the
-default prefix, `ctrl+b`):
+To open it with `cmd+k` in Ghostty, send herdr's prefix and the key as text (`\x02` is
+`ctrl+b`, herdr's default prefix):
 
 ```
 keybind = cmd+k=text:\x02\x20
@@ -89,34 +88,29 @@ keybind = cmd+k=text:\x02\x20
 | `ctrl-/` | hide or show the preview |
 | `esc` | close |
 
-**The order** is the one herdr's own agent panel uses with `agent_panel_sort = "priority"`:
-`● blocked` (red), `● done` (cyan), `● working` (yellow), `○ idle`, `· unknown`, and plain
-terminals (`› shell`) at the end, in tab-bar order. Inside a status, the agent whose change
-Switchboard saw last goes on top, whatever its machine. Changes that happened while the popup
-was closed are seen together when it opens, so they are interleaved: the latest of each
-machine, then the next one of each. With a query, matches that score the same keep this order.
+**The order** is the one herdr's own agent panel uses with `agent_panel_sort = "priority"` (as
+of herdr 0.9.5): blocked (red `●`), done (cyan `●`), working (yellow `●`), idle (`○`), unknown
+(`·`), and plain terminals (`›`) at the end, in tab-bar order. Inside a status, the agent whose
+change Switchboard saw last goes on top, whatever its machine. With a query, matches that score
+the same keep this order.
 
-**The columns** are machine, workspace, tab and pane, as in herdr's navigator. A tab without a
-name shows its number, dimmed. The pane shows its name (from `herdr pane rename` or the agent)
-or else the title the agent set; in a split tab its position goes in front (`2 · npm run dev`).
-The agent's kind is shown when it is not `claude`, then the working directory, dimmed.
+**The columns** are machine, workspace, tab and pane, as in herdr's navigator, then the agent's
+kind (when it is not `claude`) and the directory, dimmed. A pane shows its name, or else the
+title its agent set; in a split tab its position goes in front (`2 · npm run dev`).
 
-**The header** counts agents and those blocked, done and working, then says which machines are
-still loading, which are offline, and which rows come from a saved copy (`server from 40 s
-ago`).
+**The header** counts the agents and those blocked, done and working, and names the machines
+still loading, offline, or shown from a saved copy (`server from 40 s ago`).
 
 **When is something `done`?** herdr's own status is not enough across machines: a server counts
-as seen whatever finishes in its active tab, even while you are looking at another machine.
-So Switchboard keeps its own record. Finished work counts as seen when you open the popup on
-that tab, when you pick it with Enter, when herdr had it `done` and turned it idle (you went
-there some other way), or when it finished outside the active tab of its machine and is
-already idle. Anything else stays `done`. A machine Switchboard has not read before starts
-with everything counted as seen.
+as seen whatever finishes in its active tab, even while you look at another machine. So
+Switchboard keeps its own record: finished work counts as seen when you open the popup on that
+tab, pick it with Enter, reach it some other way (herdr turned it from `done` to idle), or when
+it finished outside its machine's active tab and is already idle. Anything else stays `done`.
 
 **Copying.** For a Claude Code session on this machine, `ctrl-y` takes the last reply from the
 session's transcript; otherwise it reads the last reply block from the screen, or copies what
-is on screen. The footer says which. Both `ctrl-y` and `ctrl-o` write OSC 52, which herdr
-forwards to the terminal you type in.
+is on screen. The footer says which. Both keys write OSC 52, which herdr forwards to the
+terminal you type in.
 
 ## Other machines
 
@@ -130,26 +124,28 @@ default already adds the usual Homebrew directories to `PATH`).
   opens, marked with their age in the header, until the fresh ones arrive. A copy older than
   `cache_max_age` (30 minutes) is not shown.
 - A machine that does not answer within 8 seconds (`remote_timeout`) shows as `offline` at the
-  bottom; the others are not held up. A machine that stops answering while the popup is open keeps its last rows.
+  bottom; the others are not held up. A machine that stops answering while the popup is open
+  keeps its last rows.
 
 **What Enter does on another machine's row**, with the jump off (the default): it focuses that
 pane on its machine through herdr's API, and the popup stays open with a footer, `focusing it on
-server…`, then `ready on server: switch to that machine to see it`. A focus through the API
-moves every window attached to that machine's server, so when you switch to it (the sidebar or
-herdr's navigator), you land on that pane. The focus runs in a process of its own, so pressing
-`esc` right away does not cancel it.
+server…`, then `ready on server: switch to that machine to see it`. As of herdr 0.9.5, a focus
+through the API moves every window attached to that server, so switching to it (sidebar or
+navigator) lands on that pane. The focus runs in its own process: `esc` does not cancel it.
 
 ## Jump to another machine (opt-in)
 
-herdr gives plugins no way to change which machine your window shows. On macOS, Ghostty accepts
-keystrokes through AppleScript, so the jump types into your window what you would: herdr's
-navigator, a search that matches just that pane, and Enter. It is **off by default**. To turn it
-on:
+As of herdr 0.9.5, a plugin has no way to change which machine your window shows. On macOS,
+Ghostty accepts keystrokes through AppleScript, so the jump types into your window what you
+would: herdr's navigator, a search that matches just that pane, and Enter. It is **off by
+default**. To turn it on:
 
 ```toml
 [jump]
 enabled = true
 client = "laptop"      # the ssh target of the Mac running your herdr window, or "local"
+prefix = "ctrl+b"      # your herdr [keys] prefix; this is herdr's default
+goto = "prefix+g"      # your herdr [keys] goto (the navigator); this is herdr's default
 ```
 
 It needs:
@@ -159,22 +155,27 @@ It needs:
   `client = "local"`, when the server is that Mac);
 - the plugin and `python3` on the Mac too, or `[jump] helper` set to the command that runs
   this plugin's `bin/switchboard` there;
-- herdr's prefix at `ctrl+b`, with `/` after it opening the navigator and `/` again its search:
-  the jump types exactly `ctrl+b`, `/`, `/`, the search and Enter;
 - the machine you jump to saved in the Mac's herdr under the same label as on the server: the
-  helper runs `herdr --machine <label>` there.
+  helper runs `herdr --machine <label>` there;
+- **`prefix` and `goto` matching the window's herdr config.** The jump types the prefix, the
+  navigator key, `/` (which focuses the navigator's search), the search and Enter; with other
+  bindings those keys would land in your pane. Each value must be in the small set that
+  [`config.example.toml`](config.example.toml) lists. One that is not turns the jump off for
+  that run: the header says `bad value for jump.goto, so the jump is off` (or `jump.prefix`),
+  and Enter works as with `enabled = false`.
 
-Without `client`, Switchboard tries to find the Mac itself from the ssh connections of the
-windows attached to the server (Tailscale helps name them when it is installed, but is not
-required), and with several Macs it picks the one touched last. Setting `client` is safer.
+Without `client`, Switchboard looks for the Mac among the ssh connections of the windows
+attached to the server (Tailscale, if installed, helps name them) and picks the one touched
+last. Setting `client` is safer.
 
 **What it runs on the Mac**, over ssh: `herdr plugin list --json` to find the plugin (unless
-`helper` is set), then the plugin's helper, started when the popup opens so Enter has one line
-to send. The helper finds the terminal running herdr, starts `osascript` and waits; on Enter it
-sends the keystrokes to that Ghostty terminal and asks herdr to focus the pane. When no search
-matches just that pane, it renames the pane for a moment and restores the name. On `esc` or a
-row of the local machine it exits without doing anything. The server sends the normal API
-focus too, so if the keystrokes do not arrive the pane is still waiting on its machine.
+`helper` is set), then the plugin's helper, started with the popup so Enter has one line to
+send. On Enter the helper checks what it would type (keys, search, terminal) before anything
+else, and if one falls outside its character set it renames and types nothing. Otherwise it
+sends the keystrokes to the Ghostty terminal running herdr and asks herdr to focus the pane;
+when no search matches just that pane, it renames the pane for a moment. On `esc` it exits
+doing nothing. The server sends the normal API focus too, so the pane is ready on its machine
+even if the keystrokes do not arrive.
 
 **The cost:** the server must be able to log in to your Mac, and anyone who controls the account
 running the herdr server can then type into your terminal. Read the jump section of
@@ -191,18 +192,19 @@ local_label = ""       # this machine's name in the list; empty means the short 
 
 [refresh]
 remote_seconds = 3     # how often each saved machine is read while the popup is open
+local_timeout = 5      # seconds to wait for this machine's herdr; raise it if it is slow
 
 [colors]
 accent = "magenta"     # palette names follow your terminal theme; "#rrggbb" works too
-selected_bg = "magenta"
 
 [jump]
-enabled = false        # see "Jump to another machine"
+enabled = false        # see "Jump to another machine" for client, prefix and goto
 ```
 
 [`config.example.toml`](config.example.toml) lists every option with its default and range. A
 mistake never stops the popup: a file that does not parse means all the defaults, a bad value
-means that option's default, and the header says what was wrong.
+means that option's default (a bad `prefix` or `goto` turns the jump off), and the header says
+what was wrong.
 
 ## How it compares
 
@@ -231,46 +233,41 @@ Corrections are welcome in an issue.
   [Install](#install)), the `[[keys.command]]` block, and `herdr server reload-config`.
 - **It says fzf is missing or too old.** It looks on `PATH` and in the Homebrew directories.
   Distribution packages are often older than 0.71; see [Install](#install).
+- **It says herdr did not answer `api snapshot` in time.** This machine's herdr was slower than
+  `[refresh] local_timeout` (5 s by default). Raise it, up to 120, in the file the message names.
 - **A machine shows `offline`.** From the server, try `ssh -o BatchMode=yes <target> herdr
   --version`; if it asks for a password or does not find `herdr`, fix the key or set
-  `[remote] herdr`. Raise `[refresh] remote_timeout` for a slow link.
-  `python3 bin/switchboard --rows`, run from the plugin's directory (`plugin_root` in
-  `herdr plugin list --json`), prints the list without fzf.
+  `[remote] herdr`. Raise `[refresh] remote_timeout` for a slow link. `bin/switchboard --rows`
+  (in the plugin's directory) prints the list without fzf.
 - **Rows marked `from 40 s ago` stay that way.** That machine has not answered yet; it is the
   saved copy. If it never updates, see the previous point.
 - **The header starts with `config …`.** The config file has a problem; the message says which,
-  and the defaults are in use.
+  and the defaults are in use for it. When it says `so the jump is off`, copy the binding from
+  your herdr config's `[keys]`, within the set `config.example.toml` lists.
 - **The jump does not happen.** Check the [requirements](#jump-to-another-machine-opt-in), set
   `[jump] client`, and try `ssh -o BatchMode=yes <client> true` from the server. macOS may ask
-  once whether the process may control Ghostty.
+  for Automation permission before it lets the helper control Ghostty.
 - **The order or the `done` marks look wrong.** They live in `recency.json` in the plugin's
   state directory; deleting it starts them over.
 
 ## Demo mode and screenshots
 
-```sh
-python3 bin/switchboard --demo
-```
+`python3 bin/switchboard --demo` shows the real interface over the invented machines and
+sessions in `demo/fixtures.json`. It needs no herdr, ssh or network, writes nothing outside
+temporary directories, and Enter prints what it would run.
 
-shows the real interface over the sample data in `demo/fixtures.json`: three machines
-(`laptop`, `workstation`, `server`), invented sessions, and a short timeline that changes two
-of them while it is open. It needs no herdr, ssh or network, writes nothing outside temporary
-directories, and Enter prints what it would have run.
-
-The images above come from it. `docs/render.sh` regenerates both with one command: it runs the
-demo in a tmux server of its own, sends the keys, captures each screen with its colours,
-draws it as a terminal window in HTML (`docs/ansi2html.py`) and takes the screenshot with
-headless Chrome; ImageMagick builds the GIF. It needs tmux, fzf, Chrome or Chromium and
-ImageMagick, uses no network, and leaves nothing behind.
+The images above come from it: `docs/render.sh` runs the demo in a tmux server of its own,
+captures each screen with its colours, draws it as a terminal window (`docs/ansi2html.py`) and
+screenshots it with headless Chrome; ImageMagick builds the GIF. It needs tmux, fzf, Chrome or
+Chromium and ImageMagick, uses no network, and leaves nothing behind.
 
 ## Security
 
-Switchboard runs the local herdr and fzf, runs herdr on your saved machines over your own ssh
-(in batch mode, never prompting), or through `herdr --machine`, and opens no other network
-connection. It keeps the last snapshot of each saved machine and a small record of what you
-have seen in its state directory, never pane output or credentials. The jump, when you turn it on, adds
-ssh from the server to your Mac. [SECURITY.md](SECURITY.md) has the details and how to report a
-vulnerability privately.
+Switchboard runs the local herdr and fzf, reaches your saved machines through your own ssh (in
+batch mode) or `herdr --machine`, and opens no other connection. It keeps each saved machine's
+last snapshot and a small record of what you have seen, never pane output or credentials. The
+jump adds ssh from the server to your Mac. [SECURITY.md](SECURITY.md) has the details and how
+to report a vulnerability privately.
 
 ## Contributing
 

@@ -47,8 +47,9 @@ locally; ruff and gitleaks are skipped with a message when they are not installe
 - **Python 3.9 syntax.** No `match`, no `X | Y` in annotations that are evaluated (use
   `Optional[X]` or `Union[X, Y]`), no parenthesised context managers, no `from __future__`.
   ruff (`make lint`) and the 3.9 CI jobs catch most of it.
-- **Every child process gets `stdin=subprocess.DEVNULL`.** The popup owns the terminal; a child
-  that reads from it swallows keystrokes, and fzf closes as if Esc had been pressed.
+- **Every child process states its stdin**: `subprocess.DEVNULL`, or a pipe the program writes
+  to. The popup owns the terminal; a child that reads from it swallows keystrokes, and fzf
+  closes as if Esc had been pressed. The tests check that every `subprocess` call says it.
 - **Every user-visible string goes through the translation table**, in English and Spanish.
 - **No bytecode in the tree.** The tests must not write `__pycache__`; `make lint` fails if they
   do.
