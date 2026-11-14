@@ -3174,6 +3174,32 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         os.environ.update(saved_env)
     check("child-env-keeps-the-rest", sorted(got) == ["KEEP", "PATH"], sorted(got))
 
+# 47. No python3 on PATH: the pane says what is missing and waits, instead of closing.
+block("47. pane without python3")
+pane_line = next(l for l in MANIFEST.split("[[panes]]", 1)[1].splitlines() if l.startswith("command = "))
+pane_cmd = json.loads(pane_line.split("=", 1)[1])  # TOML basic strings use JSON's escapes
+if HAVE_TOMLLIB:
+    check("manifest-pane-command-read-right", pane_cmd == sb.tomllib.loads(MANIFEST)["panes"][0]["command"])
+with tempfile.TemporaryDirectory() as d:
+    bare = os.path.join(d, "bin")
+    os.mkdir(bare)
+    os.symlink(shutil.which("sh"), os.path.join(bare, "sh"))  # a shell and nothing else
+    p = subprocess.Popen(pane_cmd, cwd=d, env=dict(os.environ, PATH=bare, HERDR_PLUGIN_ROOT=str(ROOT)),
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         universal_newlines=True)
+    _time.sleep(1.0)
+    waiting = p.poll() is None
+    out, _ = p.communicate("\n", timeout=10)
+    check("no-python-pane-waits-for-enter", waiting, out)
+    check("no-python-pane-says-what-is-needed", p.returncode == 127 and "Python 3.9 or newer" in out
+          and "PATH the herdr server runs with" in out and "Press Enter" in out, (p.returncode, out))
+    # With python3 there, the same command runs the program (it stops at the fzf check here).
+    env = dict(os.environ, HERDR_PLUGIN_ROOT=str(ROOT), SWITCHBOARD_FZF="", HERDR_BIN_PATH="/bin/false",
+               PATH=os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", ""))
+    r = subprocess.run(pane_cmd, cwd=d, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       universal_newlines=True, timeout=20)
+    check("pane-with-python-runs-the-program", r.returncode != 0 and "fzf" in r.stdout, r.stdout[-200:])
+
 # 48. Once the pane may carry the temporary name, the name comes back and the focus goes out,
 # whatever happens to the typing.
 block("48. jump restores the name")
