@@ -113,6 +113,16 @@ What it has to get right, and how it fails otherwise:
    remote timeout), so the footer never says it failed before a slow focus lands.
 37. A hung local herdr cannot freeze anything: the local snapshot has a timeout at open and in
    every refresh, the refresh keeps the last rows, and the popup says what failed.
+38. Closing the popup always removes its run directory, whatever local_seconds is and however
+   slow the local snapshot, and also when its terminal goes away (SIGHUP); stop wakes the
+   watch loop at once.
+39. The detached worker checks again what it was handed: a result name that is not a plain
+   focus-N-N (such as ../x) or a directory that is not ours and 0700 gets nothing written.
+40. The selected row reads well: no gutter column, a pointer in the selected row's text colour,
+   and only the glyph coloured, so the status word takes the selection's colour. ctrl-t still
+   finds the terminals by their glyph.
+41. The keys the jump types come from [jump] prefix and goto, herdr's defaults unless set, and
+   are checked against closed character sets in the config, on the way and in the AppleScript.
 
     python3 tests/test_switchboard.py
 """
@@ -157,6 +167,16 @@ os.environ.update(NO_COLOR="1", PYTHONDONTWRITEBYTECODE="1",
                   HERDR_PLUGIN_STATE_DIR=os.path.join(_tmp_root, "state"))
 os.makedirs(os.environ["HOME"])
 os.chmod(_run_root, 0o700)
+
+_socks = [0]
+
+
+def short_sock(name):
+    """A unix socket path under the short runtime root: a socket path is limited to about
+    104 bytes, and TMPDIR can be far longer (macOS, CI runners)."""
+    _socks[0] += 1
+    return os.path.join(_run_root, "%s-%d.sock" % (name, _socks[0]))
+
 
 loader = importlib.machinery.SourceFileLoader("switchboard", str(TOOL))
 spec = importlib.util.spec_from_loader("switchboard", loader)
@@ -333,7 +353,7 @@ with tempfile.TemporaryDirectory() as d:
                       'case "$*" in\n'
                       '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
                       '  "--machine m1 api snapshot") cat "%(d)s/m1.json" ;;\n'
-                      '  "--machine m2 api snapshot") sleep 5 ;;\n'
+                      '  "--machine m2 api snapshot") exec sleep 5 ;;\n'
                       '  "--machine m3 api snapshot") echo "must not be asked" >&2; exit 9 ;;\n'
                       '  "api snapshot") cat "%(d)s/local.json" ;;\n'
                       "  *) exit 2 ;;\n"
@@ -417,13 +437,13 @@ class FakeFzf:
 
 
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
-    sock = os.path.join(d, "f.sock")
+    sock = short_sock("f")
     fz = FakeFzf(sock, position=2)
     check("http-get-position", sb.fzf_position(sock) == 2)
     check("http-get-no-content-length", fz.reqs and b"Content-Length" not in fz.reqs[-1], fz.reqs[-1:])
     check("http-post", sb.fzf_request(sock, "POST", b"reload(x)") is not None
           and fz.reqs[-1].endswith(b"\r\n\r\nreload(x)") and b"Content-Length: 9" in fz.reqs[-1])
-    check("http-no-fzf", sb.fzf_position(os.path.join(d, "missing.sock")) is None)
+    check("http-no-fzf", sb.fzf_position(short_sock("missing")) is None)
 
     # watch() end to end: a change sends a reload, no change sends nothing.
     sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
@@ -566,7 +586,7 @@ check("goto-unique-id", sb.goto_query({"pane": "w3:p1D"}, ents) == "w3:p1d")
 check("goto-repeated-id", sb.goto_query({"pane": "w1:p1"}, ents) is None)
 check("goto-id-inside-another", sb.goto_query({"pane": "w3:p1"}, ents + [ent("m1", "w3:p1")]) is None)
 check("goto-id-in-a-title", sb.goto_query({"pane": "w3:p1D"}, ents + [ent("", "w9:p2", title="see W3:P1D")]) is None)
-scr = sb.ghostty_keys_script("/dev/ttys000", "w3:p1d")
+scr = sb.ghostty_keys_script("/dev/ttys000", "w3:p1d", "\\x02//")
 check("applescript-one-burst", 'tty is "/dev/ttys000"' in scr and scr.count("perform action") == 1
       and '"text:\\\\x02//w3:p1d\\\\r"' in scr and "delay" not in scr, scr)
 for bad in (("/dev/ttys000", 'x" & do shell script "rm'), ("/dev/tty; rm", "w1:p1"), ("/dev/ttys000", "W1:P1")):
@@ -604,6 +624,7 @@ args = sb.jump_argv({"machine": "m1", "kind": "a", "pane": "w1:p1", "tab": "w1:t
 check("jump-argv-renames-when-repeated", args[6] == "1" and args[5].startswith("sbj")
       and args[:5] == ["--jump", "box1", "a", "w1:p1", "w1:t1"], args)
 check("jump-argv-name-of-that-machine", args[7] == "", args)
+check("jump-argv-carries-the-keys", len(args) == 9 and args[8] == sb.JUMP_KEYS, args)
 popen = []
 orig_popen = sb.subprocess.Popen
 sb.subprocess.Popen = lambda argv, **kw: popen.append((argv, kw))
@@ -742,9 +763,11 @@ sb.jump = lambda *a, **kw: got_jump.append((a, kw)) or 0
 sb.local_tui_tty = lambda ps_text=None: "/dev/ttys000"
 sb.subprocess.Popen = lambda argv, **kw: FakeOsa()
 try:
-    sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", "w1:p1", "1", "logs"]) + "\n"))
+    sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", "w1:p1", "1", "logs", "\\x01//"])
+                                + "\n"))
     check("server-jumps-with-what-is-ready", got_jump and got_jump[0][0] == ("box1", "a", "w1:p1", "w1:t1", "w1:p1", True, "logs")
-          and got_jump[0][1].get("tty") == "/dev/ttys000" and isinstance(got_jump[0][1].get("osa"), FakeOsa), got_jump)
+          and got_jump[0][1].get("tty") == "/dev/ttys000" and isinstance(got_jump[0][1].get("osa"), FakeOsa)
+          and got_jump[0][1].get("keys") == "\\x01//", got_jump)
     got_jump.clear()
     sb.jump_server(_io.StringIO(""))
     check("server-no-line-no-jump", not got_jump and killed, (got_jump, killed))
@@ -1349,6 +1372,10 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
         return buf, None, demo_missing(buf) if missing is None else missing
     screen, rc, missing = run_demo(b"\x1b")
     check("demo-pty-renders", missing == [], missing)
+    # fzf 0.66+ draws its gutter as a ▌ on every row; with a blank gutter only the pointer of
+    # the selected row is one (a few redraws), against one per visible row without it.
+    halves = screen.decode("utf-8", "replace").count("\u258c")
+    check("demo-pty-no-gutter-column", 0 < halves < 10, halves)
     check("demo-pty-esc-exits-clean", rc == 0, rc)
     screen, rc, missing = run_demo(b"\r")
     plain = sb.ANSI.sub("", screen.decode("utf-8", "replace"))
@@ -1377,7 +1404,7 @@ with tempfile.TemporaryDirectory() as d:
     fh = executable(d / "herdr", '#!/bin/sh\necho "$*" >> "%(d)s/log"\ncase "$*" in\n'
                                  '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
                                  '  "--machine m2 "*) exit 1 ;;\n'
-                                 '  "--machine m1 agent focus"*) sleep 1.5 ;;\n  *) exit 0 ;;\nesac\n' % {"d": d})
+                                 '  "--machine m1 agent focus"*) exec sleep 1.5 ;;\n  *) exit 0 ;;\nesac\n' % {"d": d})
     run_dir = d / "run"
     run_dir.mkdir(mode=0o700)  # like the popup's own (mkdtemp): helpers refuse anything looser
     run_dir.chmod(0o700)
@@ -1460,7 +1487,7 @@ with tempfile.TemporaryDirectory() as d:
     lv.refresh_remote(0, m1[0])
     lv.changed()  # the loops re-read the same data from here on: only the ack can change the rows
     check("acks-watch-before", "● done" in lv.text())
-    sock = os.path.join(str(d), "w.sock")
+    sock = short_sock("w")
     fz = FakeFzf(sock, position=0)
     stop = _threading.Event()
     _threading.Thread(target=sb.watch, args=(lv, sock, str(d / "rows"), stop, str(ack_file)), daemon=True).start()
@@ -1555,7 +1582,7 @@ else:
 check("program-executable", os.access(str(TOOL), os.X_OK) and SOURCE.startswith("#!/usr/bin/env python3\n"))
 std = set(getattr(sys, "stdlib_module_names", ())) or {
     "base64", "copy", "glob", "json", "os", "re", "select", "shlex", "shutil", "socket", "subprocess", "sys",
-    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty", "stat", "math"}
+    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty", "stat", "math", "signal"}
 imported = set()
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):
@@ -1966,7 +1993,7 @@ with tempfile.TemporaryDirectory() as d:
         gone = d / "gone"
         gone.mkdir(mode=0o700)
         gone.chmod(0o700)
-        sock = str(d / "q.sock")
+        sock = short_sock("q")
         FakeFzf(sock)
         stop = _threading.Event()
         lv.changed()
@@ -1993,7 +2020,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                                      '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
                                      '  "api snapshot") cat "%(d)s/local.json" ;;\n'
                                      '  "--machine m1 api snapshot") cat "%(d)s/m1.json" ;;\n'
-                                     '  "--machine m1 agent focus"*) sleep 2 ;;\n'
+                                     '  "--machine m1 agent focus"*) exec sleep 2 ;;\n'
                                      '  *"pane read"*) echo "pane text" ;;\n'
                                      '  *) exit 0 ;;\nesac\n' % {"d": d})
         pid, fd = _pty.fork()
@@ -2162,7 +2189,7 @@ saved_hook = sb.threading.excepthook
 sb.threading.excepthook = lambda a: errors.append(a.exc_type.__name__)
 try:
     with tempfile.TemporaryDirectory(dir="/tmp") as d:
-        sock = os.path.join(d, "x.sock")
+        sock = short_sock("x")
         FakeFzf(sock)
         feed["local"], feed["m1"] = good_local, good_remote
         lv3 = sb.Live([{"id": "m1", "label": "box1"}], sb.entries_from(good_local, "", "here", 0), fetch=fetch33,
@@ -2324,9 +2351,21 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
           and open(os.path.join(run, "acks")).read() == "one\ntwo\n")
     os.symlink(decoy, os.path.join(run, "readlink"))
     os.mkfifo(os.path.join(run, "pipe"))
-    t0 = _time.time()
-    check("read-only-regular-files", sb.read_small(fd, "readlink") is None and sb.read_small(fd, "pipe") is None
-          and sb.read_small(fd, "res") == "hello\n" and _time.time() - t0 < 1)
+    check("read-refuses-links-and-reads-files", sb.read_small(fd, "readlink") is None
+          and sb.read_small(fd, "res") == "hello\n")
+    # The pipe in a thread with a deadline: a read that blocked would hang the whole suite.
+    piped = []
+    reader = _threading.Thread(target=lambda: piped.append(sb.read_small(fd, "pipe")), daemon=True)
+    reader.start()
+    reader.join(1.5)
+    blocked = reader.is_alive()
+    if blocked:  # release it: a writer lets the blocked open return
+        try:
+            os.close(os.open(os.path.join(run, "pipe"), os.O_WRONLY | os.O_NONBLOCK))
+        except OSError:
+            pass
+        reader.join(2)
+    check("read-never-blocks-on-a-pipe", not blocked and piped == [None], (blocked, piped))
 
     # The directory goes away and someone recreates it with links planted: nothing reaches them.
     shutil.rmtree(run)
@@ -2349,7 +2388,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     # watch(): a rows.tmp planted as a link is never written through.
     rows_dir = private_tmp(d, "rows-dir")
     os.symlink(decoy, os.path.join(rows_dir, "rows.tmp"))
-    sock = os.path.join(d, "r.sock")
+    sock = short_sock("r")
     FakeFzf(sock)
     feed35 = {"n": 1}
     lv = sb.Live([], [], fetch=lambda m="", t=None, i=None: snap([pane("w1:p1")], [agent("w1:p1", "idle", feed35["n"])]),
@@ -2371,7 +2410,9 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     decoy = decoy_in(d)
     (pathlib.Path(d) / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
     fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%(d)s/machines.json" ;;\n'
-                                             '  *"agent focus"*) env > "%(d)s/worker-env"; sleep 1.5; touch "%(d)s/focused" ;;\n'
+                                             '  *"agent focus"*) { [ -n "${SWITCHBOARD_RUN_DIR+x}" ] && echo has_run_dir; '
+                                             '[ -n "${SWITCHBOARD_RUN_FD+x}" ] && echo has_run_fd; } > "%(d)s/worker-flags"; '
+                                             'sleep 1.5; touch "%(d)s/focused" ;;\n'
                                              'esac\n' % {"d": d})
     env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=run, SWITCHBOARD_LABELS=json.dumps({"m1": "box1"}))
     out = subprocess.run([sys.executable, str(TOOL), "--enter", "m1|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
@@ -2392,11 +2433,9 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("attack-decoy-unchanged", open(decoy).read() == "precious\n", open(decoy).read())
     check("attack-nothing-written-in-the-new-directory", sorted(os.listdir(run)) == sorted([name, name + ".tmp"]),
           os.listdir(run))
-    worker_env = open(os.path.join(d, "worker-env")).read() if os.path.exists(os.path.join(d, "worker-env")) else ""
-    # Only flags in the failure detail: the environment can hold secrets.
-    flags = {"has_run_dir": "SWITCHBOARD_RUN_DIR=" in worker_env, "has_path": run in worker_env,
-             "has_run_fd": "SWITCHBOARD_RUN_FD=" in worker_env}
-    check("attack-worker-env-has-no-path", flags == {"has_run_dir": False, "has_path": False, "has_run_fd": True}, flags)
+    # The fake herdr records two yes/no flags, never the environment itself (it can hold secrets).
+    worker_flags = open(os.path.join(d, "worker-flags")).read().split() if os.path.exists(os.path.join(d, "worker-flags")) else None
+    check("attack-worker-env-has-no-path", worker_flags == ["has_run_fd"], worker_flags)
 
 # 36. --focus-wait outlasts the slowest worker.
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
@@ -2415,7 +2454,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
 # 37. A hung local herdr.
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
-    slow = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n  "api snapshot") sleep 6 ;;\n'
+    slow = executable(d / "herdr", '#!/bin/sh\ncase "$*" in\n  "api snapshot") exec sleep 6 ;;\n'
                                    '  "machine list --json") echo "[]" ;;\nesac\n')
     saved = (sb.HERDR, sb.LOCAL_TIMEOUT)
     sb.HERDR, sb.LOCAL_TIMEOUT = str(slow), 1.0
@@ -2440,8 +2479,228 @@ with tempfile.TemporaryDirectory() as d:
     r = subprocess.run([sys.executable, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
     took = _time.time() - t0
-    check("popup-hung-herdr-says-so", r.returncode == 1 and "herdr api snapshot failed" in r.stdout and took < 4,
+    cfg_path = os.path.join(os.environ["HERDR_PLUGIN_CONFIG_DIR"], "config.toml")
+    check("popup-hung-herdr-says-what-to-raise", r.returncode == 1 and "within 1 s" in r.stdout
+          and "[refresh] local_timeout" in r.stdout and cfg_path in r.stdout and took < 4,
+          (r.returncode, took, r.stdout[-300:]))
+    # The option itself, from a config file and without the test override.
+    cfg_dir = d / "cfg-timeout"
+    cfg_dir.mkdir()
+    (cfg_dir / "config.toml").write_text("[refresh]\nlocal_timeout = 1\n")
+    env = dict(os.environ, HERDR_BIN_PATH=str(slow), SWITCHBOARD_FZF=str(fzf_ok), HERDR_PLUGIN_CONFIG_DIR=str(cfg_dir))
+    t0 = _time.time()
+    r = subprocess.run([sys.executable, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
+    took = _time.time() - t0
+    check("local-timeout-option-applies", r.returncode == 1 and "within 1 s" in r.stdout and took < 4,
           (r.returncode, took, r.stdout[-200:]))
+    r = subprocess.run([sys.executable, str(TOOL), "--rows"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
+    check("rows-timeout-says-what-to-raise", r.returncode == 1 and "[refresh] local_timeout" in r.stderr
+          and "Traceback" not in r.stderr, (r.returncode, r.stderr[-200:]))
+    (cfg_dir / "config.toml").write_text("lang = \"es\"\n[refresh]\nlocal_timeout = 1\n")
+    r = subprocess.run([sys.executable, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=30)
+    check("local-timeout-message-in-spanish", "no contestó api snapshot en 1 s" in r.stdout, r.stdout[-200:])
+cfg, warn = sb.merge_config({"refresh": {"local_timeout": 30}})
+check("local-timeout-in-range", cfg["refresh"]["local_timeout"] == 30.0 and not warn, (cfg["refresh"], warn))
+for bad in (0.5, 121, "fast"):
+    cfg, warn = sb.merge_config({"refresh": {"local_timeout": bad}})
+    check("local-timeout-out-of-range %r" % (bad,), cfg["refresh"]["local_timeout"] == 5.0 and warn, (cfg["refresh"], warn))
+
+# 38. Closing always removes the run directory.
+def close_popup(local_seconds, slow):
+    """Open the popup over a fake herdr, press Esc, and return (rc, seconds from Esc to exit,
+    what is left in the popup's run root). slow: every snapshot after the first hangs."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = private_tmp(d, "runs")
+        cfg = os.path.join(d, "cfg")
+        os.mkdir(cfg)
+        with open(os.path.join(cfg, "config.toml"), "w") as f:
+            f.write("[refresh]\nlocal_seconds = %s\n" % local_seconds)
+        snapfile = os.path.join(d, "snap.json")
+        with open(snapfile, "w") as f:
+            json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="only-row")])}}, f)
+        hang = 'echo $$ > "%s/hung"; exec sleep 30' % d if slow else "true"
+        fh = executable(os.path.join(d, "herdr"),
+                        '#!/bin/sh\ncase "$*" in\n  "machine list --json") echo "[]" ;;\n'
+                        '  "api snapshot") if [ -e "%(d)s/once" ]; then %(hang)s; fi; touch "%(d)s/once"; cat "%(s)s" ;;\n'
+                        '  *) exit 0 ;;\nesac\n' % {"d": d, "hang": hang, "s": snapfile})
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), HERDR_PLUGIN_CONFIG_DIR=cfg,
+                              HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"), SWITCHBOARD_RUN_ROOT=root)
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+        import fcntl as _f6
+        import struct as _st6
+        import termios as _tm6
+        _f6.ioctl(fd, _tm6.TIOCSWINSZ, _st6.pack("HHHH", 30, 140, 0, 0))
+        buf, t_esc, rc, end = b"", None, None, _time.time() + 30
+        while _time.time() < end:
+            r, _, _ = _sel.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    chunk = os.read(fd, 65536)
+                except OSError:
+                    chunk = b""
+                if not chunk:
+                    _, status = os.waitpid(pid, 0)
+                    rc = os.waitstatus_to_exitcode(status)
+                    break
+                buf += chunk
+            if t_esc is None and b"only-row" in buf:
+                # With a slow snapshot, wait until a refresh is hanging before closing.
+                deadline = _time.time() + 5
+                while slow and not os.path.exists(os.path.join(d, "hung")) and _time.time() < deadline:
+                    _time.sleep(0.05)
+                os.write(fd, b"\x1b")
+                t_esc = _time.time()
+        if rc is None:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        took = _time.time() - t_esc if t_esc else None
+        left = sorted(os.listdir(root))
+        if os.path.exists(os.path.join(d, "hung")):  # the hanging fake herdr outlives the popup
+            try:
+                os.kill(int(open(os.path.join(d, "hung")).read().strip()), 9)
+            except (ValueError, OSError):
+                pass
+        return rc, took, left
+
+
+rc, took, left = close_popup(10, False)
+check("close-with-a-long-interval-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 1.5,
+      (rc, took, left))
+rc, took, left = close_popup(1, True)
+check("close-during-a-slow-snapshot-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 4,
+      (rc, took, left))
+
+
+# A popup whose terminal goes away (SIGHUP) still removes its directories: the run directory
+# and, in the demo, the temporary state directory.
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = private_tmp(d, "runs")
+        tmpdir = private_tmp(d, "tmp")
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH="/bin/false", SWITCHBOARD_RUN_ROOT=root,
+                              TMPDIR=tmpdir)
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL), "--demo"])
+        import fcntl as _f7
+        import struct as _st7
+        import termios as _tm7
+        _f7.ioctl(fd, _tm7.TIOCSWINSZ, _st7.pack("HHHH", 30, 160, 0, 0))
+        buf, end = b"", _time.time() + 20
+        while _time.time() < end and b"rate-limiter-review" not in buf:
+            r, _, _ = _sel.select([fd], [], [], 0.05)
+            if r:
+                try:
+                    buf += os.read(fd, 65536)
+                except OSError:
+                    break
+        seen_before = (sorted(os.listdir(root)), sorted(os.listdir(tmpdir)))
+        os.close(fd)  # the terminal goes away: the session leader gets SIGHUP
+        done = 0
+        for _ in range(100):
+            done, _status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                break
+            _time.sleep(0.05)
+        if not done:
+            os.kill(pid, 9)
+            os.waitpid(pid, 0)
+        # The run directory, and at least the demo's state directory (a preview child has its own).
+        check("hangup-was-really-mid-run", len(seen_before[0]) == 1 and len(seen_before[1]) >= 1, seen_before)
+        check("hangup-removes-every-directory", done == pid and os.listdir(root) == [] and os.listdir(tmpdir) == [],
+              (done, os.listdir(root), os.listdir(tmpdir)))
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    rows_dir = private_tmp(d, "rows")
+    saved_every = sb.LOCAL_EVERY
+    sb.LOCAL_EVERY = 10.0
+    try:
+        lv = sb.Live([], [], fetch=lambda m="", t=None, i=None: snap([], []), cache=False)
+        stop = _threading.Event()
+        t = _threading.Thread(target=sb.watch, args=(lv, short_sock("none"), os.path.join(rows_dir, "rows"),
+                                                    stop, None))
+        t.start()
+        _time.sleep(0.5)
+        t0 = _time.time()
+        stop.set()
+        t.join(3)
+        check("stop-wakes-the-watch-loop", not t.is_alive() and _time.time() - t0 < 1, _time.time() - t0)
+    finally:
+        sb.LOCAL_EVERY = saved_every
+
+# 39. The worker re-checks the name and the directory it inherits.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    (pathlib.Path(d) / "machines.json").write_text(json.dumps([{"id": "m1", "label": "box1", "enabled": True}]))
+    fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%s/machines.json" ;;\n'
+                                             '  *) exit 0 ;;\nesac\n' % d)
+    parent = private_tmp(d, "parent")
+
+    def run_worker(dir_path, name):
+        fd = os.open(dir_path, os.O_RDONLY)
+        try:
+            env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_FD=str(fd))
+            subprocess.run([sys.executable, str(TOOL), "--focus", "m1|a|w1:p1|w1:t1", name], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, pass_fds=(fd,), timeout=30)
+        finally:
+            os.close(fd)
+
+    run_dir = private_tmp(parent, "run")
+    run_worker(run_dir, "focus-1-1")
+    check("worker-writes-a-valid-result", sorted(os.listdir(run_dir)) == ["focus-1-1"], os.listdir(run_dir))
+    run_worker(run_dir, "../escape")
+    check("worker-refuses-a-name-that-climbs-out", sorted(os.listdir(parent)) == ["run"]
+          and sorted(os.listdir(run_dir)) == ["focus-1-1"], (os.listdir(parent), os.listdir(run_dir)))
+    loose = os.path.join(parent, "loose")
+    os.mkdir(loose)
+    os.chmod(loose, 0o755)
+    run_worker(loose, "focus-2-2")
+    check("worker-refuses-a-directory-that-is-not-private", os.listdir(loose) == [], os.listdir(loose))
+
+# 40. A readable selected row.
+argv = sb.fzf_argv("fzf", "self", "/tmp/s.sock")
+check("blank-gutter", "--gutter" in argv and argv[argv.index("--gutter") + 1] == " ", argv)
+colors = dict(kv.split(":", 1) for kv in sb.fzf_colors(sb.DEFAULTS["colors"]).split(","))
+check("pointer-in-the-selected-text-colour", colors.get("pointer") == sb.DEFAULTS["colors"]["selected_fg"], colors)
+env = dict(os.environ, HERDR_BIN_PATH="/bin/false")
+del env["NO_COLOR"]
+r = subprocess.run([sys.executable, str(TOOL), "--demo", "--rows"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                   universal_newlines=True, env=env, timeout=20)
+rows = [l.split("\t", 1)[1] for l in r.stdout.splitlines()[1:] if "\t" in l]
+glyph_only = re.compile(r"^\x1b\[[0-9;]+m[●○·›]\x1b\[0m (blocked|done|working|idle|unknown|shell) ")
+check("only-the-glyph-is-coloured", rows and all(glyph_only.match(x) for x in rows),
+      [x[:40] for x in rows if not glyph_only.match(x)][:3])
+plain_rows = [sb.ANSI.sub("", x) for x in rows]
+check("terminals-still-start-with-their-glyph", sum(1 for x in plain_rows if x.startswith("› ")) == 5,
+      [x[:12] for x in plain_rows])
+
+# 41. The jump's keys are configurable and cannot escape the AppleScript string.
+check("jump-keys-default-is-herdrs", sb.DEFAULTS["jump"]["prefix"] == "ctrl+b" and sb.DEFAULTS["jump"]["goto"] == "prefix+g"
+      and sb.JUMP_KEYS == "\\x02g/", sb.JUMP_KEYS)
+check("jump-keys-custom", sb.goto_keys("ctrl+a", "prefix+/") == "\\x01//" and sb.goto_keys("ctrl+z", "prefix+;") == "\\x1a;/")
+for prefix, goto in (("f12", "prefix+g"), ("ctrl+B", "prefix+g"), ("ctrl+b", "g"), ("ctrl+b", "prefix+shift+g"),
+                     ("ctrl+b", 'prefix+"'), ("ctrl+b", "prefix+\\"), ("ctrl+b", "prefix+gg"), ("ctrl+b\n", "prefix+g"),
+                     ("ctrl+b", "prefix+g\n"), ("", "")):
+    check("jump-keys-refused %r" % ((prefix, goto),), sb.goto_keys(prefix, goto) is None)
+cfg, problems = sb.merge_config({"jump": {"prefix": "ctrl+a", "goto": 'prefix+" & do shell script "x'}})
+check("jump-keys-bad-config-is-default", cfg["jump"]["prefix"] == "ctrl+a" and cfg["jump"]["goto"] == "prefix+g"
+      and any("jump.goto" in p for p in problems), (cfg["jump"], problems))
+sb.configure(cfg)
+try:
+    check("jump-keys-from-config", sb.JUMP_KEYS == "\\x01g/", sb.JUMP_KEYS)
+    check("jump-keys-used-in-the-script", '"text:\\\\x01g/w1:p1\\\\r"' in sb.ghostty_keys_script("/dev/ttys000", "w1:p1"))
+finally:
+    sb.configure(sb.load_config()[0])
+    sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
+for bad in ('\\x02g/" & do shell script "touch x', "\\x02g/\\r", "\\x00g/", "\\x1bg/", "x/", "\\x02G/"):
+    try:
+        sb.ghostty_keys_script("/dev/ttys000", "w1:p1", bad)
+        check("applescript-refuses-keys %r" % bad, False)
+    except ValueError:
+        pass
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]

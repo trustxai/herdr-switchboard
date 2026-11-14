@@ -28,6 +28,7 @@ import re
 import select
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -135,6 +136,10 @@ STRINGS = {
         "select_lines": ", %d lines",
         "snapshot_failed": "herdr api snapshot failed (%s). Press Enter to close. ",
         "rows_failed": "herdr api snapshot failed: %s",
+        "snapshot_timeout": "herdr did not answer api snapshot within %s s. If this machine is that slow, raise"
+                            " [refresh] local_timeout in %s. Press Enter to close. ",
+        "rows_timeout": "herdr did not answer api snapshot within %s s. If this machine is that slow, raise"
+                        " [refresh] local_timeout in %s.",
         "remote_focusing": "focusing it on %s…",
         "remote_ready": "ready on %s: switch to that machine to see it · esc closes",
         "remote_failed": "could not focus it on %s · esc closes",
@@ -208,6 +213,10 @@ STRINGS = {
         "select_lines": ", %d líneas",
         "snapshot_failed": "falló herdr api snapshot (%s). Enter para cerrar. ",
         "rows_failed": "falló herdr api snapshot: %s",
+        "snapshot_timeout": "herdr no contestó api snapshot en %s s. Si esta máquina es así de lenta, subí"
+                            " [refresh] local_timeout en %s. Enter para cerrar. ",
+        "rows_timeout": "herdr no contestó api snapshot en %s s. Si esta máquina es así de lenta, subí"
+                        " [refresh] local_timeout en %s.",
         "remote_focusing": "enfocándola en %s…",
         "remote_ready": "lista en %s: pasá a esa máquina para verla · esc cierra",
         "remote_failed": "no se pudo enfocar en %s · esc cierra",
@@ -278,6 +287,7 @@ DEFAULTS = {
         "local_seconds": 1.0,
         "remote_seconds": 3.0,
         "remote_timeout": 8.0,
+        "local_timeout": 5.0,
         "cache_max_age": 1800.0,
     },
     # Names of the terminal's own ANSI palette, so the default looks right on any theme.
@@ -295,6 +305,8 @@ DEFAULTS = {
         "enabled": False,
         "client": "",
         "helper": "",
+        "prefix": "ctrl+b",
+        "goto": "prefix+g",
     },
 }
 
@@ -304,11 +316,31 @@ NUMBER_RANGES = {
     ("refresh", "local_seconds"): (0.2, 60.0),
     ("refresh", "remote_seconds"): (0.5, 600.0),
     ("refresh", "remote_timeout"): (1.0, 120.0),
+    ("refresh", "local_timeout"): (1.0, 120.0),
     ("refresh", "cache_max_age"): (0.0, 86400.0),
 }
 # Exactly the colour values fzf accepts: -1 (terminal default), 0 to 255, #rrggbb, and the
 # names of the 16 base colours (gray and grey are aliases of bright-black). An unknown name
 # makes fzf exit before drawing anything, so it is refused here.
+# The herdr keys the jump types, in herdr's own syntax so they can be copied from its config:
+# the prefix (ctrl plus a letter) and the navigator's key after it (one plain key). They end
+# up inside an AppleScript string and Ghostty's text: action, so only these characters.
+PREFIX_KEY = re.compile(r"ctrl\+([a-z])")
+GOTO_KEY = re.compile(r"prefix\+([a-z0-9/?;,.=\[\]'`-])")
+# The text Ghostty is asked to type: the prefix as \xNN, the navigator key, and "/" (the key
+# that focuses the navigator's search, fixed in herdr).
+KEYS_TEXT = re.compile(r"\\x(0[1-9a-f]|1[0-9a])[a-z0-9/?;,.=\[\]'`-]/")
+
+
+def goto_keys(prefix, goto):
+    """The Ghostty text for these herdr keys, or None when either is not accepted."""
+    p = PREFIX_KEY.fullmatch(prefix or "")
+    g = GOTO_KEY.fullmatch(goto or "")
+    if not p or not g:
+        return None
+    return "\\x%02x%s/" % (ord(p.group(1)) - 96, g.group(1))
+
+
 COLOR_VALUE = re.compile(r"^(-1|#[0-9a-fA-F]{6}|25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]"
                          r"|(bright-)?(black|red|green|yellow|blue|magenta|cyan|white)|gray|grey)$")
 # The extra fzf entries: comma-separated "name[:value[:attribute...]]". Only the shape is
@@ -560,6 +592,10 @@ def merge_config(raw):
                 if key == "colors" and got is not None and not (
                         FZF_COLOR_SPEC.match(got) if sub == "fzf" else COLOR_VALUE.match(got)):
                     got = None
+                if key == "jump" and got is not None and (
+                        sub == "prefix" and not PREFIX_KEY.fullmatch(got)
+                        or sub == "goto" and not GOTO_KEY.fullmatch(got)):
+                    got = None
                 if got is None:
                     problems.append(tr("cfg_bad_value", key + "." + sub, lang=lang))
                 else:
@@ -609,13 +645,14 @@ CONFIG = copymod.deepcopy(DEFAULTS)
 CONFIG_WARNING = None
 LOCAL_LABEL = ""
 LOCAL_EVERY = REMOTE_EVERY = REMOTE_TIMEOUT = 0.0
-LOCAL_TIMEOUT = 5.0  # seconds for a read of this machine's herdr, as for the other local reads
+LOCAL_TIMEOUT = 5.0  # seconds for a snapshot of this machine's herdr ([refresh] local_timeout)
 CACHE_MAX_AGE = 1800
 REMOTE_HERDR = DEFAULT_REMOTE_HERDR
 COLORS = dict(DEFAULTS["colors"])
 JUMP_ENABLED = False
 JUMP_CLIENT = ""
 JUMP_HELPER = ""
+JUMP_KEYS = "\\x02g/"
 STATE_DIR = state_dir()
 
 
@@ -623,7 +660,7 @@ def configure(cfg, warning=None):
     """Turn a loaded config into the module settings. SWITCHBOARD_* variables win over the
     file (the tests use them)."""
     global CONFIG, CONFIG_WARNING, LANG, LOCAL_LABEL, LOCAL_EVERY, REMOTE_EVERY, REMOTE_TIMEOUT
-    global CACHE_MAX_AGE, REMOTE_HERDR, COLORS, JUMP_ENABLED, JUMP_CLIENT, JUMP_HELPER, LOCAL_TIMEOUT
+    global CACHE_MAX_AGE, REMOTE_HERDR, COLORS, JUMP_ENABLED, JUMP_CLIENT, JUMP_HELPER, LOCAL_TIMEOUT, JUMP_KEYS
     CONFIG, CONFIG_WARNING = cfg, warning
     LANG = cfg["lang"]
     LOCAL_LABEL = cfg["local_label"]
@@ -631,13 +668,15 @@ def configure(cfg, warning=None):
     LOCAL_EVERY = _env_float("SWITCHBOARD_LOCAL_EVERY", refresh["local_seconds"])
     REMOTE_EVERY = _env_float("SWITCHBOARD_REMOTE_EVERY", refresh["remote_seconds"])
     REMOTE_TIMEOUT = _env_float("SWITCHBOARD_REMOTE_TIMEOUT", refresh["remote_timeout"])
-    LOCAL_TIMEOUT = _env_float("SWITCHBOARD_LOCAL_TIMEOUT", 5.0)
+    LOCAL_TIMEOUT = _env_float("SWITCHBOARD_LOCAL_TIMEOUT", refresh["local_timeout"])
     CACHE_MAX_AGE = refresh["cache_max_age"]
     REMOTE_HERDR = os.environ.get("SWITCHBOARD_REMOTE_HERDR") or cfg["remote"]["herdr"]
     COLORS = dict(cfg["colors"])
     JUMP_ENABLED = cfg["jump"]["enabled"]
     JUMP_CLIENT = cfg["jump"]["client"]
     JUMP_HELPER = cfg["jump"]["helper"]
+    JUMP_KEYS = goto_keys(cfg["jump"]["prefix"], cfg["jump"]["goto"]) or goto_keys(
+        DEFAULTS["jump"]["prefix"], DEFAULTS["jump"]["goto"])
 
 
 try:
@@ -807,10 +846,12 @@ def format_row(e):
     # Most agents are claude: the kind is shown only when it is something else.
     kind = e["agent"] if e["agent"] not in ("", "claude") else ""
     tail = "  ".join(x for x in (kind, e["cwd"]) if x)
-    # No fixed colours in the text: fzf paints the selected row, and a fixed grey there
-    # would not read. What is dimmed uses only the dim attribute.
+    # No fixed colours in the text: fzf paints the selected row, and a fixed colour there
+    # would not read on its background. Only the glyph carries the status colour; the word
+    # takes the row's colour, so it stays legible when selected. Dimmed text uses only the
+    # dim attribute.
     cols = [
-        "%s%s %s%s" % (color, glyph, pad(tr("st_" + e["status"]), 8), OFF),
+        "%s%s%s %s" % (color, glyph, OFF, pad(tr("st_" + e["status"]), 8)),
         pad(e["machine_label"], MACHINE_WIDTH),
         pad(e["ws_label"], 15),
         # An unnamed tab shows its number dimmed: it is the one on the tab bar.
@@ -1385,12 +1426,21 @@ def watch(live, sock, rows_file, stop, acks=None):
         os.replace(rows_name + ".tmp", rows_name, src_dir_fd=rows_dir, dst_dir_fd=rows_dir)
         fzf_request(sock, "POST", reload_action(rows_file, fzf_position(sock)).encode())
 
+    def nap():
+        """Until the next local pass is due, a machine answers, or stop is set. stop is
+        looked at every fifth of a second, so closing never waits out a long interval."""
+        due = time.time() + LOCAL_EVERY
+        while not stop.is_set():
+            left = due - time.time()
+            if left <= 0 or kick.wait(min(left, 0.2)):
+                break
+        kick.clear()
+
     for i, m in enumerate(live.machines):
         threading.Thread(target=remote_loop, args=(i, m), daemon=True).start()
     try:
         while not stop.is_set():
-            kick.wait(LOCAL_EVERY)
-            kick.clear()
+            nap()
             if stop.is_set():
                 break
             try:
@@ -1735,7 +1785,9 @@ def fzf_colors(colors=None):
     spec = [
         "fg:-1", "bg:-1", "hl:" + c["accent"], "fg+:%s:bold" % c["selected_fg"],
         "bg+:" + c["selected_bg"], "hl+:%s:bold:underline" % c["selected_fg"], "gutter:-1",
-        "pointer:" + c["accent"], "prompt:" + c["accent"], "spinner:" + c["accent"],
+        # The pointer sits on the selected row's background, so it takes that row's text
+        # colour: in the accent it would vanish into a background of the same colour.
+        "pointer:" + c["selected_fg"], "prompt:" + c["accent"], "spinner:" + c["accent"],
         "label:" + c["accent"], "border:" + c["muted"], "info:" + c["muted"],
         "header:" + c["muted"], "scrollbar:" + c["muted"],
     ]
@@ -1748,6 +1800,9 @@ def fzf_argv(fzf, self_cmd, sock, remote_enter=False):
         # No padding: every column lost here breaks a preview line.
         "--layout", "reverse", "--height", "100%", "--border", "none",
         "--prompt", "❯ ", "--pointer", "▌", "--highlight-line", "--info", "inline-right",
+        # A blank gutter: fzf 0.66+ draws it as a ▌ on every row, a column of half blocks
+        # that also hides the pointer. --gutter exists since 0.66, below the 0.71 minimum.
+        "--gutter", " ",
         "--no-multi", "--cycle", "--scrollbar", "│",
         # With a query, score ties keep the priority order.
         "--tiebreak", "index",
@@ -1827,6 +1882,7 @@ def selected_text(lines, a, b):
     return "\n".join(parts)
 
 
+ESC_WAIT = 0.15  # seconds a lone Esc waits for the rest of a possible escape sequence
 SGR_MOUSE = re.compile(r"\x1b\[<(\d+);(\d+);(\d+)([Mm])")
 
 
@@ -1952,8 +2008,9 @@ def select_view(row_id, tty="/dev/tty"):
                     return 0
                 elif buf.startswith("\x1b") and len(buf) < 3:
                     # A lone Esc, or the first bytes of an arrow key whose rest is still on its
-                    # way? Wait a moment for more before taking it as Esc.
-                    r2, _, _ = select.select([fd], [], [], 0.05)
+                    # way? Wait a moment for more before taking it as Esc (150 ms: enough for a
+                    # slow machine or link, still instant to the eye; tmux waits 500 ms).
+                    r2, _, _ = select.select([fd], [], [], ESC_WAIT)
                     if not r2:
                         return 0
                     break
@@ -2313,23 +2370,25 @@ def goto_query(target, entries):
     return None
 
 
-def ghostty_keys_script(tty, query):
+def ghostty_keys_script(tty, query, keys=None):
     """The AppleScript that opens the Goto in the terminal on that tty, searches and jumps.
 
-    ctrl+b // opens the Goto with its search, then the query and Enter, all in ONE burst so
-    the window processes it at once and shows the jump, not the Goto typing. query only
-    holds [a-z0-9:._ -]: nothing to escape."""
-    if not QUERY_CHARS.match(query) or not re.match(r"^/dev/[\w.]+$", tty):
-        raise ValueError("unexpected characters in the query or the tty")
+    keys (the Ghostty text for [jump] prefix and goto, then /) opens the navigator and its
+    search; then the query and Enter, all in ONE burst so the window processes it at once
+    and shows the jump, not the navigator typing. keys, query and tty are checked against
+    closed character sets: nothing to escape, and nothing can leave the text: string."""
+    keys = keys or JUMP_KEYS
+    if not QUERY_CHARS.match(query) or not re.match(r"^/dev/[\w.]+$", tty) or not KEYS_TEXT.fullmatch(keys):
+        raise ValueError("unexpected characters in the keys, the query or the tty")
     return "\n".join([
         'tell application "Ghostty"',
         '  set t to first terminal whose tty is "%s"' % tty,
-        '  perform action "text:\\\\x02//%s\\\\r" on t' % query,
+        '  perform action "text:%s%s\\\\r" on t' % (keys.replace("\\", "\\\\"), query),
         'end tell',
     ])
 
 
-def jump(label, kind, pane, tab, query, rename, old_label, wait=0.15, tty=None, osa=None):
+def jump(label, kind, pane, tab, query, rename, old_label, keys=None, wait=0.15, tty=None, osa=None):
     """Runs on the Mac of the window, while the popup closes.
 
     tty and osa come ready from --jump-server: the window's tty and an osascript already
@@ -2342,7 +2401,7 @@ def jump(label, kind, pane, tab, query, rename, old_label, wait=0.15, tty=None, 
         time.sleep(0.8)  # let the new name reach the window
     tty = tty or local_tui_tty()
     if tty:
-        script = ghostty_keys_script(tty, query)
+        script = ghostty_keys_script(tty, query, keys)
         if osa is not None:
             osa.communicate(script.encode("utf-8"), timeout=10)
         else:
@@ -2365,7 +2424,9 @@ def jump_argv(target, label, entries):
     if rename:
         query = "sbj" + base64.b32encode(os.urandom(5)).decode("ascii").lower().rstrip("=")
     old = next((e["pane_label"] for e in entries if e["machine"] == target["machine"] and e["pane"] == target["pane"]), "")
-    return ["--jump", label, target["kind"], target["pane"], target["tab"], query, "1" if rename else "0", old]
+    # The keys go along: they are the window's herdr keys, set where the popup is opened.
+    return ["--jump", label, target["kind"], target["pane"], target["tab"], query, "1" if rename else "0", old,
+            JUMP_KEYS]
 
 
 def jump_server(stdin=None):
@@ -2384,11 +2445,11 @@ def jump_server(stdin=None):
         args = json.loads(line) if line.strip() else None
     except ValueError:
         args = None
-    if not (isinstance(args, list) and len(args) == 8 and args[0] == "--jump"):
+    if not (isinstance(args, list) and len(args) == 9 and args[0] == "--jump"):
         if osa is not None:
             osa.kill()
         return 0
-    return jump(args[1], args[2], args[3], args[4], args[5], args[6] == "1", args[7],
+    return jump(args[1], args[2], args[3], args[4], args[5], args[6] == "1", args[7], keys=args[8],
                 wait=0.05, tty=tty, osa=osa)
 
 
@@ -2636,7 +2697,10 @@ def popup(self_cmd, demo=False):
         entries = entries_from(snap, LOCAL, local_label(), 0)
     except Exception as exc:
         try:
-            input(tr("snapshot_failed", clean(str(exc))))
+            if isinstance(exc, subprocess.TimeoutExpired):
+                input(tr("snapshot_timeout", "%g" % LOCAL_TIMEOUT, config_path()))
+            else:
+                input(tr("snapshot_failed", clean(str(exc))))
         except (EOFError, KeyboardInterrupt):
             pass
         return 1
@@ -2647,7 +2711,7 @@ def popup(self_cmd, demo=False):
 
     # The socket and the reloadable rows go in a private (0700), short directory: on macOS
     # a unix socket path cannot exceed 104 bytes.
-    tmp = tempfile.mkdtemp(prefix="switchboard-", dir="/tmp")
+    tmp = tempfile.mkdtemp(prefix="switchboard-", dir=os.environ.get("SWITCHBOARD_RUN_ROOT") or "/tmp")
     sock, rows_file, acks = os.path.join(tmp, "fzf.sock"), os.path.join(tmp, "rows"), os.path.join(tmp, "acks")
     stop = threading.Event()
     argv = fzf_argv(fzf, self_cmd, sock, remote_enter=remote_enter)
@@ -2661,13 +2725,13 @@ def popup(self_cmd, demo=False):
     finally:
         stop.set()
         if watcher.is_alive():
-            watcher.join(2)  # it may be writing the rows file that is about to be removed
+            watcher.join(2)  # stop wakes it; a pass already under way may take a moment
         live.consume_acks(acks)  # an Enter on a remote row just before Esc
-        # Removed only once no pass of watch() can run: a pass that outlived the directory
-        # could otherwise meet a directory someone else created under the same name. If
-        # one is stuck, the directory stays: it is ours and 0700, so nobody else can use it.
-        if not watcher.is_alive():
-            shutil.rmtree(tmp, ignore_errors=True)
+        # Always removed. A pass of watch() still running after this cannot reach anything
+        # else: the rows go through the old descriptor (now ENOENT), fzf's socket is only
+        # contacted after a rows write succeeded, and the acks only through a directory
+        # that open_private_dir accepts as ours.
+        shutil.rmtree(tmp, ignore_errors=True)
     if proc.returncode == 2:
         # fzf refused its command line and drew nothing: say why instead of vanishing.
         reason = fzf_rejects(fzf, [a for a in argv[1:] if not a.startswith("--listen")]) or "exit 2"
@@ -2706,6 +2770,10 @@ def popup(self_cmd, demo=False):
     return 0
 
 
+def _exit_on_signal(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 def main(argv):
     global DEMO, STATE_DIR
     if argv[:1] in (["-h"], ["--help"]):
@@ -2717,6 +2785,11 @@ def main(argv):
     problems = dependency_problems(fzf=False)
     if problems:
         return explain_and_wait(problems)
+    # A popup whose window or session goes away gets SIGHUP (or SIGTERM). By default Python
+    # would die on the spot and leave its temporary directories behind; as an exit, the
+    # cleanup in the finally blocks runs.
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, _exit_on_signal)
     demo = argv[:1] == ["--demo"]
     if demo:
         argv = argv[1:]
@@ -2741,13 +2814,16 @@ def main(argv):
             return focus_wait(argv[1], argv[2])
         if argv[:1] == ["--jump-server"]:
             return jump_server()
-        if argv[:1] == ["--jump"] and len(argv) == 8:
-            return jump(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6] == "1", argv[7])
+        if argv[:1] == ["--jump"] and len(argv) == 9:
+            return jump(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6] == "1", argv[7], keys=argv[8])
         if argv[:1] == ["--rows"]:
             try:
                 entries, machines, down = collect(with_remote=True)
             except Exception as exc:  # the local herdr did not answer with a snapshot
-                sys.stderr.write(tr("rows_failed", clean(str(exc))) + "\n")
+                if isinstance(exc, subprocess.TimeoutExpired):
+                    sys.stderr.write(tr("rows_timeout", "%g" % LOCAL_TIMEOUT, config_path()) + "\n")
+                else:
+                    sys.stderr.write(tr("rows_failed", clean(str(exc))) + "\n")
                 return 1
             sys.stdout.write(render(entries, machines, down=down))
             return 0
