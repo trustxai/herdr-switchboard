@@ -2199,7 +2199,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                 except OSError:
                     chunk = b""
                 if not chunk:
-                    rc = finish(pid, fd, 5)
+                    rc, fd = finish(pid, fd, 5), None  # finish closed it
                     break
                 buf += chunk
             plain = sb.ANSI.sub("", buf.decode("utf-8", "replace"))
@@ -2212,7 +2212,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
             if "focusing" in marks and "ready" not in marks and "ready on box1" in plain:
                 marks["ready"] = _time.time()
                 os.write(fd, b"\x1b")
-        if rc is None:
+        if fd is not None:  # each descriptor is closed once
             finish(pid, fd, 0)
         check("enter-pty-footer-at-once", "focusing" in marks and marks["focusing"] - marks["enter"] < 1.5, marks)
         check("enter-pty-focus-arrives-later", "ready" in marks and marks["ready"] - marks["enter"] >= 1.5, marks)
@@ -2257,7 +2257,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                 except OSError:
                     chunk = b""
                 if not chunk:
-                    rc, exited_at = finish(pid, fd, 5), _time.time()
+                    rc, exited_at, fd = finish(pid, fd, 5), _time.time(), None  # finish closed it
                     break
                 buf += chunk
             plain = sb.ANSI.sub("", buf.decode("utf-8", "replace"))
@@ -2268,7 +2268,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
             if "enter" in sent and "esc" not in sent and "focusing it on box1" in plain:
                 os.write(fd, b"\x1b")
                 sent.add("esc")
-        if rc is None:
+        if fd is not None:  # each descriptor is closed once
             finish(pid, fd, 0)
         check("close-after-enter-exits-at-once", rc == 0 and "esc" in sent and not (d / "focused").exists(),
               (rc, sorted(sent), (d / "focused").exists()))
@@ -2749,7 +2749,7 @@ def close_popup(local_seconds, slow, signals=False, leader=True):
                 except OSError:
                     chunk = b""
                 if not chunk:
-                    rc = finish(pid, fd, 5)
+                    rc, fd = finish(pid, fd, 5), None  # finish closed it
                     break
                 buf += chunk
             elif leader:  # exited while a child still holds the terminal open
@@ -2780,7 +2780,8 @@ def close_popup(local_seconds, slow, signals=False, leader=True):
         ps = subprocess.run(["ps", "-axo", "command="], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             universal_newlines=True, timeout=20).stdout
         lingering = any(root in line and "ps -axo" not in line for line in ps.splitlines())
-        finish(pid, fd, 0)  # reaps, or kills, what is left of the terminal's session, and closes fd
+        if fd is not None:
+            finish(pid, fd, 0)  # reaps, or kills, what is left of the terminal's session, and closes fd
         if os.path.exists(os.path.join(d, "hung")):  # the hanging fake herdr outlives the popup
             try:
                 os.kill(int(open(os.path.join(d, "hung")).read().strip()), 9)
@@ -2796,8 +2797,8 @@ rc, took, left, _ = close_popup(1, True)
 check("close-during-a-slow-snapshot-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 4,
       (rc, took, left))
 # A second signal during the cleanup is ignored: the first one's exit code and nothing left.
-# fzf does not outlive the popup either: the popup leads its terminal's session, so its exit
-# hangs up fzf (checked here, since nothing in the program does it).
+# fzf does not outlive the popup either (the popup ends it, and here the kernel's hang-up of
+# a session leader's terminal would too).
 rc, took, left, lingering = close_popup(1, True, signals=True)
 check("second-signal-does-not-cut-the-cleanup", rc == 128 + 15 and left == [] and took is not None and took < 5,
       (rc, took, left))
