@@ -3347,6 +3347,25 @@ for label, text in (("tests", pathlib.Path(__file__).read_text()), ("program", S
     if label == "program":
         check("bounded-waits-exemption-pinned", exempt_seen == WAIT_EXEMPT, exempt_seen)
 
+# 51. Everything the program starts gets env=child_env(), except the sites named here: fzf
+# itself (it needs SWITCHBOARD_RUN_DIR), fzf_rejects (it runs before the run directory
+# exists), and the --focus worker, whose env is child_env() plus the descriptor's variable.
+block("51. every child gets child_env()")
+ENV_EXCEPTIONS = {("popup", "dict(os.environ, SWITCHBOARD_RUN_DIR=tmp, SWITCHBOARD_LABELS=json.dumps(labels))"),
+                  ("fzf_rejects", None), ("enter", "env")}
+env_sites, env_exceptions = 0, set()
+for node, fn in _calls_with_function(SOURCE):
+    if _subprocess_call(node.func) not in ("run", "Popen", "check_output", "call", "check_call"):
+        continue
+    env_sites += 1
+    env = next((k.value for k in node.keywords if k.arg == "env"), None)
+    if isinstance(env, ast.Call) and getattr(env.func, "id", "") == "child_env":
+        continue
+    env_exceptions.add((fn, ast.get_source_segment(SOURCE, env) if env is not None else None))
+check("child-env-at-every-site", env_exceptions == ENV_EXCEPTIONS and env_sites >= 8, (env_sites, env_exceptions))
+enter_def = next(n for n in ast.walk(ast.parse(SOURCE)) if isinstance(n, ast.FunctionDef) and n.name == "enter")
+check("worker-env-starts-from-child-env", "env = child_env(run_dir)" in ast.get_source_segment(SOURCE, enter_def))
+
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]

@@ -58,7 +58,10 @@ locally; ruff and gitleaks are skipped with a message when they are not installe
   to. The popup owns the terminal; a child that reads from it swallows keystrokes, and fzf
   closes as if Esc had been pressed. The tests check that every `subprocess` call says it.
 - **Anything started outside fzf gets `env=child_env()`**: no `FZF_*` variable and nothing that
-  holds the run directory's path.
+  holds the run directory's path. Block 51 checks every `subprocess` call in the program; the
+  only ones without it are fzf itself (in `popup`), `fzf_rejects` (it runs before the run
+  directory exists) and the `--focus` worker in `enter`, whose `env` starts from
+  `child_env(run_dir)`.
 - **Every wait has a bound**. Block 50 checks, with the AST, in the program and in the tests:
   every `subprocess.run`, `check_output`, `call` and `check_call` (also through an attribute,
   such as `sb.subprocess.run`) passes `timeout=`; every `communicate()` passes a timeout; every
