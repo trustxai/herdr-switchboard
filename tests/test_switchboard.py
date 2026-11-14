@@ -4001,9 +4001,10 @@ for mode, orphan in (("--preview", False), ("--copy", True), ("--select", True))
     found, alive = holder_after_timeout(mode, orphan)
     check("%s-read-timeout-ends-what-holds-its-pipe" % mode[2:], found and not alive, (found, alive))
 
-# A preview fzf starts once the popup has begun ending it (a redraw after the command it waited
-# for, say) reads nothing: end_fzf found what was below fzf before it started, and fzf need not
-# kill it on the way out. Without the popup's mark the same preview reads as usual.
+# A preview fzf starts once the popup has begun ending it reads nothing: end_fzf may have looked
+# for what is below fzf already, and fzf need not kill it on its way out. Nor does one that gets
+# going only after the popup has removed its run directory. Its run directory as usual: it reads.
+# Outside the popup (no run directory given): it reads.
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
     run57 = private_tmp(d, "run")
     with open(os.path.join(d, "machines.json"), "w") as f:
@@ -4012,17 +4013,23 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
                        '  *"pane read"*) echo read >> "%s/reads"; echo screen ;;\n  *) exit 1 ;;\nesac\n' % d)
     herdr57 = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n'
                          '  "machine list --json") cat "%s/machines.json" ;;\n  *) exit 1 ;;\nesac\n' % d)
-    env57 = dict(os.environ, HERDR_BIN_PATH=str(herdr57), SWITCHBOARD_SSH=str(ssh57), SWITCHBOARD_RUN_DIR=run57,
+    env57 = dict(os.environ, HERDR_BIN_PATH=str(herdr57), SWITCHBOARD_SSH=str(ssh57),
                  HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
     reads57 = []
-    for closing in (False, True):
-        if closing:
+    for case in ("open", "closing", "removed", "outside"):
+        if case == "closing":
             open(os.path.join(run57, "closing"), "w").close()
+        env = dict(env57, SWITCHBOARD_RUN_DIR=run57 if case != "removed" else os.path.join(d, "gone"))
+        if case == "outside":
+            del env["SWITCHBOARD_RUN_DIR"]
         subprocess.run([sys.executable, "-B", str(TOOL), "--preview", "m1|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, env=env57)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30, env=env)
         reads57.append(len(open(os.path.join(d, "reads")).read().split()) if os.path.exists(os.path.join(d, "reads"))
                        else 0)
-    check("preview-reads-nothing-once-the-popup-is-closing", reads57 == [1, 1], reads57)
+    # Reads counted so far after each case: one, still one, still one, two.
+    check("preview-reads-nothing-once-the-popup-is-closing", reads57[:2] == [1, 1], reads57)
+    check("preview-reads-nothing-once-the-run-dir-is-gone", reads57[1:3] == [1, 1], reads57)
+    check("preview-reads-outside-the-popup", reads57[0] == 1 and reads57[3] == 2, reads57)
 
 # end_fzf's last step, on a stand-in for fzf that ignores SIGTERM, as do its child and
 # grandchild. The terminal is a pty: the stand-in puts it in raw mode on the alternate screen.

@@ -2361,10 +2361,16 @@ def mark_closing(run_dir):
 def popup_closing():
     """True in a command fzf starts once the popup has begun ending fzf. end_fzf signals what
     is below fzf when it looks; a preview fzf starts after that is found by nothing, and fzf
-    need not kill it on its way out. So such a preview reads nothing."""
-    fd = open_private_dir(os.environ.get("SWITCHBOARD_RUN_DIR"))
-    if fd is None:
+    need not kill it on its way out. So such a preview reads nothing. Neither does one that
+    finds the popup's run directory gone (the popup has closed: a preview that fzf started on
+    its way out may get this far only after that) or not ours. Outside the popup (no
+    SWITCHBOARD_RUN_DIR), False."""
+    run_dir = os.environ.get("SWITCHBOARD_RUN_DIR")
+    if not run_dir:
         return False
+    fd = open_private_dir(run_dir)
+    if fd is None:
+        return True
     try:
         os.stat(CLOSING, dir_fd=fd, follow_symlinks=False)
         return True
