@@ -2766,7 +2766,7 @@ def close_popup(local_seconds, slow, signals=False, leader=True):
                 buf += read_until(fd, lambda _b: not slow or os.path.exists(os.path.join(d, "hung")), 5)
                 buf += read_until(fd, lambda _b: leader or os.path.exists(popup_pid), 5)
                 target = pid if leader else int(open(popup_pid).read())
-                t_esc = _time.time()
+                t_esc, mark = _time.time(), len(buf)
                 if signals:
                     os.kill(target, _sig8.SIGTERM)
                     buf += read_until(fd, lambda _b: False, 0.4)
@@ -2774,6 +2774,15 @@ def close_popup(local_seconds, slow, signals=False, leader=True):
                 else:
                     os.write(fd, b"\x1b")
         took = _time.time() - t_esc if t_esc else None
+        # The terminal after the popup left: what fzf wrote on its way out, and whether echo
+        # and signal keys are back (on a pty master, tcgetattr reads the terminal's settings).
+        terminal = {}
+        if fd is not None:
+            buf += read_until(fd, lambda _b: False, 0.3)
+            after = buf[mark:] if t_esc else b""
+            lflag = _tm6.tcgetattr(fd)[3]
+            terminal = {"main-screen": b"\x1b[?1049l" in after, "echo": bool(lflag & _tm6.ECHO),
+                        "isig": bool(lflag & _tm6.ISIG)}
         left = sorted(os.listdir(root))
         # fzf's command line names its socket under the run root: yes/no, from the command
         # lines only, before anything else here ends what is left.
@@ -2787,26 +2796,29 @@ def close_popup(local_seconds, slow, signals=False, leader=True):
                 os.kill(int(open(os.path.join(d, "hung")).read().strip()), 9)
             except (ValueError, OSError):
                 pass
-        return rc, took, left, lingering
+        return rc, took, left, lingering, terminal
 
 
-rc, took, left, _ = close_popup(10, False)
+rc, took, left, _, _ = close_popup(10, False)
 check("close-with-a-long-interval-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 1.5,
       (rc, took, left))
-rc, took, left, _ = close_popup(1, True)
+rc, took, left, _, _ = close_popup(1, True)
 check("close-during-a-slow-snapshot-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 4,
       (rc, took, left))
 # A second signal during the cleanup is ignored: the first one's exit code and nothing left.
 # fzf does not outlive the popup either (the popup ends it, and here the kernel's hang-up of
 # a session leader's terminal would too).
-rc, took, left, lingering = close_popup(1, True, signals=True)
+rc, took, left, lingering, _ = close_popup(1, True, signals=True)
 check("second-signal-does-not-cut-the-cleanup", rc == 128 + 15 and left == [] and took is not None and took < 5,
       (rc, took, left))
 check("signal-leaves-no-fzf", not lingering)
 # The same with a parent leading the terminal's session: no hang-up from the kernel, so only
 # the popup's own kill ends fzf (on macOS the kernel's hang-up could not be counted on).
-rc, took, left, lingering = close_popup(1, True, signals=True, leader=False)
+rc, took, left, lingering, terminal = close_popup(1, True, signals=True, leader=False)
 check("signal-popup-ends-its-own-fzf", rc == 128 + 15 and left == [] and not lingering, (rc, took, left, lingering))
+# ...gently: fzf gets the chance to put the terminal back (main screen, echo, signal keys).
+check("signal-popup-leaves-the-terminal-usable", terminal == {"main-screen": True, "echo": True, "isig": True},
+      terminal)
 
 
 # A popup whose terminal goes away (SIGHUP) still removes its directories: the run directory

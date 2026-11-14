@@ -2840,12 +2840,15 @@ def popup(self_cmd, demo=False):
         if proc is not None and proc.poll() is None:
             # Leaving on a signal: fzf goes too. Nothing else is sure to end it: the kernel
             # hangs it up only when this process leads the terminal's session, and macOS
-            # first waits for the terminal's output to drain.
-            proc.kill()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                pass
+            # first waits for the terminal's output to drain. SIGTERM first, so fzf puts the
+            # terminal back (main screen, mouse off, echo); SIGKILL only if it has not left.
+            for end in (proc.terminate, proc.kill):
+                end()
+                try:
+                    proc.wait(timeout=2)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
         stop.set()
         if watcher.is_alive():
             watcher.join(2)  # stop wakes it; a pass already under way may take a moment

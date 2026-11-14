@@ -135,8 +135,9 @@ anywhere else: its writes go through the removed directory's descriptor and fail
 socket is contacted only after such a write succeeded.
 
 The popup also closes this way when its window or session goes away: SIGHUP and SIGTERM exit
-through the same cleanup, which ends the popup's own fzf (a kill, then a wait of up to two
-seconds) and removes the run directory (and, for `--demo`, its temporary state directory). A
+through the same cleanup, which ends the popup's own fzf (SIGTERM, so fzf puts the terminal
+back, and a wait of up to two seconds; SIGKILL and another two seconds only if it is still
+there) and removes the run directory (and, for `--demo`, its temporary state directory). A
 second SIGHUP or SIGTERM during that cleanup is ignored, so it finishes. The detached focus
 worker and the jump's connection run in sessions of their own and do not get the popup's
 hangup.
