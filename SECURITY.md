@@ -49,10 +49,13 @@ like) get `/dev/null` or one of its own pipes as their input, never the popup's 
 
 **What each child gets in its environment.** fzf gets the popup's environment plus
 `SWITCHBOARD_RUN_DIR` (the run directory below, which its `--enter` and `--focus-wait` bindings
-need) and `SWITCHBOARD_LABELS` (the machines' labels). The commands fzf runs (`--preview`,
-`--copy`, `--select`, `--enter`, `--focus-wait`) are Switchboard itself, and they inherit fzf's
-environment, including the `FZF_*` variables fzf exports, such as `FZF_SOCK`, a path inside the
-run directory. Everything else Switchboard starts gets a cleaned copy of its environment:
+need) and `SWITCHBOARD_LABELS` (the machines' labels). fzf runs its commands through `sh -c`
+(`--with-shell`): Switchboard itself with `--preview`, `--copy` (ctrl-y), `--select` (ctrl-o),
+`--enter` (Enter, when other machines are saved and the jump is off) and `--focus-wait` (the
+background footer `--enter` asks for); `cat` of the rows file, for each reload of the list; and
+the ctrl-t query toggle, a `case` on `$FZF_QUERY`. All of them inherit fzf's environment,
+including the `FZF_*` variables fzf exports, such as `FZF_SOCK`, a path inside the run
+directory. Everything else Switchboard starts gets a cleaned copy of its environment:
 without any `FZF_*` variable, without `SWITCHBOARD_RUN_DIR` and `SWITCHBOARD_RUN_FD`, and
 without any other variable whose value contains the run directory's path. That covers herdr
 (local, over ssh, or through `herdr --machine`), `ssh`, `ps`, `ioreg`, `tailscale`, `osascript`,
