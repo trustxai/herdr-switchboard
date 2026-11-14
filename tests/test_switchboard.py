@@ -1801,16 +1801,16 @@ check("builtin-reads-special-floats", special["a"] == float("inf") and special["
 
 # 28. Colours fzf accepts, and a popup that never vanishes on an fzf error.
 for v in ("magenta", "bright-black", "bright-white", "gray", "grey", "0", "16", "99", "255", "-1", "#bd93f9"):
-    check("color-accepted %s" % v, sb.COLOR_VALUE.match(v) is not None)
+    check("color-accepted %s" % v, sb.COLOR_VALUE.fullmatch(v) is not None)
 for v in ("purple", "256", "999", "01", "#bd93f", "Magenta", "bright-gray", "", "-2", "red,blue"):
-    check("color-refused %r" % v, sb.COLOR_VALUE.match(v) is None)
+    check("color-refused %r" % v, sb.COLOR_VALUE.fullmatch(v) is None)
 cfg, problems = sb.merge_config({"colors": {"accent": "purple", "muted": "999", "selected_bg": "blue"}})
 check("color-bad-value-is-default", cfg["colors"]["accent"] == "magenta" and cfg["colors"]["muted"] == "bright-black"
       and cfg["colors"]["selected_bg"] == "blue" and len(problems) == 2, (cfg["colors"], problems))
 for v in ("", "info:8", "dark,fg+:#282a36:bold", "bogus"):
-    check("fzf-spec-shape-ok %r" % v, sb.FZF_COLOR_SPEC.match(v) is not None)
+    check("fzf-spec-shape-ok %r" % v, sb.FZF_COLOR_SPEC.fullmatch(v) is not None)
 for v in ("a b", "x,,y", ",x", "hl:x(y)", "hl:magenta;rm"):
-    check("fzf-spec-shape-refused %r" % v, sb.FZF_COLOR_SPEC.match(v) is None)
+    check("fzf-spec-shape-refused %r" % v, sb.FZF_COLOR_SPEC.fullmatch(v) is None)
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
     # An fzf that refuses any colour spec mentioning "bogus", as the real one does.
@@ -2755,6 +2755,26 @@ for bad in ('\\x02g/" & do shell script "touch x', "\\x02g/\\r", "\\x00g/", "\\x
         check("applescript-refuses-keys %r" % bad, False)
     except ValueError:
         pass
+
+# 43. What the jump types is matched whole: a final newline is not let through.
+for tty, query in (("/dev/ttys000", "w1:p1\n"), ("/dev/ttys000", "w1:p1\r"), ("/dev/ttys000\n", "w1:p1"),
+                   ("/dev/ttys\u00e9", "w1:p1"), ('/dev/ttys000"', "w1:p1")):
+    try:
+        sb.ghostty_keys_script(tty, query)
+        check("applescript-refuses %r" % ((tty, query),), False)
+    except ValueError:
+        pass
+check("typeable-whole-query", not sb.typeable("w1:p1\n", "\\x02g/") and sb.typeable("w1:p1", "\\x02g/"))
+for sub, value in (("accent", "red\n"), ("selected_bg", "#ff00ff\n"), ("fzf", "fg:red\n")):
+    cfg, problems = sb.merge_config({"colors": {sub: value}})
+    check("colour-whole-value %s" % sub, cfg["colors"][sub] == sb.DEFAULTS["colors"][sub] and problems, cfg["colors"][sub])
+_proj = os.path.join(os.environ["HOME"], ".agent", "projects", "p")
+os.makedirs(_proj)
+for _name in ("0123abcd-ef.jsonl", "0123abcd-ef\n.jsonl"):
+    open(os.path.join(_proj, _name), "w").close()
+check("transcript-id-whole", sb.transcript_path("0123abcd-ef\n") is None
+      and sb.transcript_path("0123abcd-ef") == os.path.join(_proj, "0123abcd-ef.jsonl"), sb.transcript_path("0123abcd-ef\n"))
+shutil.rmtree(os.path.join(os.environ["HOME"], ".agent"))
 
 # 45. The other machines' rows show up even when fzf opens --listen late (they answered
 # before it listened). The demo, behind an fzf that starts listening 0.3 s late.
