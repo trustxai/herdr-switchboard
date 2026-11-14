@@ -139,24 +139,44 @@ socket is contacted only after such a write succeeded.
 
 The popup also closes this way when its window or session goes away: SIGHUP and SIGTERM exit
 through the same cleanup, which ends the popup's own fzf and removes the run directory (and,
-for `--demo`, its temporary state directory). fzf gets SIGTERM, so it puts the terminal back,
-and up to two seconds to leave; fzf does not act on it while it waits for `--copy` or
-`--select` to finish, so then the popup kills the process groups of the commands fzf started,
-waits up to two more seconds, and only then sends fzf SIGKILL. A second SIGHUP or SIGTERM
-during that cleanup is ignored, so it finishes.
+for `--demo`, its temporary state directory). fzf gets SIGTERM, so it puts the terminal back
+(main screen, mouse off, echo), and up to two seconds to leave. While fzf waits for a command it
+runs synchronously (`--copy` on ctrl-y, `--select` on ctrl-o, `--enter`), it does not act on
+SIGTERM, and those commands share fzf's process group, which fzf never kills. So if fzf is still
+there, every process below it, found by parent pid, gets SIGTERM: the command leaves through its
+own cleanup, which ends its helpers, and fzf, back from it, leaves as above. Only if fzf is still
+there two seconds later do everything below it and fzf get SIGKILL, and the popup puts the
+terminal back itself (the settings it saved before starting fzf, and the sequences that leave
+the alternate screen and turn the mouse off). All of it takes at most ten seconds: three waits
+of two seconds and two `ps` runs of up to two seconds each. Only processes below the popup's fzf
+at that moment are signalled; one that has already left that tree (its parent died) is not
+found, and a pid that ends and is reused between the `ps` and the signal is the one exception. A
+second SIGHUP or SIGTERM during that cleanup is ignored, so it finishes.
 
-The detached focus worker and the jump's connection run in sessions of their own and do not
-get the popup's hangup. So does every helper that the popup itself, `--rows`, the worker or
-the jump's helper runs and waits for (herdr, ssh, `ps`, `ioreg`, `tailscale`): each gets a
-session and process group of its own, killed whole when its timeout passes and when the
-process that started it exits, SIGHUP and SIGTERM included. The helpers of the commands fzf
-runs (`--preview`, `--copy`, `--select`) stay instead in that command's process group, which
-fzf kills with SIGKILL when it is done with the command: for a preview when the next one
-starts, for all of them when fzf exits. A helper that times out there is killed on its own.
-`--enter` starts only the focus worker, and `--focus-wait` starts nothing. Nothing ends a
-helper in a session of its own once the process that started it was killed with SIGKILL,
-which skips that cleanup: it runs until it ends by itself (ssh's `ConnectTimeout=5` bounds
-only the connection, not a remote herdr that stops answering).
+Which children get a session of their own. Every helper that goes through `run_child` does,
+with its own process group, killed whole when its timeout passes and when the process that
+started it exits, SIGHUP and SIGTERM included: herdr, ssh to the other machines and
+`herdr --machine`, `ps`, `ioreg` and `tailscale` (the jump's lookups) and `fzf --version`. That
+holds in the popup, `--rows`, `--copy`, `--select`, `--enter`, the focus worker and the jump's
+helper. In `--preview` they stay instead in the preview's process group, which fzf kills with
+SIGKILL only while that preview is still running (the cursor moves on, fzf exits). A helper that
+times out there is killed with every process below it by parent pid, and so is one running when
+the preview is told to stop; what still holds its output after that has left the tree (a daemon
+whose parent exited): the preview waits for it two seconds at most, and it stays in the
+preview's process group, which fzf kills only if the preview is still running then, so it can
+outlive the preview and fzf until it ends by itself.
+
+These are waited for, with a timeout, without a session of their own: the herdr that focuses a
+row of this machine after Enter, the `fzf --filter` that checks the configured colours, the `ps`
+that lists what is below fzf or below a preview's helper, and osascript in the jump's helper
+(`--jump` and `--jump-server`). On a timeout, or an exit of the process waiting for it, that
+child alone is killed. fzf runs in the popup's own process group and ends as described above.
+Started and not waited for, each in a session of its own on purpose: the focus worker, the herdr
+that focuses another machine's row after Enter, the jump's connection and its launch. `--enter`
+starts only the focus worker, and `--focus-wait` starts nothing. Nothing ends a helper in a
+session of its own once the process that started it was killed with SIGKILL, which skips that
+cleanup: it runs until it ends by itself (ssh's `ConnectTimeout=5` bounds only the connection,
+not a remote herdr that stops answering).
 
 ### Enter on another machine's row
 

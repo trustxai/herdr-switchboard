@@ -124,11 +124,19 @@ What it has to get right, and how it fails otherwise:
    finds the terminals by their glyph.
 41. The keys the jump types come from [jump] prefix and goto, herdr's defaults unless set, and
    are checked against closed character sets in the config, on the way and in the AppleScript.
-53. Reads started by the commands fzf runs (--preview, --copy, --select) end when fzf ends those
-   commands, with the real fzf: cursor moves and Esc, or the popup told to leave while one hangs.
+53. What the program counts on from fzf, with the real fzf: only a preview (and a bg-transform)
+   gets a process group of its own; --copy, --select and --enter run in fzf's own group, which
+   fzf never kills; what a finished command left outlives fzf; and fzf acts on SIGTERM only once
+   the command it waits for returns.
 54. herdr_on_bound covers the worker's lookup, both reads and the waits after a kill, from the
    named timeouts, and --focus-wait waits that long.
 55. Nothing the watch loop started writes into a directory while it is removed.
+56. Reads started by the commands fzf runs end with them, with the real fzf: cursor moves and
+   Esc, a preview read's timeout, and the popup told to leave (SIGTERM, SIGHUP) while --copy or
+   --select waits, whether the popup leads its terminal's session or not: the command and its
+   read end, the terminal comes back, and it is quick.
+57. A read that times out leaves nothing holding its pipe, in each mode; end_fzf's last step
+   ends everything below fzf and nothing else, within its bound, and puts the terminal back.
 
     python3 tests/test_switchboard.py
 """
@@ -3553,62 +3561,14 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     if alive:
         os.kill(orphan, _signal.SIGKILL)
 
-# 53. Reads started by the commands fzf runs end when fzf ends those commands. fzf runs each
-# command in a process group of its own and ends it by killing that group with SIGKILL (the
-# next preview replaces it; fzf exits), so a read that left the group would outlive it. A
-# popup over a remote machine whose `pane read` over ssh hangs; the fake ssh records each
-# such read's pid (yes/no checks only).
-block("53. reads under fzf end with fzf")
-
-
-def popup_with_hung_reads(drive, remote_timeout="60"):
-    """Open the popup on remote rows whose pane reads hang; drive(fd, popup_pid, reads_file)
-    does the keys. Returns (the pids of the hung reads still alive after the popup left,
-    how many there were, the popup's exit code)."""
-    with tempfile.TemporaryDirectory(dir="/tmp") as d:
-        root = private_tmp(d, "runs")
-        reads = os.path.join(d, "reads")
-        with open(os.path.join(d, "machines.json"), "w") as f:
-            json.dump([{"id": "m1", "label": "box1", "enabled": True, "target": "box1-host"}], f)
-        with open(os.path.join(d, "local.json"), "w") as f:
-            json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="here")])}}, f)
-        remote = [pane("w1:p%d" % i, tab="w1:t%d" % i) for i in range(1, 6)]
-        with open(os.path.join(d, "m1.json"), "w") as f:
-            json.dump({"result": {"snapshot": snap(remote, [agent("w1:p%d" % i, "blocked", 9 - i, title="far-%d" % i,
-                                                                   tab="w1:t%d" % i) for i in range(1, 6)])}}, f)
-        fake_ssh = executable(os.path.join(d, "ssh"), '#!/bin/sh\ncase "$*" in\n'
-                              '  *"pane read"*) echo $$ >> "%(d)s/reads"; exec sleep 120 ;;\n'
-                              '  *"api snapshot"*) cat "%(d)s/m1.json" ;;\n'
-                              '  *) exit 1 ;;\nesac\n' % {"d": d})
-        fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n'
-                        '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
-                        '  "api snapshot") cat "%(d)s/local.json" ;;\n'
-                        '  *) exit 1 ;;\nesac\n' % {"d": d})
-        pid, fd = _pty.fork()
-        if pid == 0:
-            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), SWITCHBOARD_SSH=str(fake_ssh),
-                              SWITCHBOARD_REMOTE_TIMEOUT=remote_timeout, SWITCHBOARD_RUN_ROOT=root,
-                              HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
-            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
-        import fcntl as _f53
-        import struct as _st53
-        import termios as _tm53
-        _f53.ioctl(fd, _tm53.TIOCSWINSZ, _st53.pack("HHHH", 30, 160, 0, 0))
-        read_until(fd, lambda b: b"far-1" in sb.ANSI.sub("", b.decode("utf-8", "replace")).encode(), 15)
-        read_until(fd, lambda _b: os.path.exists(reads), 10)  # the first remote preview is hanging
-        drive(fd, pid, reads)
-        rc = finish(pid, fd, 15)
-        pids = [int(x) for x in open(reads).read().split()] if os.path.exists(reads) else []
-        left, end = list(pids), _time.time() + 3
-        while left and _time.time() < end:
-            _time.sleep(0.1)
-            left = [p for p in left if _alive(p)]
-        for p in left:  # never leave them behind, whatever the result
-            try:
-                os.kill(p, _signal.SIGKILL)
-            except OSError:
-                pass
-        return left, len(pids), rc
+# 53. What the program counts on from fzf, measured with the real fzf and a parent leading
+# the terminal's session (so the kernel's hang-up ends nothing). Only a preview, and a
+# bg-transform, run in a process group of their own; transform-footer (--copy), transform
+# (--enter) and execute (--select) run in fzf's own group, which fzf never kills. What a
+# command left behind when it finished outlives fzf, a preview's included. While fzf waits
+# for a synchronous command it does not act on SIGTERM; it does as soon as the command
+# returns, and puts the terminal back. If a later fzf changes any of this, these say so.
+block("53. what fzf runs, and how it ends it")
 
 
 def _alive(pid):
@@ -3619,39 +3579,91 @@ def _alive(pid):
         return False
 
 
-def moves_then_esc(fd, pid, reads):
-    for _ in range(3):
-        os.write(fd, b"\x1b[B")
-        read_until(fd, lambda _b: False, 1.0)
-    os.write(fd, b"\x1b")
+def fzf_premise():
+    """Returns ({kind: (in a group of its own, what it left still alive after fzf left)},
+    fzf still there 1 s after SIGTERM while a command runs, fzf gone once that command
+    returned, the main screen back)."""
+    import fcntl as _f53
+    import struct as _st53
+    import termios as _tm53
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        log, fzf_pid_file, hold_pid_file = (os.path.join(d, n) for n in ("log", "fzf.pid", "hold.pid"))
+        cmd = executable(os.path.join(d, "cmd"), '#!/bin/sh\nsleep 300 >/dev/null 2>&1 &\n'
+                         'echo "$1 $(ps -o pgid= -p $$ | tr -d " ") $!" >> "%s"\n' % log)
+        hold = executable(os.path.join(d, "hold"), '#!/bin/sh\necho $$ > "%s"\nexec sleep 300\n' % hold_pid_file)
+        argv = [fzf_real, "--with-shell", "sh -c", "--preview", "%s preview" % cmd,
+                "--bind", "ctrl-y:transform-footer(%s transform-footer)" % cmd,
+                "--bind", "ctrl-t:transform(%s transform)" % cmd,
+                "--bind", "ctrl-b:bg-transform-footer(%s bg-transform-footer)" % cmd,
+                "--bind", "ctrl-o:execute(%s execute)" % cmd,
+                "--bind", "ctrl-x:execute(%s)" % hold]
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ["TERM"] = "xterm-256color"
+            r, w = os.pipe()
+            os.write(w, b"a\nb\n")
+            os.close(w)
+            os.dup2(r, 0)
+            inner = os.fork()
+            if inner == 0:
+                os.execv(fzf_real, argv)
+            with open(fzf_pid_file + ".tmp", "w") as f:
+                f.write(str(inner))
+            os.rename(fzf_pid_file + ".tmp", fzf_pid_file)
+            quit_at = _time.time() + 60
+            while _time.time() < quit_at and not os.waitpid(inner, os.WNOHANG)[0]:
+                _time.sleep(0.02)
+            _time.sleep(30)  # still leading the session; finish() ends this group
+            os._exit(0)
+        leftovers, kinds = [], {}
+        try:
+            _f53.ioctl(fd, _tm53.TIOCSWINSZ, _st53.pack("HHHH", 30, 100, 0, 0))
 
-
-def key_then_sigterm(key):
-    def drive(fd, pid, reads):
-        os.write(fd, key)
-        read_until(fd, lambda _b: False, 1.5)  # the command's read is hanging now
-        os.kill(pid, _signal.SIGTERM)
-    return drive
+            def logged():
+                return [l.split() for l in open(log).read().splitlines()] if os.path.exists(log) else []
+            read_until(fd, lambda _b: os.path.exists(fzf_pid_file) and any(r[0] == "preview" for r in logged()), 10)
+            fzf_pid = int(open(fzf_pid_file).read())
+            fzf_group = os.getpgid(fzf_pid)
+            for key, kind in ((b"\x19", "transform-footer"), (b"\x14", "transform"),
+                              (b"\x02", "bg-transform-footer"), (b"\x0f", "execute")):
+                os.write(fd, key)
+                read_until(fd, lambda _b: any(r[0] == kind for r in logged()), 5)
+            for r in logged():
+                if len(r) == 3 and r[0] not in kinds:
+                    kinds[r[0]] = int(r[1]) != fzf_group
+                    leftovers.append((r[0], int(r[2])))
+            os.write(fd, b"\x18")  # ctrl-x: a command that waits
+            read_until(fd, lambda _b: os.path.exists(hold_pid_file) and os.path.getsize(hold_pid_file), 5)
+            hold_pid = int(open(hold_pid_file).read())
+            os.kill(fzf_pid, _signal.SIGTERM)
+            read_until(fd, lambda _b: False, 1.0)
+            waited = _alive(fzf_pid)
+            os.kill(hold_pid, _signal.SIGTERM)  # the command returns
+            after = read_until(fd, lambda _b: not _alive(fzf_pid), 3)
+            after += read_until(fd, lambda _b: False, 0.2)
+            gone = not _alive(fzf_pid)
+            result = {k: (kinds[k], _alive(p)) for k, p in leftovers}
+            return result, waited, gone, b"\x1b[?1049l" in after
+        finally:
+            for _k, p in leftovers:
+                try:
+                    os.kill(p, _signal.SIGKILL)
+                except OSError:
+                    pass
+            finish(pid, fd, 0)
 
 
 if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
-    left, started, rc = popup_with_hung_reads(moves_then_esc)
-    check("preview-reads-end-with-fzf", started >= 3 and not left and rc == 0, (started, len(left), rc))
-    left, started, rc = popup_with_hung_reads(key_then_sigterm(b"\x19"))  # ctrl-y: --copy
-    check("copy-read-ends-with-fzf", started >= 2 and not left and rc == 128 + 15, (started, len(left), rc))
-    left, started, rc = popup_with_hung_reads(key_then_sigterm(b"\x0f"))  # ctrl-o: --select
-    check("select-read-ends-with-fzf", started >= 2 and not left and rc == 128 + 15, (started, len(left), rc))
-    # A read that times out inside a preview is killed then, with the popup still open and the
-    # cursor where it was (only the read itself: its group is the preview's own).
-    timed_out = []
+    groups, waited, gone, main_screen = fzf_premise()
+    check("fzf-runs-only-previews-and-bg-actions-in-a-group-of-their-own",
+          {k: v[0] for k, v in groups.items()} == {"preview": True, "bg-transform-footer": True,
+                                                   "transform-footer": False, "transform": False, "execute": False},
+          groups)
+    check("fzf-leaves-alive-what-a-finished-command-left", len(groups) == 5 and all(v[1] for v in groups.values()),
+          groups)
+    check("fzf-waits-for-a-command-before-acting-on-sigterm", waited)
+    check("fzf-acts-on-sigterm-once-the-command-returns", gone and main_screen, (gone, main_screen))
 
-    def wait_past_the_timeout(fd, pid, reads):
-        read_until(fd, lambda _b: False, 1.5 + 1.5)  # remote_timeout 1.5 s, then a margin
-        timed_out.extend(int(x) for x in open(reads).read().split())
-        timed_out[:] = [p for p in timed_out if _alive(p)]
-        os.write(fd, b"\x1b")
-    popup_with_hung_reads(wait_past_the_timeout, remote_timeout="1.5")
-    check("preview-read-killed-at-its-timeout", not timed_out, timed_out)
 # --enter starts one thing, the --focus worker, in a session of its own on purpose (the focus
 # must land after Esc; herdr_on_bound bounds it, block 54); --focus-wait starts nothing.
 _defs = {n.name: n for n in ast.walk(ast.parse(SOURCE)) if isinstance(n, ast.FunctionDef)}
@@ -3664,8 +3676,6 @@ _enter_starts = [c for c in ast.walk(_defs["enter"]) if isinstance(c, ast.Call)
 check("enter-starts-only-the-detached-worker", len(_enter_starts) == 1
       and any(k.arg == "start_new_session" and getattr(k.value, "value", None) is True for k in _enter_starts[0].keywords),
       len(_enter_starts))
-check("fzf-commands-flagged", "FZF_COMMANDS = ([\"--preview\"], [\"--copy\"], [\"--select\"], [\"--enter\"], "
-      "[\"--focus-wait\"])" in SOURCE and "FZF_COMMAND = argv[:1] in FZF_COMMANDS" in SOURCE)
 
 # 54. herdr_on_bound covers everything herdr_on() can do, from the timeouts it uses, and
 # --focus-wait waits that long: the focus above lands after the old deadline and is reported.
@@ -3754,6 +3764,316 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
 check("popup-removes-the-run-dir-under-the-lock", "held = writes.acquire(timeout=WATCH_JOIN)\n        try:\n"
       "            shutil.rmtree(tmp, ignore_errors=True)" in SOURCE)
 
+# 56. Reads started by the commands fzf runs end with those commands, with the real fzf: a
+# popup over a remote machine whose `pane read` over ssh hangs. The fake ssh records each
+# read: which command started it (from that command's line), its pid and the command's pid
+# (yes/no checks only). Previews: cursor moves and Esc leave none, and a preview's read is
+# killed at its timeout. ctrl-y (--copy) and ctrl-o (--select), which fzf waits for in its
+# own process group: the popup told to leave (SIGTERM, SIGHUP) while one hangs ends the
+# command and its read, fzf puts the terminal back, and it is quick, whether the popup leads
+# its terminal's session or a parent does (then the kernel's hang-up ends nothing).
+block("56. reads under fzf end with fzf")
+
+
+def popup_with_hung_reads(drive, remote_timeout="60", leader=True):
+    """Open the popup on remote rows whose pane reads hang; drive(fd, pump, popup_pid, reads,
+    leave) does the keys: pump(pred, seconds) reads the terminal, leave(sig) signals the popup.
+    leader=False: a parent leads the terminal's session and outlives the popup. Returns a
+    dict: rc; took, seconds from leave() to the popup's exit; terminal, what fzf left on the
+    way out (and, with a parent leading, the terminal's echo and signal keys); started and
+    left, {command: [pid, ...]} of the hung reads and of the commands that started them, and
+    of those still alive 3 s after the popup left."""
+    import fcntl as _f56
+    import struct as _st56
+    import termios as _tm56
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = private_tmp(d, "runs")
+        reads, popup_pid, popup_rc = (os.path.join(d, n) for n in ("reads", "popup.pid", "popup.rc"))
+        with open(os.path.join(d, "machines.json"), "w") as f:
+            json.dump([{"id": "m1", "label": "box1", "enabled": True, "target": "box1-host"}], f)
+        with open(os.path.join(d, "local.json"), "w") as f:
+            json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="here")])}}, f)
+        remote = [pane("w1:p%d" % i, tab="w1:t%d" % i) for i in range(1, 6)]
+        with open(os.path.join(d, "m1.json"), "w") as f:
+            json.dump({"result": {"snapshot": snap(remote, [agent("w1:p%d" % i, "blocked", 9 - i, title="far-%d" % i,
+                                                                   tab="w1:t%d" % i) for i in range(1, 6)])}}, f)
+        fake_ssh = executable(os.path.join(d, "ssh"), '#!/bin/sh\ncase "$*" in\n'
+                              '  *"pane read"*) k=other\n'
+                              '    case "$(ps -o command= -p $PPID)" in\n'
+                              '      *--copy*) k=copy ;; *--select*) k=select ;; *--preview*) k=preview ;;\n'
+                              '    esac\n'
+                              '    echo "$k $$ $PPID" >> "%(d)s/reads"; exec sleep 120 ;;\n'
+                              '  *"api snapshot"*) cat "%(d)s/m1.json" ;;\n'
+                              '  *) exit 1 ;;\nesac\n' % {"d": d})
+        fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n'
+                        '  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                        '  "api snapshot") cat "%(d)s/local.json" ;;\n'
+                        '  *) exit 1 ;;\nesac\n' % {"d": d})
+        pid, fd = _pty.fork()
+        if pid == 0:
+            os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), SWITCHBOARD_SSH=str(fake_ssh),
+                              SWITCHBOARD_REMOTE_TIMEOUT=remote_timeout, SWITCHBOARD_RUN_ROOT=root,
+                              HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
+            if leader:
+                os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+            inner = os.fork()
+            if inner == 0:
+                os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+            with open(popup_pid + ".tmp", "w") as f:
+                f.write(str(inner))
+            os.rename(popup_pid + ".tmp", popup_pid)
+            done, st, quit_at = 0, 0, _time.time() + 60
+            while not done and _time.time() < quit_at:
+                done, st = os.waitpid(inner, os.WNOHANG)
+                _time.sleep(0.02)
+            with open(popup_rc + ".tmp", "w") as f:
+                f.write(str(os.waitstatus_to_exitcode(st) if done else -9))
+            os.rename(popup_rc + ".tmp", popup_rc)
+            _time.sleep(30)  # still leading the session; finish() ends this group
+            os._exit(0)
+        out, sent = [b""], {}
+
+        def pump(pred, seconds):
+            out[0] += read_until(fd, lambda b: pred(out[0] + b), seconds)
+
+        def leave(sig):
+            sent.update(t=_time.time(), mark=len(out[0]))
+            os.kill(target, sig)
+        _f56.ioctl(fd, _tm56.TIOCSWINSZ, _st56.pack("HHHH", 30, 160, 0, 0))
+        pump(lambda b: b"far-1" in sb.ANSI.sub("", b.decode("utf-8", "replace")).encode(), 15)
+        pump(lambda _b: os.path.exists(reads), 10)  # the first remote preview is hanging
+        pump(lambda _b: leader or os.path.exists(popup_pid), 5)
+        target = pid if leader else int(open(popup_pid).read())
+        drive(fd, pump, target, reads, leave)
+        rc, end = None, _time.time() + 30
+        while rc is None and _time.time() < end:
+            pump(lambda _b: False, 0.05)
+            if leader:
+                done, st = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    rc = os.waitstatus_to_exitcode(st)
+            elif os.path.exists(popup_rc):
+                rc = int(open(popup_rc).read())
+            _time.sleep(0.01)
+        result = {"rc": rc, "took": _time.time() - sent["t"] if "t" in sent and rc is not None else None}
+        pump(lambda _b: False, 0.3)
+        after = out[0][sent.get("mark", len(out[0])):]
+        result["terminal"] = {"main-screen": b"\x1b[?1049l" in after, "mouse-off": b"\x1b[?1000l" in after}
+        if not leader:
+            lflag = _tm56.tcgetattr(fd)[3]
+            result["terminal"].update(echo=bool(lflag & _tm56.ECHO), isig=bool(lflag & _tm56.ISIG))
+        started = {}
+        for line in (open(reads).read().splitlines() if os.path.exists(reads) else []):
+            kind, read_pid, cmd_pid = line.split()
+            started.setdefault(kind, []).extend([int(read_pid), int(cmd_pid)])
+        everything = [p for ps in started.values() for p in ps]
+        alive, end = list(everything), _time.time() + 3
+        while alive and _time.time() < end:
+            _time.sleep(0.1)
+            alive = [p for p in alive if _alive(p)]
+        for p in alive:  # never leave them behind, whatever the result
+            try:
+                os.kill(p, _signal.SIGKILL)
+            except OSError:
+                pass
+        result["started"] = started
+        result["left"] = {k: [p for p in v if p in alive] for k, v in started.items() if set(v) & set(alive)}
+        finish(pid, fd, 0)
+        return result
+
+
+def moves_then_esc(fd, pump, pid, reads, leave):
+    for _ in range(3):
+        os.write(fd, b"\x1b[B")
+        pump(lambda _b: False, 1.0)
+    os.write(fd, b"\x1b")
+
+
+def key_then(key, kind, sig):
+    def drive(fd, pump, pid, reads, leave):
+        os.write(fd, key)
+        pump(lambda _b: any(l.startswith(kind + " ") for l in open(reads).read().splitlines()), 5)  # it hangs now
+        leave(sig)
+    return drive
+
+
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    r = popup_with_hung_reads(moves_then_esc)
+    check("preview-reads-end-with-fzf", len(r["started"].get("preview", [])) >= 6 and not r["left"] and r["rc"] == 0,
+          (r["started"].keys(), r["left"], r["rc"]))
+    for key, kind, sig in ((b"\x19", "copy", _signal.SIGTERM), (b"\x0f", "select", _signal.SIGHUP)):
+        for leader in (True, False):
+            r = popup_with_hung_reads(key_then(key, kind, sig), leader=leader)
+            name = "%s-%s" % (kind, "leading" if leader else "not-leading")
+            check(name + "-command-and-reads-end-with-the-popup", r["started"].get(kind) and not r["left"]
+                  and r["rc"] == 128 + sig, (r["rc"], sorted(r["started"]), r["left"]))
+            check(name + "-terminal-comes-back", all(r["terminal"].values()), r["terminal"])
+            # Left before end_fzf's last step (SIGKILL) was due: fzf ended on its own SIGTERM.
+            check(name + "-quick", r["took"] is not None and r["took"] < 2 * sb.FZF_END_WAIT, r["took"])
+    # A read that times out inside a preview is killed then, with the popup still open and the
+    # cursor where it was.
+    timed_out = []
+
+    def wait_past_the_timeout(fd, pump, pid, reads, leave):
+        pump(lambda _b: False, 1.5 + sb.PS_TIMEOUT + 1.5)  # remote_timeout 1.5 s, the kill, a margin
+        timed_out.extend(int(l.split()[1]) for l in open(reads).read().splitlines())
+        timed_out[:] = [p for p in timed_out if _alive(p)]
+        os.write(fd, b"\x1b")
+    popup_with_hung_reads(wait_past_the_timeout, remote_timeout="1.5")
+    check("preview-read-killed-at-its-timeout", not timed_out, timed_out)
+
+# 57. Each mode's reads are bounded by what really ends that mode. A read that times out
+# leaves nothing holding its output pipe: in --preview, the read and everything below it
+# (fzf kills the preview's group only while the preview runs); in --copy and --select (fzf
+# never kills those), the read's own process group, which also holds what left the read's
+# tree, as a daemon does. And end_fzf's last step: with everything below fzf ignoring
+# SIGTERM, within its stated bound, everything below fzf goes, nothing else does, and the
+# terminal is put back.
+block("57. each mode's reads; end_fzf's last step")
+
+
+def holder_after_timeout(mode, orphan):
+    """Run `switchboard MODE ROW` alone, in a session of its own with no terminal (so, as under
+    fzf, nobody hangs anything up when it exits), over a fake ssh whose pane read hangs and
+    leaves a process holding the read's output pipe: a child of the read, or (orphan) one
+    whose parent has exited already. Returns (that process was started, it is still alive
+    KILL_WAIT + PS_TIMEOUT + 2 s after the read's timeout of 1.5 s)."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        holder = os.path.join(d, "holder")
+        with open(os.path.join(d, "machines.json"), "w") as f:
+            json.dump([{"id": "m1", "label": "box1", "enabled": True, "target": "box1-host"}], f)
+        spawn = ("sh -c 'sleep 120 & echo $! > \"%s\"'" if orphan else "sleep 120 & echo $! > \"%s\"") % holder
+        fake_ssh = executable(os.path.join(d, "ssh"), '#!/bin/sh\ncase "$*" in\n'
+                              '  *"pane read"*) %s; exec sleep 120 ;;\n  *) exit 1 ;;\nesac\n' % spawn)
+        fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n'
+                        '  "machine list --json") cat "%s/machines.json" ;;\n  *) exit 1 ;;\nesac\n' % d)
+        p = subprocess.Popen([sys.executable, "-B", str(TOOL), mode, "m1|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                             env=dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_SSH=str(fake_ssh),
+                                      SWITCHBOARD_REMOTE_TIMEOUT="1.5", HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state")))
+        hp, end = None, _time.time() + 10
+        while hp is None and _time.time() < end:
+            if os.path.exists(holder) and os.path.getsize(holder):
+                hp = int(open(holder).read())
+            _time.sleep(0.05)
+        end = _time.time() + 1.5 + sb.KILL_WAIT + sb.PS_TIMEOUT + 2
+        while hp is not None and _alive(hp) and _time.time() < end:
+            _time.sleep(0.05)
+        alive = hp is not None and _alive(hp)
+        for kill in (lambda: os.kill(hp, _signal.SIGKILL), lambda: os.killpg(p.pid, _signal.SIGKILL)):
+            try:
+                kill()
+            except (OSError, TypeError):
+                pass
+        p.wait(5)
+        return hp is not None, alive
+
+
+for mode, orphan in (("--preview", False), ("--copy", True), ("--select", True)):
+    found, alive = holder_after_timeout(mode, orphan)
+    check("%s-read-timeout-ends-what-holds-its-pipe" % mode[2:], found and not alive, (found, alive))
+
+# end_fzf's last step, on a stand-in for fzf that ignores SIGTERM, as do its child and
+# grandchild. The terminal is a pty: the stand-in puts it in raw mode on the alternate screen.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    import termios as _tm57
+    master, slave = os.openpty()
+    saved = _tm57.tcgetattr(slave)
+    pids = os.path.join(d, "pids")
+    stand_in = ("import os, signal, sys, time, tty\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "fd = int(sys.argv[1])\ntty.setraw(fd)\nos.write(fd, b'\\x1b[?1049h\\x1b[?1000h')\n"
+                "if os.fork() == 0:\n"
+                "    if os.fork() == 0:\n"
+                "        open(sys.argv[2], 'a').write('%d\\n' % os.getpid())\n"
+                "    else:\n"
+                "        open(sys.argv[2], 'a').write('%d\\n' % os.getpid())\n"
+                "time.sleep(60)\n")
+    unrelated = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL, start_new_session=True)
+    fake_fzf = subprocess.Popen([sys.executable, "-c", stand_in, str(slave), pids], stdin=subprocess.DEVNULL,
+                                pass_fds=(slave,))
+    end = _time.time() + 10
+    while _time.time() < end and not (os.path.exists(pids) and len(open(pids).read().split()) == 2):
+        _time.sleep(0.05)
+    below = [int(x) for x in open(pids).read().split()] if os.path.exists(pids) else []
+    t0 = _time.time()
+    sb.end_fzf(fake_fzf, (slave, saved))
+    took = _time.time() - t0
+    left, end = list(below), _time.time() + 3
+    while left and _time.time() < end:
+        _time.sleep(0.05)
+        left = [p for p in left if _alive(p)]
+    shown = read_until(master, lambda _b: False, 0.3)
+    lflag = _tm57.tcgetattr(slave)[3]
+    check("end-fzf-last-step-ends-everything-below-fzf", len(below) == 2 and not left and fake_fzf.poll() is not None,
+          (below, left, fake_fzf.poll()))
+    check("end-fzf-touches-nothing-else", unrelated.poll() is None)
+    check("end-fzf-within-its-bound", 2 * sb.FZF_END_WAIT <= took <= 3 * sb.FZF_END_WAIT + 2 * sb.PS_TIMEOUT, took)
+    check("end-fzf-last-step-puts-the-terminal-back", b"\x1b[?1049l" in shown and b"\x1b[?1000l" in shown
+          and bool(lflag & _tm57.ECHO) and bool(lflag & _tm57.ICANON), (shown[-60:], lflag))
+    for p in left + [unrelated.pid]:
+        try:
+            os.kill(p, _signal.SIGKILL)
+        except OSError:
+            pass
+    unrelated.wait(5)
+    if fake_fzf.poll() is None:
+        fake_fzf.kill()
+        fake_fzf.wait(5)
+    os.close(master)
+    os.close(slave)
+
+# The same last step from the popup itself, with a stand-in fzf that ignores SIGTERM and
+# leaves the terminal raw, on the alternate screen, with the mouse on: the popup told to leave
+# puts the terminal back from what it saved before starting fzf. A parent leads the session.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    import fcntl as _f57
+    import struct as _st57
+    import termios as _tm57b
+    ready, popup_pid, popup_rc = (os.path.join(d, n) for n in ("ready", "popup.pid", "popup.rc"))
+    stuck_fzf = executable(os.path.join(d, "fzf"), "#!%s\nimport os, signal, sys, time, tty\n"
+                           "if '--version' in sys.argv:\n    print('0.74.2')\n    sys.exit(0)\n"
+                           "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                           "fd = os.open('/dev/tty', os.O_RDWR)\ntty.setraw(fd)\n"
+                           "os.write(fd, b'\\x1b[?1049h\\x1b[?1000h')\nopen(%r, 'w').close()\ntime.sleep(60)\n"
+                           % (sys.executable, ready))
+    with open(os.path.join(d, "local.json"), "w") as f:
+        json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="here")])}}, f)
+    fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") echo "[]" ;;\n'
+                    '  "api snapshot") cat "%s/local.json" ;;\n  *) exit 1 ;;\nesac\n' % d)
+    pid, fd = _pty.fork()
+    if pid == 0:
+        os.environ.update(TERM="xterm-256color", HERDR_BIN_PATH=str(fh), SWITCHBOARD_FZF=str(stuck_fzf),
+                          SWITCHBOARD_RUN_ROOT=private_tmp(d, "runs"), HERDR_PLUGIN_STATE_DIR=os.path.join(d, "state"))
+        inner = os.fork()
+        if inner == 0:
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+        with open(popup_pid + ".tmp", "w") as f:
+            f.write(str(inner))
+        os.rename(popup_pid + ".tmp", popup_pid)
+        done, st, quit_at = 0, 0, _time.time() + 60
+        while not done and _time.time() < quit_at:
+            done, st = os.waitpid(inner, os.WNOHANG)
+            _time.sleep(0.02)
+        with open(popup_rc + ".tmp", "w") as f:
+            f.write(str(os.waitstatus_to_exitcode(st) if done else -9))
+        os.rename(popup_rc + ".tmp", popup_rc)
+        _time.sleep(30)  # still leading the session; finish() ends this group
+        os._exit(0)
+    _f57.ioctl(fd, _tm57b.TIOCSWINSZ, _st57.pack("HHHH", 30, 140, 0, 0))
+    read_until(fd, lambda _b: os.path.exists(ready) and os.path.exists(popup_pid), 15)
+    stuck = bool(os.path.exists(ready) and not _tm57b.tcgetattr(fd)[3] & _tm57b.ECHO)
+    t0 = _time.time()
+    os.kill(int(open(popup_pid).read()), _signal.SIGTERM)
+    shown = read_until(fd, lambda _b: os.path.exists(popup_rc), 3 * sb.FZF_END_WAIT + 2 * sb.PS_TIMEOUT + 5)
+    took = _time.time() - t0
+    shown += read_until(fd, lambda _b: False, 0.3)
+    lflag = _tm57b.tcgetattr(fd)[3]
+    rc = int(open(popup_rc).read()) if os.path.exists(popup_rc) else None
+    check("popup-puts-the-terminal-back-when-fzf-must-be-killed", stuck and rc == 128 + 15
+          and b"\x1b[?1049l" in shown and b"\x1b[?1000l" in shown and bool(lflag & _tm57b.ECHO)
+          and bool(lflag & _tm57b.ICANON), (stuck, rc, round(took, 1), shown[-40:], lflag))
+    finish(pid, fd, 0)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]

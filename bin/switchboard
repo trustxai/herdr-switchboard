@@ -937,32 +937,35 @@ def child_env(run_dir=None):
 _RUNNING = set()  # children run_child() started that have not finished yet
 _RUNNING_LOCK = threading.Lock()
 KILL_WAIT = 2  # seconds run_child waits for a killed child's output pipe to close
-# True in the commands fzf runs (--preview, --copy, --select, --enter, --focus-wait): main()
-# sets it. fzf runs each of them in a process group of its own and ends it by killing that
-# group with SIGKILL (when the next preview replaces it, and when fzf exits), which ends this
-# process without its exit cleanup.
-FZF_COMMAND = False
+# True only in --preview: main() sets it. fzf runs each preview in a process group of its own
+# and kills that group with SIGKILL while the preview still runs (the cursor moves on, fzf
+# exits); that ends this process without its exit cleanup. The other commands fzf runs
+# (--copy, --select, --enter) share fzf's own group, which fzf never kills; --focus-wait
+# (a bg-transform, in a group of its own) starts nothing. Measured with fzf 0.71 to 0.75;
+# block 53 checks it against the installed fzf.
+PREVIEW_MODE = False
 
 
 def run_child(argv, timeout):
     """subprocess.run for herdr, ssh and the like, bounded for real. Returns a
     CompletedProcess; raises TimeoutExpired like subprocess.run.
 
-    Where the child goes depends on who is reading:
-    - In a command fzf runs (FZF_COMMAND), the child stays in that command's process group,
-      so fzf's SIGKILL of the group ends it and anything it started, whenever fzf ends the
-      command. On a timeout only the child itself can be killed here (killing the group
-      would kill this process); whatever it started that still holds its output pipe is
-      waited for KILL_WAIT seconds, then left to that same group and to fzf's kill of it.
-    - Anywhere else (the popup's own refreshes, --rows, the --focus worker, the jump's
-      helper), the child gets a session and process group of its own: a timeout kills the
-      whole group (subprocess.run kills only the child, then waits without a bound for
-      anything that still holds its output pipe), and so does an exit of this process while
-      the read runs (an abandoned thread, or SIGTERM and SIGHUP, which main turns into an
-      exit).
-    Nothing here survives a SIGKILL of this process: a read it started then runs until it
-    ends by itself."""
-    own_group = not FZF_COMMAND
+    Where the child goes depends on what ends the reader:
+    - In --preview (PREVIEW_MODE), the child stays in the preview's process group, so
+      fzf's SIGKILL of that group (while the preview runs) ends it and anything it started.
+      On a timeout, or when this process is told to stop, the child and every process below
+      it by parent pid are killed (the group is this process's own, so it cannot be killed
+      from here); a process that already left that tree (a daemon) is not found.
+    - Anywhere else (the popup's own refreshes, --rows, --copy, --select, --enter, the
+      --focus worker, the jump's helper), the child gets a session and process group of its
+      own: a timeout kills the whole group (subprocess.run kills only the child, then waits
+      without a bound for anything that still holds its output pipe), and so does an exit of
+      this process while the read runs (an abandoned thread, or SIGTERM and SIGHUP, which
+      main turns into an exit).
+    After a kill it waits at most KILL_WAIT seconds more for the output pipe. Nothing here
+    survives a SIGKILL of this process (no exit cleanup): a read in a session of its own
+    then runs until it ends by itself."""
+    own_group = not PREVIEW_MODE
     p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                          universal_newlines=True, start_new_session=own_group, env=child_env())
     p.switchboard_own_group = own_group
@@ -990,14 +993,46 @@ def run_child(argv, timeout):
 
 
 def _kill_group(p):
-    """The child's own group when it has one; else (in a command fzf runs) the child alone."""
-    try:
-        if getattr(p, "switchboard_own_group", True):
+    """The child's own group when it has one; else (in --preview) the child and every
+    process below it."""
+    if getattr(p, "switchboard_own_group", True):
+        try:
             os.killpg(p.pid, signal.SIGKILL)
-        else:
-            p.kill()
-    except OSError:
-        pass
+        except OSError:
+            pass
+        return
+    for pid in descendants(p.pid) + [p.pid]:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
+PS_TIMEOUT = 2  # seconds descendants() gives `ps`
+
+
+def descendants(pid):
+    """Every process below `pid` by parent pid at this moment, from `ps` (Linux and macOS
+    both have it), run directly with a timeout rather than through run_child, which kills
+    with this. A process whose parent already died has left the tree and is not found."""
+    try:
+        out = subprocess.run(["ps", "-axo", "pid=,ppid="], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=PS_TIMEOUT,
+                             env=child_env()).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            children.setdefault(int(parts[1]), []).append(int(parts[0]))
+    found, todo = [], [pid]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            if child not in found and child != os.getpid():
+                found.append(child)
+                todo.append(child)
+    return found
 
 
 @atexit.register
@@ -2907,46 +2942,73 @@ def enter_mode(machines, demo=False):
     return (True, False) if JUMP_ENABLED else (False, True)
 
 
-def command_groups(parent):
-    """The process groups led by children of `parent`: fzf runs each command (and its
-    reads, see run_child) in one. From ps, which both Linux and macOS have."""
-    groups = set()
-    for line in run_out(["ps", "-axo", "pid=,ppid=,pgid="], timeout=5).splitlines():
-        parts = line.split()
-        if len(parts) == 3 and all(x.isdigit() for x in parts):
-            pid, ppid, pgid = (int(x) for x in parts)
-            if ppid == parent and pgid == pid:
-                groups.add(pgid)
-    groups.discard(os.getpgrp())
-    return groups
+FZF_END_WAIT = 2  # seconds end_fzf waits after each of its three steps
+# What fzf undoes on its way out: mouse reports, a hidden cursor, the alternate screen.
+TERMINAL_RESET = "\x1b[?1000l\x1b[?1002l\x1b[?1006l\x1b[?25h\x1b[?1049l"
 
 
-def end_fzf(proc):
-    """End the popup's fzf, leaving on a signal. SIGTERM first: fzf then puts the terminal
-    back (main screen, mouse off, echo) and kills the commands it runs. While it waits for a
-    synchronous command (ctrl-y's --copy, ctrl-o's --select) it does not act on SIGTERM, so
-    after 2 s the process groups of the commands it started are killed here: the command
-    returns, fzf leaves as above, and their reads do not outlive the popup. SIGKILL only if
-    fzf is still there 2 s later."""
+def end_fzf(proc, terminal=None):
+    """End the popup's fzf, leaving on a signal, within 3 * FZF_END_WAIT + 2 * PS_TIMEOUT
+    seconds.
+
+    SIGTERM first: fzf then puts the terminal back (main screen, mouse off, echo) and ends
+    the previews still running. While it waits for a synchronous command (ctrl-y's --copy,
+    ctrl-o's --select, Enter's --enter) it does not act on SIGTERM, and those commands run in
+    fzf's own process group, which fzf never kills. So if fzf has not left, every process
+    below it (its commands and what they started, by parent pid) gets SIGTERM: a command
+    leaves through its own clean-up, which ends its reads, fzf returns from it, acts on its
+    SIGTERM and leaves as above. Only if fzf is still there then, everything below it and
+    fzf itself get SIGKILL, and the terminal is put back from `terminal` (saved_terminal(),
+    taken before fzf started). Nothing that is not below this popup's fzf is touched."""
     proc.terminate()
-    try:
-        proc.wait(timeout=2)
+    if _waited(proc):
         return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in descendants(proc.pid):
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        if sig == signal.SIGKILL:
+            proc.kill()
+        if _waited(proc):
+            break
+    if terminal is not None:
+        restore_terminal(terminal)
+
+
+def saved_terminal(path="/dev/tty"):
+    """(descriptor, settings) of the popup's terminal, for end_fzf to put back if fzf has to
+    be killed; None without a terminal. The caller closes the descriptor. Non-blocking, so a
+    terminal nobody reads any more cannot hold the popup up."""
+    import termios
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        return fd, termios.tcgetattr(fd)
+    except termios.error:
+        os.close(fd)
+        return None
+
+
+def restore_terminal(terminal):
+    import termios
+    fd, settings = terminal
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, settings)
+        os.write(fd, TERMINAL_RESET.encode())
+    except (OSError, termios.error):
+        pass  # the terminal is gone (a SIGHUP when the window closed)
+
+
+def _waited(proc):
+    try:
+        proc.wait(timeout=FZF_END_WAIT)
+        return True
     except subprocess.TimeoutExpired:
-        pass
-    for group in command_groups(proc.pid):
-        try:
-            os.killpg(group, signal.SIGKILL)
-        except OSError:
-            pass
-    for end in (None, proc.kill):
-        if end:
-            end()
-        try:
-            proc.wait(timeout=2)
-            return
-        except subprocess.TimeoutExpired:
-            pass
+        return False
 
 
 def popup(self_cmd, demo=False):
@@ -2982,8 +3044,9 @@ def popup(self_cmd, demo=False):
     labels = {m["id"]: m["label"] for m in machines}
     writes = threading.Lock()  # held by watch() while it writes the rows, by us while we remove them
     watcher = threading.Thread(target=watch, args=(live, sock, rows_file, stop, acks, writes), daemon=True)
-    proc = None
+    proc, terminal = None, None
     try:
+        terminal = saved_terminal()
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True,
                                 env=dict(os.environ, SWITCHBOARD_RUN_DIR=tmp, SWITCHBOARD_LABELS=json.dumps(labels)))
         watcher.start()
@@ -2993,7 +3056,9 @@ def popup(self_cmd, demo=False):
             # Leaving on a signal: fzf goes too. Nothing else is sure to end it: the kernel
             # hangs it up only when this process leads the terminal's session, and macOS
             # first waits for the terminal's output to drain.
-            end_fzf(proc)
+            end_fzf(proc, terminal)
+        if terminal is not None:
+            os.close(terminal[0])
         stop.set()
         if watcher.is_alive():
             watcher.join(2)  # stop wakes it; a pass already under way may take a moment
@@ -3059,11 +3124,8 @@ def _exit_on_signal(signum, frame):
     raise SystemExit(128 + signum)
 
 
-FZF_COMMANDS = (["--preview"], ["--copy"], ["--select"], ["--enter"], ["--focus-wait"])
-
-
 def main(argv):
-    global DEMO, STATE_DIR, FZF_COMMAND
+    global DEMO, STATE_DIR, PREVIEW_MODE
     if argv[:1] in (["-h"], ["--help"]):
         sys.stdout.write(tr("usage", config_path()))
         return 0
@@ -3087,8 +3149,8 @@ def main(argv):
     self_cmd = " ".join(shlex.quote(x) for x in (sys.executable, os.path.abspath(__file__)))
     if demo:
         self_cmd += " --demo"
-    # The modes fzf runs: their reads stay in the process group fzf kills (see run_child).
-    FZF_COMMAND = argv[:1] in FZF_COMMANDS
+    # Only a preview's reads stay in the process group fzf kills (see run_child).
+    PREVIEW_MODE = argv[:1] == ["--preview"]
     try:
         if argv[:1] == ["--preview"]:
             return preview(argv[1] if len(argv) > 1 else "")
