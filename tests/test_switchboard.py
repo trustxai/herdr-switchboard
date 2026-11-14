@@ -3804,8 +3804,12 @@ def popup_with_hung_reads(drive, remote_timeout="60", leader=True, snapshot_hang
         with open(os.path.join(d, "m1.json"), "w") as f:
             json.dump({"result": {"snapshot": snap(remote, [agent("w1:p%d" % i, "blocked", 9 - i, title="far-%d" % i,
                                                                    tab="w1:t%d" % i) for i in range(1, 6)])}}, f)
+        # Each pane read also notes when it started and which pane: printed only when a check fails.
+        executable(os.path.join(d, "now"), "#!%s\nimport time\nprint('%%.3f' %% time.time())\n" % sys.executable)
         fake_ssh = executable(os.path.join(d, "ssh"), '#!/bin/sh\ncase "$*" in\n'
-                              '  *"pane read"*) k=other\n'
+                              '  *"pane read"*) k=other; p=; prev=\n'
+                              '    for w in $*; do [ "$prev" = read ] && p=$w; prev=$w; done\n'
+                              '    echo "$$ $("%(d)s/now") $p" >> "%(d)s/times"\n'
                               '    case "$(ps -ww -o command= -p $PPID)" in\n'
                               '      *--copy*) k=copy ;; *--select*) k=select ;; *--preview*) k=preview ;;\n'
                               '    esac\n'
@@ -3893,6 +3897,15 @@ def popup_with_hung_reads(drive, remote_timeout="60", leader=True, snapshot_hang
         result["started"] = started
         result["left"] = {k: [p for p in v if p in alive] for k, v in started.items() if set(v) & set(alive)}
         result["run_dir_left"] = sorted(os.listdir(root))
+        # For each read still alive: its command, its pane and when it started against the signal.
+        times = {}
+        for line in (open(os.path.join(d, "times")).read().splitlines() if os.path.exists(os.path.join(d, "times"))
+                     else []):
+            parts = line.split()
+            if len(parts) >= 2:
+                times[int(parts[0])] = (float(parts[1]), parts[2] if len(parts) > 2 else "")
+        result["left_detail"] = sorted((k, times[p][1], round(times[p][0] - sent["t"], 2) if "t" in sent else None)
+                                       for k, v in result["left"].items() for p in v if p in times)
         finish(pid, fd, 0)
         return result
 
@@ -3922,7 +3935,8 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
             name = "%s-%s" % (kind, "leading" if leader else "not-leading")
             check(name + "-command-and-reads-end-with-the-popup", r["started"].get(kind) and r["started"].get("helper")
                   and r["started"].get("snapshot") and not r["left"] and not r["run_dir_left"]
-                  and r["rc"] == 128 + sig, (r["rc"], sorted(r["started"]), r["left"], r["run_dir_left"]))
+                  and r["rc"] == 128 + sig, (r["rc"], sorted(r["started"]), r["left"], r["run_dir_left"],
+                                             r["left_detail"]))
             check(name + "-terminal-comes-back", all(r["terminal"].values()), r["terminal"])
             # Left before end_fzf's last step (SIGKILL) was due: fzf ended on its own SIGTERM.
             check(name + "-quick", r["took"] is not None and r["took"] < 2 * sb.FZF_END_WAIT, r["took"])
@@ -3937,7 +3951,7 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
             pass
     r = popup_with_hung_reads(two_signals, leader=False, snapshot_hangs=True)
     check("second-signal-during-the-close-is-ignored", r["rc"] == 128 + 15 and not r["left"] and not r["run_dir_left"]
-          and all(r["terminal"].values()), (r["rc"], r["left"], r["run_dir_left"], r["terminal"]))
+          and all(r["terminal"].values()), (r["rc"], r["left"], r["run_dir_left"], r["terminal"], r["left_detail"]))
     # A read that times out inside a preview is killed then, with the popup still open and the
     # cursor where it was.
     timed_out = []
