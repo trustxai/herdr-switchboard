@@ -4111,7 +4111,9 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
                            "if '--version' in sys.argv:\n    print('0.74.2')\n    sys.exit(0)\n"
                            "def noted(*_):\n"
                            "    run = os.environ.get('SWITCHBOARD_RUN_DIR', '')\n"
-                           "    open(%r, 'a').write('%%s\\n' %% os.path.exists(os.path.join(run, 'closing')))\n"
+                           "    mark = os.path.join(run, 'closing')\n"
+                           "    size = os.path.getsize(mark) if os.path.exists(mark) else -1\n"
+                           "    open(%r, 'a').write('%%s %%d\\n' %% (os.path.exists(mark), size))\n"
                            "signal.signal(signal.SIGTERM, noted)\n"
                            "fd = os.open('/dev/tty', os.O_RDWR)\ntty.setraw(fd)\n"
                            "os.write(fd, b'\\x1b[?1049h\\x1b[?1000h')\nopen(%r, 'w').close()\ntime.sleep(60)\n"
@@ -4152,8 +4154,11 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("popup-puts-the-terminal-back-when-fzf-must-be-killed", stuck and rc == 128 + 15
           and b"\x1b[?1049l" in shown and b"\x1b[?1000l" in shown and bool(lflag & _tm57b.ECHO)
           and bool(lflag & _tm57b.ICANON), (stuck, rc, round(took, 1), shown[-40:], lflag))
-    # The run directory says the popup is closing before fzf gets its first SIGTERM.
+    # The run directory says the popup is closing before fzf gets its first SIGTERM, with an
+    # empty file.
     check("popup-marks-closing-before-ending-fzf", os.path.exists(seen) and open(seen).read().split()[:1] == ["True"],
+          open(seen).read() if os.path.exists(seen) else None)
+    check("closing-is-an-empty-file", os.path.exists(seen) and open(seen).read().split()[:2] == ["True", "0"],
           open(seen).read() if os.path.exists(seen) else None)
     finish(pid, fd, 0)
 

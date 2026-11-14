@@ -2349,11 +2349,14 @@ CLOSING = "closing"  # created in the run directory when the popup starts ending
 
 
 def mark_closing(run_dir):
-    """The popup is ending its fzf: see popup_closing()."""
+    """The popup is ending its fzf: see popup_closing(). An empty file, 0600, never through a
+    symlink."""
     fd = open_private_dir(run_dir)
     if fd is not None:
         try:
-            append_line(fd, CLOSING, "")
+            os.close(os.open(CLOSING, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=fd))
+        except OSError:
+            pass
         finally:
             os.close(fd)
 
