@@ -2566,10 +2566,15 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     fh = executable(os.path.join(d, "herdr"), '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%(d)s/machines.json" ;;\n'
                                              '  *"agent focus"*) { [ -n "${SWITCHBOARD_RUN_DIR+x}" ] && echo has_run_dir; '
                                              '[ -n "${SWITCHBOARD_RUN_FD+x}" ] && echo has_run_fd; '
-                                             'env | grep -qF -- "%(run)s" && echo has_path; } > "%(d)s/worker-flags"; '
+                                             'env | grep -qF -- "%(run)s" && echo has_path; '
+                                             'env | grep -q "^FZF_" && echo has_fzf; } > "%(d)s/worker-flags"; '
                                              'sleep 1.5; touch "%(d)s/focused" ;;\n'
                                              'esac\n' % {"d": d, "run": run})
-    env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=run, SWITCHBOARD_LABELS=json.dumps({"m1": "box1"}))
+    # --enter runs under fzf's transform, and fzf (0.66+) exports its state to it: FZF_SOCK
+    # is the socket inside the run directory. Set the way fzf sets them.
+    env = dict(os.environ, HERDR_BIN_PATH=str(fh), SWITCHBOARD_RUN_DIR=run, SWITCHBOARD_LABELS=json.dumps({"m1": "box1"}),
+               FZF_SOCK=os.path.join(run, "fzf.sock"), FZF_QUERY="", FZF_ACTION="enter", FZF_KEY="enter",
+               FZF_CURRENT_ITEM="m1|a|w1:p1|w1:t1\tbox1 row")
     out = subprocess.run([sys.executable, str(TOOL), "--enter", "m1|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, universal_newlines=True, env=env, timeout=20).stdout
     m = re.search(r"--focus-wait (focus-[0-9]+-[0-9]+) ", out)
@@ -2589,9 +2594,27 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     check("attack-nothing-written-in-the-new-directory", sorted(os.listdir(run)) == sorted([name, name + ".tmp"]),
           os.listdir(run))
     # The fake herdr records yes/no flags, never the environment itself (it can hold secrets):
-    # neither variable that names the directory, and its path under no name at all.
+    # neither variable that names the directory, its path under no name at all, nothing of
+    # fzf's. herdr runs with child_env(), so it does not see the descriptor's variable either.
     worker_flags = open(os.path.join(d, "worker-flags")).read().split() if os.path.exists(os.path.join(d, "worker-flags")) else None
-    check("attack-worker-env-has-no-path", worker_flags == ["has_run_fd"], worker_flags)
+    check("attack-worker-env-has-no-path", worker_flags == [], worker_flags)
+    # And the worker's own environment, as enter() builds it (marks computed here, nothing kept).
+    captured, run2 = [], private_tmp(d, "run2")
+    saved_popen, saved_env, saved_out = sb.subprocess.Popen, dict(os.environ), sys.stdout
+    os.environ.update(SWITCHBOARD_RUN_DIR=run2, FZF_SOCK=os.path.join(run2, "fzf.sock"), FZF_QUERY="x",
+                      OTHER_HOLDS_IT="prefix:" + run2)
+    sb.subprocess.Popen = lambda argv, **kw: captured.append(kw.get("env") or {}) or None
+    sys.stdout = _io.StringIO()  # enter() prints fzf actions
+    try:
+        sb.enter("m1|a|w1:p1|w1:t1")
+    finally:
+        sb.subprocess.Popen, sys.stdout = saved_popen, saved_out
+        os.environ.clear()
+        os.environ.update(saved_env)
+    marks = [("fzf" if any(k.startswith("FZF_") for k in e) else "")
+             + ("path" if any(run2 in v for v in e.values()) else "")
+             + ("fd" if "SWITCHBOARD_RUN_FD" in e else "") for e in captured]
+    check("worker-env-nothing-of-fzf-nor-the-path", marks == ["fd"], marks)
 
 # 36. --focus-wait outlasts the slowest worker.
 block('36. --focus-wait outlasts the slowest worker')
@@ -3095,6 +3118,61 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
         # Before: they showed only with the demo's first change, at about 9 s.
         check("late-listen-rows-arrive", seen is not None and seen < 5, seen)
         check("late-listen-esc-exits", rc == 0, rc)
+
+# 46. Nothing fzf exports, and nothing that names the run directory, reaches the programs
+# the popup and its helpers start: herdr, ssh, osascript. The fakes record yes/no marks.
+block("46. children's environment")
+MARKS_SH = ('#!/bin/sh\n{ env | grep -q "^FZF_" && echo fzf; env | grep -q "^SWITCHBOARD_RUN_" && echo runvar; '
+            'env | grep -qF -- "%(run)s" && echo path; echo ran; } >> "%(out)s"\n')
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    run = private_tmp(d, "run")
+    marks = {k: os.path.join(d, k + ".marks") for k in ("herdr", "ssh", "osa")}
+    fakes = {k: executable(os.path.join(d, k), MARKS_SH % {"run": run, "out": marks[k]}) for k in marks}
+    fzf_env = dict(FZF_SOCK=os.path.join(run, "fzf.sock"), FZF_QUERY="", FZF_CURRENT_ITEM="row",
+                   SWITCHBOARD_RUN_DIR=run)
+
+    def took(k, wait=5.0):
+        end = _time.time() + wait
+        while _time.time() < end and not (os.path.exists(marks[k]) and "ran" in open(marks[k]).read()):
+            _time.sleep(0.05)
+        got = open(marks[k]).read().split() if os.path.exists(marks[k]) else None
+        if os.path.exists(marks[k]):
+            os.remove(marks[k])
+        return got
+
+    # herdr from a child of fzf (the preview), in a process of its own.
+    subprocess.run([sys.executable, str(TOOL), "--preview", "|a|w1:p1|w1:t1"], stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, env=dict(os.environ, HERDR_BIN_PATH=str(fakes["herdr"]), **fzf_env),
+                   timeout=30)
+    check("child-env-herdr-from-preview", took("herdr") == ["ran"])
+    saved = (sb.HERDR, sb.SSH, sb.OSASCRIPT, dict(os.environ))
+    os.environ.update(fzf_env)
+    sb.HERDR, sb.SSH, sb.OSASCRIPT = str(fakes["herdr"]), str(fakes["ssh"]), str(fakes["osa"])
+    try:
+        sb.launch_jump(["--jump", "box1"], ("ssh", "mac1"), helper="sb-helper")
+        check("child-env-ssh-of-the-jump", took("ssh") == ["ran"])
+        link = sb.JumpLink(find=lambda: ("ssh", "mac1"), helper=lambda host: "sb-helper").start()
+        link.send(["--jump", "box1"])
+        if link.proc:
+            link.proc.wait(10)
+        check("child-env-ssh-of-the-link", took("ssh") == ["ran"])
+        sb.jump("box1", "a", "w1:p1", "w1:t1", "sbjabc", False, "", keys="\\x02g/", wait=0, tty="/dev/ttys000")
+        check("child-env-osascript", took("osa") == ["ran"])
+        check("child-env-herdr-of-the-jump", took("herdr") == ["ran"])
+    finally:
+        sb.HERDR, sb.SSH, sb.OSASCRIPT = saved[:3]
+        os.environ.clear()
+        os.environ.update(saved[3])
+    env_in = dict(fzf_env, PATH="/bin", KEEP="1", HOLDS_IT="x" + run)
+    saved_env = dict(os.environ)
+    os.environ.clear()
+    os.environ.update(env_in)
+    try:
+        got = sb.child_env()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved_env)
+    check("child-env-keeps-the-rest", sorted(got) == ["KEEP", "PATH"], sorted(got))
 
 # 50. Nothing in the tests or the program waits without a bound on a child, a thread or a
 # terminal (the popup's wait for fzf is the user's: it ends with a key or a signal).

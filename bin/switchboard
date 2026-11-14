@@ -914,6 +914,21 @@ def header(entries, machines, pending, down, stale=()):
 DEMO = None  # a Demo when running --demo: herdr calls are answered from the fixtures
 
 
+def child_env(run_dir=None):
+    """The environment for anything started outside fzf: herdr, ssh, osascript, the jump
+    helper and the --enter worker.
+
+    fzf exports its state to the commands it runs (FZF_SOCK is the socket inside the run
+    directory, FZF_CURRENT_ITEM a row's text, and about thirty more FZF_* variables), and
+    the popup gives fzf SWITCHBOARD_RUN_DIR. None of that is passed on: every FZF_*
+    variable, both SWITCHBOARD_RUN_* ones, and any other variable whose value holds the
+    run directory's path."""
+    run_dir = run_dir or os.environ.get("SWITCHBOARD_RUN_DIR") or ""
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith("FZF_") and k not in ("SWITCHBOARD_RUN_DIR", "SWITCHBOARD_RUN_FD")
+            and not (run_dir and run_dir in v)}
+
+
 def herdr(args, timeout=None):
     # stdin is /dev/null for EVERY child: the popup is a terminal, and a child that reads
     # it (an ssh without -n, say) eats keystrokes. Half an arrow key (the ESC of ESC [ B)
@@ -921,7 +936,7 @@ def herdr(args, timeout=None):
     if DEMO is not None:
         return DEMO.run(args)
     r = subprocess.run([HERDR] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                       stderr=subprocess.DEVNULL, universal_newlines=True, timeout=timeout)
+                       stderr=subprocess.DEVNULL, universal_newlines=True, timeout=timeout, env=child_env())
     if r.returncode != 0:
         raise RuntimeError("herdr %s: rc %d" % (" ".join(args), r.returncode))
     return r.stdout
@@ -959,7 +974,8 @@ def herdr_on(machine, args, timeout=None, info=None, need_output=True):
         try:
             if argv:
                 r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, universal_newlines=True, timeout=timeout)
+                                   stderr=subprocess.DEVNULL, universal_newlines=True, timeout=timeout,
+                                   env=child_env())
                 if r.returncode == 0 and (r.stdout.strip() or not need_output):
                     return r.stdout
         except (OSError, subprocess.SubprocessError):
@@ -1555,7 +1571,9 @@ def enter(row_id, run_dir=None):
 
     The worker outlives the popup on purpose, so it never gets the run directory's name:
     it inherits a descriptor of that directory, opened and checked here while the popup
-    still owns it, and its argv holds only the bare name of its result file. If the popup
+    still owns it, its argv holds only the bare name of its result file, and its
+    environment is child_env() (fzf, which runs this, exports FZF_SOCK, a path inside the
+    run directory). If the popup
     has removed the directory by the time the worker finishes, there is nowhere to write
     and nothing is written; the focus has happened all the same."""
     target = parse_id(row_id)
@@ -1568,7 +1586,7 @@ def enter(row_id, run_dir=None):
     try:
         record_ack(target, run_fd)
         name = "focus-%d-%d" % (os.getpid(), int(time.time() * 1000)) if run_fd is not None else ""
-        env = {k: v for k, v in os.environ.items() if k not in ("SWITCHBOARD_RUN_DIR", "SWITCHBOARD_RUN_FD")}
+        env = child_env(run_dir)
         if run_fd is not None:
             env["SWITCHBOARD_RUN_FD"] = str(run_fd)
         me = [sys.executable, os.path.abspath(__file__)]
@@ -2238,7 +2256,7 @@ def ssh_mux():
 def run_out(argv, timeout=5):
     try:
         r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           universal_newlines=True, timeout=timeout)
+                           universal_newlines=True, timeout=timeout, env=child_env())
         return r.stdout if r.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -2479,7 +2497,7 @@ def jump(label, kind, pane, tab, query, rename, old_label, keys=None, wait=0.15,
         osa.communicate(script.encode("utf-8"), timeout=10)
     else:
         subprocess.run([OSASCRIPT, "-e", script], stdin=subprocess.DEVNULL,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, env=child_env())
     time.sleep(0.6)
     if rename:
         # The label goes as it is: herdr takes a label that starts with "-" as text, and a
@@ -2512,7 +2530,7 @@ def jump_server(stdin=None):
     osa = None
     if tty:
         osa = subprocess.Popen([OSASCRIPT, "-"], stdin=subprocess.PIPE,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env())
     line = stdin.readline()
     try:
         args = json.loads(line) if line.strip() else None
@@ -2560,7 +2578,7 @@ class JumpLink:
                     if not argv:
                         return
                 self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                                             stderr=subprocess.DEVNULL, start_new_session=True)
+                                             stderr=subprocess.DEVNULL, start_new_session=True, env=child_env())
         except Exception:
             self.proc = None
         finally:
@@ -2599,7 +2617,7 @@ def launch_jump(args, client, helper=None):
         if not argv:
             return False
     subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+                     stderr=subprocess.DEVNULL, start_new_session=True, env=child_env())
     return True
 
 
@@ -2839,7 +2857,7 @@ def popup(self_cmd, demo=False):
         # its machine.
         if cmd:
             subprocess.Popen([HERDR] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL, start_new_session=True)
+                             stderr=subprocess.DEVNULL, start_new_session=True, env=child_env())
         if JUMP_ENABLED:
             args = jump_argv(target, labels.get(target["machine"], ""), live.entries())
             if not (link and link.send(args)):
@@ -2852,7 +2870,7 @@ def popup(self_cmd, demo=False):
     if cmd:
         try:
             subprocess.run([HERDR] + cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=10)
+                           stderr=subprocess.DEVNULL, timeout=10, env=child_env())
         except (OSError, subprocess.SubprocessError):
             pass
     return 0
