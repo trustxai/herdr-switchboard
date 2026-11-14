@@ -634,7 +634,10 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
     sb.LOCAL_EVERY, sb.REMOTE_EVERY = 0.05, 0.05
     data.update(local=snap([pane("w1:p1")], [agent("w1:p1", "working", 1)]),
                 m1=snap([pane("w1:p1")], [agent("w1:p1", "idle", 1)]))
-    lv = sb.Live(machines, sb.entries_from(fake_fetch(), "", "here", 0), fetch=fake_fetch)
+    # The first rows as a local pass renders them, with this machine's label: otherwise the
+    # first local pass is a change of its own, and when the other machine answers after it (a
+    # slow runner) fzf gets two reloads.
+    lv = sb.Live(machines, sb.entries_from(fake_fetch(), "", sb.local_label(), 0), fetch=fake_fetch)
     lv.changed()
     rows_file, stop = os.path.join(d, "rows"), _threading.Event()
     w9a = _threading.Thread(target=sb.watch, args=(lv, sock, rows_file, stop), daemon=True)
