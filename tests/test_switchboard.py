@@ -1692,8 +1692,10 @@ with tempfile.TemporaryDirectory() as d:
     sb.STATE_DIR = str(d / "state")
     m1 = [{"id": "m1", "label": "box1"}]
     vivid = {"local": snap17(T1, ag17("p1", "working", 1, T1)), "m1": snap17(T1, ag17("p9", "working", 1, T1))}
+    # No snapshot cache: the watch loop's threads would otherwise still be writing it into this
+    # temporary directory while it is removed (seen on a slow macOS runner).
     lv = sb.Live(m1, sb.entries_from(vivid["local"], "", "here", 0), fetch=lambda m="", t=None, i=None: vivid[m or "local"],
-                 focus=T1)
+                 focus=T1, cache=False)
     lv.refresh_remote(0, m1[0])
     vivid["m1"] = snap17(T1, ag17("p9", "idle", 2, T1, 2))
     lv.refresh_remote(0, m1[0])
@@ -1714,11 +1716,13 @@ with tempfile.TemporaryDirectory() as d:
     sock = short_sock("w")
     fz = FakeFzf(sock, position=0)
     stop = _threading.Event()
-    _threading.Thread(target=sb.watch, args=(lv, sock, str(d / "rows"), stop, str(ack_file)), daemon=True).start()
+    watcher24 = _threading.Thread(target=sb.watch, args=(lv, sock, str(d / "rows"), stop, str(ack_file)), daemon=True)
+    watcher24.start()
     _time.sleep(0.3)
     ack_file.write_text(json.dumps(["m1", T1]) + "\n")
     _time.sleep(0.5)
     stop.set()
+    watcher24.join(5)  # the loop is done with this directory before it goes
     check("acks-watch-applies-and-reloads", not ack_file.exists() and "● done" not in lv.text()
           and any(b"reload-sync" in r for r in fz.reqs), (ack_file.exists(), lv.text()[:300]))
     sb.STATE_DIR = STATE
@@ -2208,8 +2212,10 @@ with tempfile.TemporaryDirectory() as d:
     sb.STATE_DIR = str(d / "state")
     m1 = [{"id": "m1", "label": "box1"}]
     vivid = {"local": snap17(T1, ag17("p1", "working", 1, T1)), "m1": snap17(T1, ag17("p9", "working", 1, T1))}
+    # No snapshot cache: the watch loop's threads would otherwise still be writing it into this
+    # temporary directory while it is removed.
     lv = sb.Live(m1, sb.entries_from(vivid["local"], "", "here", 0), fetch=lambda m="", t=None, i=None: vivid[m or "local"],
-                 focus=T1)
+                 focus=T1, cache=False)
     # A --focus that appends exactly while the file is being removed: its line must survive.
     acks = d / "acks"
     acks.write_text(json.dumps(["m1", T1]) + "\n")
