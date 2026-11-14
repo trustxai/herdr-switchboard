@@ -309,6 +309,44 @@ def order(entries):
     return [e["pane"] for e in sorted(entries, key=sb.sort_key)]
 
 
+# Started here, checked in block 52: a remote read that spends the whole remote timeout on
+# ssh and then most of it again on the `herdr --machine` fallback. It needs remote_timeout = 6
+# s and about 12 s in all (a backstop as short as the old one, the timeout plus 5 s, gives up
+# 0.6 s before the answer), so it runs while the rest of the suite does.
+_late_dir = tempfile.mkdtemp(prefix="late-", dir=_tmp_root)
+with open(os.path.join(_late_dir, "machines.json"), "w") as _f:
+    json.dump([{"id": "m1", "label": "box1", "enabled": True, "target": "box1-host"}], _f)
+with open(os.path.join(_late_dir, "local.json"), "w") as _f:
+    json.dump({"result": {"snapshot": snap([pane("w1:p1")], [agent("w1:p1", "idle", 1, title="here-row")])}}, _f)
+with open(os.path.join(_late_dir, "m1.json"), "w") as _f:
+    json.dump({"result": {"snapshot": snap([pane("w1:p7")], [agent("w1:p7", "idle", 1, title="late-remote")])}}, _f)
+# The ssh also leaves a child holding its output pipe, as a real one's helpers can: killing
+# only the ssh would leave the read waiting on that pipe.
+_late_ssh = executable(os.path.join(_late_dir, "ssh"), '#!/bin/sh\nsleep 300 &\necho $! > "%s/ssh-child.pid"\n'
+                       'echo $$ > "%s/ssh.pid"\nexec sleep 300\n' % (_late_dir, _late_dir))
+
+
+def _late_cleanup():
+    """Whatever the late ssh left (only a regression leaves anything) goes when the suite ends."""
+    for name in ("ssh.pid", "ssh-child.pid"):
+        try:
+            os.kill(int(open(os.path.join(_late_dir, name)).read()), _signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+
+
+_atexit.register(_late_cleanup)
+_late_herdr = executable(os.path.join(_late_dir, "herdr"),
+                         '#!/bin/sh\ncase "$*" in\n  "machine list --json") cat "%(d)s/machines.json" ;;\n'
+                         '  "api snapshot") cat "%(d)s/local.json" ;;\n'
+                         '  "--machine m1 api snapshot") sleep 5.6; cat "%(d)s/m1.json" ;;\n'
+                         '  *) exit 1 ;;\nesac\n' % {"d": _late_dir})
+_late_t0 = _time.time()
+_late = subprocess.Popen([sys.executable, str(TOOL), "--rows"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, universal_newlines=True, start_new_session=True,
+                         env=dict(os.environ, HERDR_BIN_PATH=str(_late_herdr), SWITCHBOARD_SSH=str(_late_ssh),
+                                  SWITCHBOARD_REMOTE_TIMEOUT="6", HERDR_PLUGIN_STATE_DIR=os.path.join(_late_dir, "state")))
+
 # 1. Priority.
 block('1. Priority')
 s = snap(
@@ -1725,7 +1763,8 @@ else:
 check("program-executable", os.access(str(TOOL), os.X_OK) and SOURCE.startswith("#!/usr/bin/env python3\n"))
 std = set(getattr(sys, "stdlib_module_names", ())) or {
     "base64", "copy", "glob", "json", "os", "re", "select", "shlex", "shutil", "socket", "subprocess", "sys",
-    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty", "stat", "math", "signal"}
+    "tempfile", "threading", "time", "unicodedata", "tomllib", "termios", "tty", "stat", "math", "signal",
+    "atexit"}
 imported = set()
 for node in ast.walk(tree):
     if isinstance(node, ast.Import):
@@ -3366,6 +3405,95 @@ check("child-env-at-every-site", env_exceptions == ENV_EXCEPTIONS and env_sites 
 enter_def = next(n for n in ast.walk(ast.parse(SOURCE)) if isinstance(n, ast.FunctionDef) and n.name == "enter")
 check("worker-env-starts-from-child-env", "env = child_env(run_dir)" in ast.get_source_segment(SOURCE, enter_def))
 
+# 52. A remote read may take the ssh timeout and then the fallback's: the wait for it is
+# derived from that worst case, in one place, and nothing a read started outlives the program.
+block("52. remote read bounds")
+try:
+    late_out, _ = _late.communicate(timeout=60)
+except subprocess.TimeoutExpired:
+    os.killpg(_late.pid, _signal.SIGKILL)
+    late_out, _ = _late.communicate(timeout=10)
+late_took = _time.time() - _late_t0
+check("slow-ssh-then-late-fallback-is-listed", "late-remote" in late_out and "box1 offline" not in late_out
+      and _late.returncode == 0, (late_took, [l for l in late_out.splitlines() if "box1" in l][:3]))
+_ssh_left = []
+for _name in ("ssh.pid", "ssh-child.pid"):
+    try:
+        _pid = int(open(os.path.join(_late_dir, _name)).read())
+        os.kill(_pid, 0)
+        _ssh_left.append(_name)
+        os.kill(_pid, _signal.SIGKILL)
+    except (OSError, ValueError):
+        pass
+check("timed-out-ssh-and-its-child-are-gone", not _ssh_left, _ssh_left)
+check("remote-waits-from-one-place", SOURCE.count("herdr_on_bound(REMOTE_TIMEOUT)") == 2
+      and sb.herdr_on_bound(6) >= 2 * 6, SOURCE.count("herdr_on_bound(REMOTE_TIMEOUT)"))
+# A read still running when the program exits (its thread is abandoned) is killed with its
+# group at exit, instead of running on without the timeout that was meant for it.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    pidfile = os.path.join(d, "pid")
+    code = ("import importlib.machinery, importlib.util, os, sys, threading, time\n"
+            "l = importlib.machinery.SourceFileLoader('sbx', sys.argv[1])\n"
+            "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('sbx', l))\n"
+            "l.exec_module(m)\n"
+            "threading.Thread(target=m.run_child, args=(['sh', '-c', 'echo $$ > %s; exec sleep 30'], 60),"
+            " daemon=True).start()\n"
+            "end = time.time() + 10\n"
+            "while not os.path.exists(%r) and time.time() < end:\n"
+            "    time.sleep(0.05)\n"
+            "time.sleep(0.2)\n") % (pidfile, pidfile)
+    subprocess.run([sys.executable, "-c", code, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=30)
+    try:
+        orphan = int(open(pidfile).read())
+    except (OSError, ValueError):
+        orphan = None
+    alive, end = orphan is not None, _time.time() + 3
+    while alive and _time.time() < end:
+        try:
+            os.kill(orphan, 0)
+            _time.sleep(0.05)
+        except OSError:
+            alive = False
+    check("exit-ends-a-running-read", orphan is not None and not alive, orphan)
+    if alive:
+        os.kill(orphan, _signal.SIGKILL)
+    # The same when a signal interrupts the read itself (main turns SIGTERM into an exit, the
+    # read unwinds before the exit cleanup runs).
+    os.remove(pidfile)
+    code2 = ("import importlib.machinery, importlib.util, signal, sys\n"
+             "l = importlib.machinery.SourceFileLoader('sbx', sys.argv[1])\n"
+             "m = importlib.util.module_from_spec(importlib.util.spec_from_loader('sbx', l))\n"
+             "l.exec_module(m)\n"
+             "signal.signal(signal.SIGTERM, m._exit_on_signal)\n"
+             "m.run_child(['sh', '-c', 'echo $$ > %s; exec sleep 30'], 60)\n") % pidfile
+    reader = subprocess.Popen([sys.executable, "-c", code2, str(TOOL)], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    end = _time.time() + 10
+    while not os.path.exists(pidfile) and _time.time() < end:
+        _time.sleep(0.05)
+    _time.sleep(0.2)
+    reader.send_signal(_signal.SIGTERM)
+    try:
+        reader.wait(10)
+    except subprocess.TimeoutExpired:
+        reader.kill()
+        reader.wait(10)
+    try:
+        orphan = int(open(pidfile).read())
+    except (OSError, ValueError):
+        orphan = None
+    alive, end = orphan is not None, _time.time() + 3
+    while alive and _time.time() < end:
+        try:
+            os.kill(orphan, 0)
+            _time.sleep(0.05)
+        except OSError:
+            alive = False
+    check("signal-ends-a-running-read", orphan is not None and not alive and reader.returncode == 128 + 15,
+          (orphan, alive, reader.returncode))
+    if alive:
+        os.kill(orphan, _signal.SIGKILL)
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]

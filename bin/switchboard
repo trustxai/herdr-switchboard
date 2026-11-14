@@ -18,6 +18,7 @@ to the local ones. While open it refreshes itself.
 
 Python 3.9 and the standard library only: macOS ships /usr/bin/python3 3.9.
 """
+import atexit
 import base64
 import copy as copymod
 import glob
@@ -933,14 +934,67 @@ def child_env(run_dir=None):
             and not (run_dir and run_dir in v)}
 
 
+_RUNNING = set()  # children run_child() started that have not finished yet
+_RUNNING_LOCK = threading.Lock()
+
+
+def run_child(argv, timeout):
+    """subprocess.run for herdr, ssh and the like, bounded for real.
+
+    The child gets a process group of its own (and no controlling terminal), so a timeout
+    kills everything it started: subprocess.run kills only the child, then waits without a
+    bound for anything that still holds its output pipe. A child still running when this
+    program exits (a read in a thread the exit abandons) is killed with its group too, so
+    nothing outlives the timeout that was meant for it. Returns a CompletedProcess; raises
+    TimeoutExpired like subprocess.run."""
+    p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         universal_newlines=True, start_new_session=True, env=child_env())
+    with _RUNNING_LOCK:
+        _RUNNING.add(p)
+    try:
+        try:
+            out, _ = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(p)
+            try:
+                p.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+        except BaseException:
+            # Interrupted, say by a SIGTERM that main turns into an exit: the exit cleanup
+            # would no longer see this child once it is unregistered below, so it goes now.
+            _kill_group(p)
+            raise
+        return subprocess.CompletedProcess(argv, p.returncode, out)
+    finally:
+        with _RUNNING_LOCK:
+            _RUNNING.discard(p)
+
+
+def _kill_group(p):
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+@atexit.register
+def _end_running_children():
+    with _RUNNING_LOCK:
+        running = list(_RUNNING)
+    for p in running:
+        if p.poll() is None:
+            _kill_group(p)
+
+
 def herdr(args, timeout=None):
     # stdin is /dev/null for EVERY child: the popup is a terminal, and a child that reads
     # it (an ssh without -n, say) eats keystrokes. Half an arrow key (the ESC of ESC [ B)
     # reaches fzf as Esc and closes it.
     if DEMO is not None:
         return DEMO.run(args)
-    r = subprocess.run([HERDR] + args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                       stderr=subprocess.DEVNULL, universal_newlines=True, timeout=timeout, env=child_env())
+    r = run_child([HERDR] + args, timeout)
     if r.returncode != 0:
         raise RuntimeError("herdr %s: rc %d" % (" ".join(args), r.returncode))
     return r.stdout
@@ -977,14 +1031,19 @@ def herdr_on(machine, args, timeout=None, info=None, need_output=True):
         argv = ssh_argv(target, remote)
         try:
             if argv:
-                r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, universal_newlines=True, timeout=timeout,
-                                   env=child_env())
+                r = run_child(argv, timeout)
                 if r.returncode == 0 and (r.stdout.strip() or not need_output):
                     return r.stdout
         except (OSError, subprocess.SubprocessError):
             pass
     return herdr(["--machine", machine] + args, timeout)
+
+
+def herdr_on_bound(timeout):
+    """The longest herdr_on() can take with that timeout: the ssh for all of it, then the
+    `herdr --machine` fallback for all of it again, plus 3 s for starting both. Anything
+    that waits for a herdr_on() from outside derives its wait from here."""
+    return 2 * timeout + 3
 
 
 def snapshot(machine=LOCAL, timeout=None, info=None):
@@ -1227,7 +1286,8 @@ def collect(with_remote):
     threads = [threading.Thread(target=fetch, args=(i, m), daemon=True) for i, m in enumerate(machines)]
     for t in threads:
         t.start()
-    deadline = time.time() + REMOTE_TIMEOUT + 5  # each read has its own timeout; this is the backstop
+    # Each read bounds itself; this backstop only covers the worst a read may take.
+    deadline = time.time() + herdr_on_bound(REMOTE_TIMEOUT)
     for t in threads:
         t.join(max(0.0, deadline - time.time()))
     for i, m in enumerate(machines):
@@ -1654,7 +1714,7 @@ def focus_wait(name, row_id):
     target = parse_id(row_id)
     label = (machine_labels().get(target["machine"]) or target["machine"]) if target else ""
     dir_fd = open_private_dir(os.environ.get("SWITCHBOARD_RUN_DIR")) if RESULT_NAME.fullmatch(name) else None
-    deadline = time.time() + 2 * REMOTE_TIMEOUT + 3
+    deadline = time.time() + herdr_on_bound(REMOTE_TIMEOUT)
     try:
         while dir_fd is not None and time.time() < deadline:
             text = clean((read_small(dir_fd, name) or "").strip())
@@ -2259,8 +2319,7 @@ def ssh_mux():
 
 def run_out(argv, timeout=5):
     try:
-        r = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           universal_newlines=True, timeout=timeout, env=child_env())
+        r = run_child(argv, timeout)
         return r.stdout if r.returncode == 0 else ""
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -2332,10 +2391,13 @@ def local_tui_tty(ps_text=None):
     return None
 
 
+IDLE_TIMEOUT = 6  # seconds for one HIDIdleTime probe (a single ioreg, over ssh or not)
+
+
 def idle_seconds(host):
     """How long since the Mac was last touched (HIDIdleTime). host None is this machine."""
     argv = ssh_argv(host, "ioreg -c IOHIDSystem", mux=False) if host else ["ioreg", "-c", "IOHIDSystem"]
-    out = run_out(argv, timeout=6) if argv else ""
+    out = run_out(argv, timeout=IDLE_TIMEOUT) if argv else ""
     m = re.search(r'"HIDIdleTime"\s*=\s*(\d+)', out)
     return int(m.group(1)) / 1e9 if m else float("inf")
 
@@ -2376,7 +2438,7 @@ def find_client(bridges=None, hosts=None, local_tty=None, idle=idle_seconds, pla
                    for c in candidates]
         for t in threads:
             t.start()
-        deadline = time.time() + 10  # idle_seconds has its own 6 s timeout; this is the backstop
+        deadline = time.time() + IDLE_TIMEOUT + 3  # each probe bounds itself; this covers the worst
         for t in threads:
             t.join(max(0.0, deadline - time.time()))
         candidates.sort(key=lambda c: results.get(c, float("inf")))
