@@ -1014,9 +1014,12 @@ PS_TIMEOUT = 2  # seconds descendants() gives `ps`
 def descendants(pid):
     """Every process below `pid` by parent pid at this moment, from `ps` (Linux and macOS
     both have it), run directly with a timeout rather than through run_child, which kills
-    with this. A process whose parent already died has left the tree and is not found."""
+    with this. A process whose parent already died has left the tree and is not found.
+
+    Every `ps` here gets -ww: ps cuts its lines at $COLUMNS, which fzf sets for a preview
+    and child_env() passes on."""
     try:
-        out = subprocess.run(["ps", "-axo", "pid=,ppid="], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        out = subprocess.run(["ps", "-ww", "-axo", "pid=,ppid="], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, universal_newlines=True, timeout=PS_TIMEOUT,
                              env=child_env()).stdout
     except (OSError, subprocess.SubprocessError):
@@ -2453,7 +2456,7 @@ def client_bridges(ps_text=None):
 
     They are the `herdr remote-client-bridge` processes; a one-off `herdr --machine` also
     creates one, which is why the choice is made per machine and not per process."""
-    ps_text = ps_text if ps_text is not None else run_out(["ps", "-axo", "pid=,command="])
+    ps_text = ps_text if ps_text is not None else run_out(["ps", "-ww", "-axo", "pid=,command="])
     out = []
     for line in ps_text.splitlines():
         parts = line.split()
@@ -2491,7 +2494,7 @@ def answers_as_mac(host):
 
 def local_tui_tty(ps_text=None):
     """The tty of a herdr window running on this machine, or None."""
-    ps_text = ps_text if ps_text is not None else run_out(["ps", "-axo", "pid=,tty=,command="])
+    ps_text = ps_text if ps_text is not None else run_out(["ps", "-ww", "-axo", "pid=,tty=,command="])
     for line in ps_text.splitlines():
         parts = line.split()
         if len(parts) >= 3 and os.path.basename(parts[2]) == "herdr" and parts[1] not in ("??", "?") \

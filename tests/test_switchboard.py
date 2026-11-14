@@ -141,6 +141,8 @@ What it has to get right, and how it fails otherwise:
    and Enter on a local row act at once, and a signal during a close never leaves the run
    directory behind. watch() does not wait for its remote reads, and once close_state() ran
    nothing more is written into the state directory.
+59. No ps line the program matches is cut by $COLUMNS, which fzf sets for its commands: every
+   ps it runs asks for whole lines.
 
     python3 tests/test_switchboard.py
 """
@@ -2902,9 +2904,9 @@ def close_popup(local_seconds, slow, signals=False, leader=True):
         left = sorted(os.listdir(root))
         # fzf's command line names its socket under the run root: yes/no, from the command
         # lines only, before anything else here ends what is left.
-        ps = subprocess.run(["ps", "-axo", "command="], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        ps = subprocess.run(["ps", "-ww", "-axo", "command="], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                             universal_newlines=True, timeout=20).stdout
-        lingering = any(root in line and "ps -axo" not in line for line in ps.splitlines())
+        lingering = any(root in line and "ps -ww -axo" not in line for line in ps.splitlines())
         if fd is not None:
             finish(pid, fd, 0)  # reaps, or kills, what is left of the terminal's session, and closes fd
         if os.path.exists(os.path.join(d, "hung")):  # the hanging fake herdr outlives the popup
@@ -3601,7 +3603,7 @@ def fzf_premise():
     with tempfile.TemporaryDirectory(dir="/tmp") as d:
         log, fzf_pid_file, hold_pid_file = (os.path.join(d, n) for n in ("log", "fzf.pid", "hold.pid"))
         cmd = executable(os.path.join(d, "cmd"), '#!/bin/sh\nsleep 300 >/dev/null 2>&1 &\n'
-                         'echo "$1 $(ps -o pgid= -p $$ | tr -d " ") $!" >> "%s"\n' % log)
+                         'echo "$1 $(ps -ww -o pgid= -p $$ | tr -d " ") $!" >> "%s"\n' % log)
         hold = executable(os.path.join(d, "hold"), '#!/bin/sh\necho $$ > "%s"\nexec sleep 300\n' % hold_pid_file)
         argv = [fzf_real, "--with-shell", "sh -c", "--preview", "%s preview" % cmd,
                 "--bind", "ctrl-y:transform-footer(%s transform-footer)" % cmd,
@@ -3803,7 +3805,7 @@ def popup_with_hung_reads(drive, remote_timeout="60", leader=True, snapshot_hang
                                                                    tab="w1:t%d" % i) for i in range(1, 6)])}}, f)
         fake_ssh = executable(os.path.join(d, "ssh"), '#!/bin/sh\ncase "$*" in\n'
                               '  *"pane read"*) k=other\n'
-                              '    case "$(ps -o command= -p $PPID)" in\n'
+                              '    case "$(ps -ww -o command= -p $PPID)" in\n'
                               '      *--copy*) k=copy ;; *--select*) k=select ;; *--preview*) k=preview ;;\n'
                               '    esac\n'
                               '    case $k in copy|select)\n'
@@ -4342,6 +4344,57 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         sb.STATE_DIR = saved_state
 check("demo-closes-its-state-before-removing-it", "            close_state()  # a refresh that outlived the popup "
       "writes nothing from here on\n            shutil.rmtree(STATE_DIR, ignore_errors=True)" in SOURCE)
+
+# 59. No ps line the program matches is cut: ps cuts at $COLUMNS (fzf sets it for its
+# commands, and child_env() passes it on). With COLUMNS=20, a herdr remote-client-bridge and a
+# herdr window on a terminal, both started from a long path, are still found. A `ps` wrapper
+# first on PATH keeps only these two (this machine may run a real herdr); a fake address
+# stands for the ssh connection. And every `ps` the program runs asks for whole lines.
+block("59. ps lines are never cut")
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    mark = "colmark59"
+    long_dir = os.path.join(d, mark, "a-directory-name-long-enough-to-be-cut")
+    os.makedirs(long_dir)
+    os.symlink("/bin/sh", os.path.join(long_dir, "herdr"))
+    real_ps = shutil.which("ps")
+    wrap = os.path.join(d, "wrap")
+    os.mkdir(wrap)
+    executable(os.path.join(wrap, "ps"), '#!/bin/sh\n"%s" "$@" | grep -F -e "%s"\n' % (real_ps, mark))
+    bridge = subprocess.Popen([os.path.join(long_dir, "herdr"), "-c", "sleep 30; :", "remote-client-bridge"],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              start_new_session=True, env=dict(os.environ, SSH_CONNECTION="box9 1 box9 22"))
+    tui, tui_fd = _pty.fork()
+    if tui == 0:
+        os.execv(os.path.join(long_dir, "herdr"), [os.path.join(long_dir, "herdr"), "-c", "sleep 30; :"])
+    try:
+        _time.sleep(0.5)
+        code59 = ("import importlib.machinery, importlib.util, json, sys\n"
+                  "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+                  "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+                  "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+                  "print(json.dumps([sb.client_bridges(), sb.local_tui_tty() is not None]))\n")
+        out = subprocess.run([sys.executable, "-c", code59, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, universal_newlines=True, timeout=30,
+                             env=dict(os.environ, COLUMNS="20", PATH=wrap + os.pathsep + os.environ["PATH"])).stdout
+        try:
+            bridges59, tty59 = json.loads(out)
+        except ValueError:
+            bridges59, tty59 = None, None
+        check("bridges-found-with-a-narrow-columns", bridges59 == [[bridge.pid, "box9"]], bridges59)
+        check("window-tty-found-with-a-narrow-columns", tty59 is True, tty59)
+    finally:
+        for p in (bridge.pid, tui):
+            try:
+                os.killpg(p, _signal.SIGKILL)
+            except OSError:
+                pass
+        bridge.wait(5)
+        finish(tui, tui_fd, 0)
+_ps_calls = [n for n in ast.walk(ast.parse(SOURCE)) if isinstance(n, ast.List) and n.elts
+             and isinstance(n.elts[0], ast.Constant) and n.elts[0].value == "ps"]
+check("every-ps-asks-for-whole-lines", len(_ps_calls) >= 4 and all(
+    any(isinstance(e, ast.Constant) and isinstance(e.value, str) and e.value.startswith("-ww") for e in n.elts)
+    for n in _ps_calls), [ast.get_source_segment(SOURCE, n) for n in _ps_calls])
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
