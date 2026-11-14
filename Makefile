@@ -10,9 +10,12 @@ PYTHON ?= python3
 
 PROGRAM := bin/switchboard
 TESTS := tests/test_switchboard.py
-# Named, not globbed: a missing program or test file makes compile and ruff fail.
-SOURCES := $(PROGRAM) $(sort $(TESTS) $(wildcard tests/*.py))
+# Named, not globbed: a missing program or test file makes compile and ruff fail. The
+# converter behind the README images is checked the same way.
+SOURCES := $(PROGRAM) $(sort $(TESTS) $(wildcard tests/*.py)) docs/ansi2html.py
+# bash scripts (bash -n) and POSIX sh scripts (sh -n).
 SCRIPTS := $(wildcard .github/scripts/*.sh)
+SH_SCRIPTS := docs/render.sh
 
 # ruff, pinned. It runs through uvx when uv is installed, so nothing has to be
 # installed into the project; otherwise a ruff found on PATH is used.
@@ -76,7 +79,8 @@ ruff:
 
 scripts:
 	@for s in $(SCRIPTS); do bash -n "$$s" || exit 1; done; \
-	echo "scripts: shell syntax ok ($(SCRIPTS))"
+	for s in $(SH_SCRIPTS); do sh -n "$$s" || exit 1; done; \
+	echo "scripts: shell syntax ok ($(SCRIPTS) $(SH_SCRIPTS))"
 
 pycache:
 	@found=$$($(FIND_PYCACHE) -print); \
