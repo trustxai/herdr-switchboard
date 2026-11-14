@@ -59,9 +59,13 @@ locally; ruff and gitleaks are skipped with a message when they are not installe
   closes as if Esc had been pressed. The tests check that every `subprocess` call says it.
 - **Anything started outside fzf gets `env=child_env()`**: no `FZF_*` variable and nothing that
   holds the run directory's path.
-- **Every wait has a bound**: each `subprocess` call, `wait`, `communicate` and `join` takes a
-  timeout (the popup's own wait for fzf is the user's). Block 50 checks this with the AST, in
-  the program and in the tests.
+- **Every wait has a bound**. Block 50 checks, with the AST, in the program and in the tests:
+  every `subprocess.run`, `check_output`, `call` and `check_call` (also through an attribute,
+  such as `sb.subprocess.run`) passes `timeout=`; every `communicate()` passes a timeout; every
+  `wait()` and `join()` passes an argument or `timeout=`; every `select()` passes its timeout;
+  and nothing calls `os.wait()`, or `os.waitpid`, `os.wait3` or `os.wait4` with options `0`. The
+  one exemption, pinned to its site, is the popup's `proc.communicate(first)`, its wait for
+  fzf, which the user ends with a key or a signal.
 - **Every user-visible string goes through the translation table**, in English and Spanish.
 - **No bytecode in the tree.** The tests must not write `__pycache__`; `make lint` fails if they
   do.

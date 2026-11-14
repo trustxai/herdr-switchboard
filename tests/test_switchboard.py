@@ -3281,26 +3281,72 @@ with tempfile.TemporaryDirectory() as d:
           warn)
 
 # 50. Nothing in the tests or the program waits without a bound on a child, a thread or a
-# terminal (the popup's wait for fzf is the user's: it ends with a key or a signal).
+# terminal. Exactly what is checked, in both files: every subprocess.run/check_output/call/
+# check_call (also through an attribute, like sb.subprocess.run) passes timeout=; every
+# communicate() passes a timeout (keyword or second argument) and every wait() and join() an
+# argument or timeout=; select() has its fourth argument; os.wait() is never called, and
+# os.waitpid/wait3/wait4 never with options 0. One exemption, pinned to its site: the popup's
+# proc.communicate(first), its wait for fzf, which the user ends with a key or a signal.
 block("50. bounded waits")
+WAIT_EXEMPT = {("program", "popup", "proc.communicate(first)")}
+
+
+def _calls_with_function(text):
+    """(call node, name of the enclosing function or None) for every call in the source."""
+    out = []
+
+    def walk(node, fn):
+        for child in ast.iter_child_nodes(node):
+            name = child.name if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) else fn
+            if isinstance(child, ast.Call):
+                out.append((child, fn))
+            walk(child, name)
+    walk(ast.parse(text), None)
+    return out
+
+
+def _subprocess_call(func):
+    """subprocess.X or anything.subprocess.X: the X, else None."""
+    if not isinstance(func, ast.Attribute):
+        return None
+    owner = func.value
+    owner_name = owner.id if isinstance(owner, ast.Name) else owner.attr if isinstance(owner, ast.Attribute) else ""
+    return func.attr if owner_name == "subprocess" else None
+
+
 for label, text in (("tests", pathlib.Path(__file__).read_text()), ("program", SOURCE)):
-    unbounded = []
-    for node in ast.walk(ast.parse(text)):
-        if not isinstance(node, ast.Call):
-            continue
+    unbounded, exempt_seen = [], set()
+    for node, fn in _calls_with_function(text):
         func = node.func
         fname = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-        base = getattr(func.value, "id", "") if isinstance(func, ast.Attribute) else ""
+        owner = getattr(func.value, "id", "") if isinstance(func, ast.Attribute) else ""
         kws = {k.arg for k in node.keywords}
-        if base == "subprocess" and fname in ("run", "check_output", "call", "check_call") and "timeout" not in kws:
-            unbounded.append(node.lineno)
-        elif fname in ("wait", "communicate", "join") and base not in ("os", "path") and not node.args \
-                and "timeout" not in kws and not (isinstance(func, ast.Attribute) and isinstance(func.value, ast.Constant)):
-            unbounded.append(node.lineno)
-        elif fname == "waitpid" and len(node.args) == 2 and isinstance(node.args[1], ast.Constant) \
-                and node.args[1].value == 0:
+        seg = ast.get_source_segment(text, node) if fname == "communicate" else None  # slow: only where needed
+        if (label, fn, seg) in WAIT_EXEMPT:
+            exempt_seen.add((label, fn, seg))
+            continue
+        if _subprocess_call(func) in ("run", "check_output", "call", "check_call"):
+            bad = "timeout" not in kws
+        elif fname == "communicate" and isinstance(func, ast.Attribute):
+            bad = "timeout" not in kws and len(node.args) < 2
+        elif fname in ("wait", "join") and isinstance(func, ast.Attribute) and not isinstance(func.value, ast.Constant) \
+                and owner != "os":
+            bad = not node.args and "timeout" not in kws
+        elif fname == "select" and isinstance(func, ast.Attribute):
+            bad = len(node.args) < 4 and "timeout" not in kws
+        elif owner == "os" and fname == "wait":
+            bad = True
+        elif owner == "os" and fname in ("waitpid", "wait3", "wait4"):
+            opts = node.args[-1] if node.args else None
+            bad = isinstance(opts, ast.Constant) and opts.value == 0
+        else:
+            bad = False
+        if bad:
             unbounded.append(node.lineno)
     check("bounded-waits-%s" % label, not unbounded, unbounded)
+    if label == "program":
+        check("bounded-waits-exemption-pinned", exempt_seen == WAIT_EXEMPT, exempt_seen)
+
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
