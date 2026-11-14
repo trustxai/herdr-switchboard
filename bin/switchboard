@@ -2788,6 +2788,11 @@ def popup(self_cmd, demo=False):
 
 
 def _exit_on_signal(signum, frame):
+    """The first SIGHUP or SIGTERM exits through the finally blocks. Any later one is ignored:
+    raised again inside a finally block, it would cut the cleanup short (a window that closes
+    sends SIGHUP right after SIGTERM, for example)."""
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_IGN)
     raise SystemExit(128 + signum)
 
 

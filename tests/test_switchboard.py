@@ -2537,9 +2537,12 @@ for bad in (0.5, 121, "fast"):
     check("local-timeout-out-of-range %r" % (bad,), cfg["refresh"]["local_timeout"] == 5.0 and warn, (cfg["refresh"], warn))
 
 # 38. Closing always removes the run directory.
-def close_popup(local_seconds, slow):
+def close_popup(local_seconds, slow, signals=False):
     """Open the popup over a fake herdr, press Esc, and return (rc, seconds from Esc to exit,
-    what is left in the popup's run root). slow: every snapshot after the first hangs."""
+    what is left in the popup's run root, whether a process still names that root). slow:
+    every snapshot after the first hangs. signals: instead of Esc, SIGTERM and 0.4 s later
+    SIGHUP, while a refresh hangs (the cleanup is then under way)."""
+    import signal as _sig8
     with tempfile.TemporaryDirectory(dir="/tmp") as d:
         root = private_tmp(d, "runs")
         cfg = os.path.join(d, "cfg")
@@ -2576,32 +2579,55 @@ def close_popup(local_seconds, slow):
                     rc = os.waitstatus_to_exitcode(status)
                     break
                 buf += chunk
+            else:  # exited while a child still holds the terminal open
+                done, status = os.waitpid(pid, os.WNOHANG)
+                if done:
+                    rc = os.waitstatus_to_exitcode(status)
+                    break
             if t_esc is None and b"only-row" in buf:
                 # With a slow snapshot, wait until a refresh is hanging before closing.
                 deadline = _time.time() + 5
                 while slow and not os.path.exists(os.path.join(d, "hung")) and _time.time() < deadline:
                     _time.sleep(0.05)
-                os.write(fd, b"\x1b")
                 t_esc = _time.time()
+                if signals:
+                    os.kill(pid, _sig8.SIGTERM)
+                    _time.sleep(0.4)
+                    os.kill(pid, _sig8.SIGHUP)
+                else:
+                    os.write(fd, b"\x1b")
         if rc is None:
             os.kill(pid, 9)
             os.waitpid(pid, 0)
         took = _time.time() - t_esc if t_esc else None
         left = sorted(os.listdir(root))
+        # fzf's command line names its socket under the run root: yes/no, from the command
+        # lines only.
+        ps = subprocess.run(["ps", "-axo", "command="], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            universal_newlines=True).stdout
+        lingering = any(root in line and "ps -axo" not in line for line in ps.splitlines())
+        os.close(fd)
         if os.path.exists(os.path.join(d, "hung")):  # the hanging fake herdr outlives the popup
             try:
                 os.kill(int(open(os.path.join(d, "hung")).read().strip()), 9)
             except (ValueError, OSError):
                 pass
-        return rc, took, left
+        return rc, took, left, lingering
 
 
-rc, took, left = close_popup(10, False)
+rc, took, left, _ = close_popup(10, False)
 check("close-with-a-long-interval-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 1.5,
       (rc, took, left))
-rc, took, left = close_popup(1, True)
+rc, took, left, _ = close_popup(1, True)
 check("close-during-a-slow-snapshot-removes-the-run-dir", rc == 0 and left == [] and took is not None and took < 4,
       (rc, took, left))
+# A second signal during the cleanup is ignored: the first one's exit code and nothing left.
+# fzf does not outlive the popup either: the popup leads its terminal's session, so its exit
+# hangs up fzf (checked here, since nothing in the program does it).
+rc, took, left, lingering = close_popup(1, True, signals=True)
+check("second-signal-does-not-cut-the-cleanup", rc == 128 + 15 and left == [] and took is not None and took < 5,
+      (rc, took, left))
+check("signal-leaves-no-fzf", not lingering)
 
 
 # A popup whose terminal goes away (SIGHUP) still removes its directories: the run directory
