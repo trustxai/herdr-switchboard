@@ -29,15 +29,19 @@ First public release.
   falls back to the default and is named in the popup's header.
 - English and Spanish interface.
 - A start-up check for Python 3.9 or newer and fzf 0.71 or newer that says what is missing and
-  how to install it, and a message naming `[refresh] local_timeout` when this machine's herdr
+  how to install it (without any `python3` on the herdr server's `PATH`, the pane says so and
+  waits for Enter), and a message naming `[refresh] local_timeout` when this machine's herdr
   does not answer in time.
 - `--demo`, which shows the interface over bundled sample data with no herdr, ssh or network.
 - An optional jump that switches the herdr window on a macOS client running Ghostty to the
   chosen machine, typing the herdr keys set in `[jump] prefix` and `goto` (herdr's defaults,
   `ctrl+b` and `prefix+g`, unless changed). Off by default, and off for the run when a key is
-  outside the accepted set; see [SECURITY.md](SECURITY.md) before enabling it.
+  outside the accepted set; a pane it renames for the jump gets its name back even when the
+  typing fails or a signal arrives. See [SECURITY.md](SECURITY.md) before enabling it.
 - The popup removes its temporary files on every close, also when its window or session goes
-  away (SIGHUP or SIGTERM).
+  away (SIGHUP or SIGTERM), and in that case ends its own fzf.
+- The programs it starts (herdr, ssh, osascript, the focus worker) get an environment without
+  fzf's `FZF_*` variables or the path of the popup's run directory.
 - README images made from `--demo`, and `docs/render.sh`, which regenerates them.
 - Apache License 2.0, security policy, contributing guide and CI on Linux and macOS.
 

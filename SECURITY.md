@@ -47,6 +47,20 @@ still finds them, Switchboard appends `/opt/homebrew/bin`, `/home/linuxbrew/.lin
 gaps and never shadow what comes first. The helpers it starts (herdr, ssh, osascript and the
 like) get `/dev/null` or one of its own pipes as their input, never the popup's terminal.
 
+**What each child gets in its environment.** fzf gets the popup's environment plus
+`SWITCHBOARD_RUN_DIR` (the run directory below, which its `--enter` and `--focus-wait` bindings
+need) and `SWITCHBOARD_LABELS` (the machines' labels). The commands fzf runs (`--preview`,
+`--copy`, `--select`, `--enter`, `--focus-wait`) are Switchboard itself, and they inherit fzf's
+environment, including the `FZF_*` variables fzf exports, such as `FZF_SOCK`, a path inside the
+run directory. Everything else Switchboard starts gets a cleaned copy of its environment:
+without any `FZF_*` variable, without `SWITCHBOARD_RUN_DIR` and `SWITCHBOARD_RUN_FD`, and
+without any other variable whose value contains the run directory's path. That covers herdr
+(local, over ssh, or through `herdr --machine`), `ssh`, `ps`, `ioreg`, `tailscale`, `osascript`,
+the jump's ssh connection to the Mac, the focus the popup sends after Enter, and the `--focus`
+worker, which also gets `SWITCHBOARD_RUN_FD`, the number of the descriptor it inherits. The
+check of the configured colours (`fzf --filter`) runs with the popup's own environment, which
+holds no run directory.
+
 ### The local herdr
 
 It reads the workspaces, tabs, panes and agents of the local herdr (`herdr api snapshot`), the
@@ -121,10 +135,11 @@ anywhere else: its writes go through the removed directory's descriptor and fail
 socket is contacted only after such a write succeeded.
 
 The popup also closes this way when its window or session goes away: SIGHUP and SIGTERM exit
-through the same cleanup, which removes the run directory (and, for `--demo`, its temporary
-state directory). A second SIGHUP or SIGTERM during that cleanup is ignored, so it finishes.
-The detached focus worker and the jump helper run in sessions of their own and do not get the
-popup's hangup.
+through the same cleanup, which ends the popup's own fzf (a kill, then a wait of up to two
+seconds) and removes the run directory (and, for `--demo`, its temporary state directory). A
+second SIGHUP or SIGTERM during that cleanup is ignored, so it finishes. The detached focus
+worker and the jump's connection run in sessions of their own and do not get the popup's
+hangup.
 
 ### Enter on another machine's row
 
@@ -132,12 +147,13 @@ With the jump off, Enter on another machine's row records the row's tab as seen 
 `acks`) and starts a worker, `bin/switchboard --focus`, in a session of its own, so neither Esc nor
 the popup closing can stop it. The worker runs the focus on that machine, by ssh or
 `herdr --machine` as above, writes a one-line result file in the run directory, and exits. It
-never receives the directory's name: it inherits a descriptor of it, opened and checked while
-the popup still owned the directory, and its command line holds only the bare name of its result
-file, which must match `focus-<digits>-<digits>`. If the popup has already removed the directory,
-the worker writes nothing; the focus has happened all the same. In the popup, a background fzf
-action waits for that file for up to twice the remote timeout plus three seconds and shows it in
-the footer.
+never receives the directory's path: it inherits a descriptor of it, opened and checked while
+the popup still owned the directory; its environment is the cleaned one described under *The
+programs it runs*, plus the descriptor's number; and its command line holds only the bare name
+of its result file, which must match `focus-<digits>-<digits>`. If the popup has already removed
+the directory, the worker writes nothing; the focus has happened all the same. In the popup, a
+background fzf action waits for that file for up to twice the remote timeout plus three seconds
+and shows it in the footer.
 
 ### The state directory
 
@@ -211,9 +227,11 @@ extra Enter):
 
 The helper checks all of that before it renames or types anything. When something is refused,
 or there is no herdr window on that Mac, it renames nothing, types nothing, stops the waiting
-`osascript` and only asks herdr to focus the pane. The server also sends the usual focus
-through herdr's API, so if the keystrokes do not arrive the pane is still focused on its
-machine.
+`osascript` and only asks herdr to focus the pane. Once it has renamed the pane, the original
+name comes back and the focus is sent whatever happens to the typing: `osascript` timing out
+after 10 seconds (for example while macOS waits for an Automation permission), `osascript`
+missing, or a SIGHUP or SIGTERM. The server also sends the usual focus through herdr's API, so
+if the keystrokes do not arrive the pane is still focused on its machine.
 
 This is the most sensitive part of the plugin, for two reasons. The herdr server must be able to
 log in to your Mac over ssh, and anyone who controls the account that runs the herdr server can

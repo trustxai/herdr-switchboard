@@ -37,6 +37,13 @@ real herdr, never opens an ssh connection and never touches your clipboard: it r
 against a fake `herdr` and fake fixtures. Keep it that way. A test that focuses or renames
 panes in your real herdr session would move you around while you work.
 
+The suite must not hang either. Each block announces itself on stderr and has a 120-second
+watchdog: past it, the run ends with every thread's stack (file, line, function) and the
+block's name. A child started on a pseudo-terminal is reaped through `finish()`, which keeps
+reading its terminal while it waits and kills its process group past a bound: a wait that stops
+reading can block forever on macOS, where an exiting session leader first waits for its
+terminal's output to drain.
+
 CI runs the suite on Ubuntu and macOS with Python 3.9 and the newest stable Python, plus
 `make lint` and a gitleaks scan of the whole history. `make check` runs the same targets
 locally; ruff and gitleaks are skipped with a message when they are not installed.
@@ -50,6 +57,11 @@ locally; ruff and gitleaks are skipped with a message when they are not installe
 - **Every child process states its stdin**: `subprocess.DEVNULL`, or a pipe the program writes
   to. The popup owns the terminal; a child that reads from it swallows keystrokes, and fzf
   closes as if Esc had been pressed. The tests check that every `subprocess` call says it.
+- **Anything started outside fzf gets `env=child_env()`**: no `FZF_*` variable and nothing that
+  holds the run directory's path.
+- **Every wait has a bound**: each `subprocess` call, `wait`, `communicate` and `join` takes a
+  timeout (the popup's own wait for fzf is the user's). Block 50 checks this with the AST, in
+  the program and in the tests.
 - **Every user-visible string goes through the translation table**, in English and Spanish.
 - **No bytecode in the tree.** The tests must not write `__pycache__`; `make lint` fails if they
   do.

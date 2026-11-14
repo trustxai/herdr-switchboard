@@ -23,9 +23,8 @@ needs you.
   Inside a status the most recent change goes on top, whatever machine it happened on.
 - **`done` means "finished and not seen yet"**, tracked across machines, so work that finished
   while you were looking at another machine stays marked until you go there.
-- **Live.** While the popup is open it reads this machine every second and each saved machine
-  every 3 seconds. On the top row the cursor stays on top, where the most urgent row goes;
-  further down it follows the agent you were on.
+- **Live.** While open it reads this machine every second and each saved machine every 3 s.
+  The cursor follows the agent you were on, or stays on the top row if it was there.
 - **Preview** of the selected pane at the bottom, without the agent's input box and status bar.
 - **Copy from the list:** `ctrl-y` copies the agent's last reply, `ctrl-o` opens the pane in a
   viewer where a mouse selection is copied. Both go to the clipboard of the machine you are
@@ -51,11 +50,12 @@ You need:
   [the fzf repository](https://github.com/junegunn/fzf/releases) or use Homebrew
   (`brew install fzf`).
 
-If Python or fzf is missing or too old, the popup says what to install instead of opening.
+Without a `python3` on that `PATH`, the pane says so and waits for Enter. If Python is too old,
+or fzf is missing or too old, the popup says what to install.
 
 **Install it on each machine you open it from.** The key runs on the herdr server of the machine
-your window is showing. Machines you just want to *see* in the list need nothing: to list them,
-Switchboard runs the herdr that is already there.
+your window is showing. Machines you just want to *see* in the list need nothing: Switchboard
+runs the herdr already there.
 
 ## Bind a key
 
@@ -83,7 +83,7 @@ keybind = cmd+k=text:\x02\x20
 | type | filter on any column: status, machine, workspace, tab, pane, directory |
 | `enter` | go to the pane, or to a terminal's tab (on another machine, see [below](#other-machines)) |
 | `ctrl-y` | copy the agent's last reply (see *Copying* below) |
-| `ctrl-o` | open the pane in a viewer: drag to select, the selection is copied on release; wheel, arrows, `j`/`k` or Page Up/Down to scroll; `esc` or `q` to go back |
+| `ctrl-o` | the pane in a viewer: drag to select, copied on release; scroll with the wheel, arrows, `j`/`k` or Page Up/Down; `esc` or `q` to go back |
 | `ctrl-t` | just the terminals; press again for everything |
 | `ctrl-/` | hide or show the preview |
 | `esc` | close |
@@ -101,16 +101,14 @@ title its agent set; in a split tab its position goes in front (`2 · npm run de
 **The header** counts the agents and those blocked, done and working, and names the machines
 still loading, offline, or shown from a saved copy (`server from 40 s ago`).
 
-**When is something `done`?** herdr's own status is not enough across machines: a server counts
-as seen whatever finishes in its active tab, even while you look at another machine. So
-Switchboard keeps its own record: finished work counts as seen when you open the popup on that
-tab, pick it with Enter, reach it some other way (herdr turned it from `done` to idle), or when
-it finished outside its machine's active tab and is already idle. Anything else stays `done`.
+**When is something `done`?** A server counts as seen whatever finishes in its active tab, even
+while you look at another machine, so Switchboard keeps its own record. Finished work counts as
+seen when you open the popup on its tab, pick it with Enter, reach it another way (herdr turned
+it from `done` to idle), or it finished outside its machine's active tab and is already idle.
 
 **Copying.** For a Claude Code session on this machine, `ctrl-y` takes the last reply from the
 session's transcript; otherwise it reads the last reply block from the screen, or copies what
-is on screen. The footer says which. Both keys write OSC 52, which herdr forwards to the
-terminal you type in.
+is on screen. The footer says which. Both keys write OSC 52, which herdr forwards.
 
 ## Other machines
 
@@ -118,7 +116,7 @@ Save a machine with `herdr machine add` and it appears in the list. For each ena
 machine with an ssh target, Switchboard runs `herdr` there over ssh, in batch mode and on one
 shared connection per machine; if that fails, or the machine has no ssh target, it uses
 `herdr --machine <id>`. If the remote shell does not find `herdr`, set `[remote] herdr` (the
-default already adds the usual Homebrew directories to `PATH`).
+default adds the Homebrew directories to `PATH`).
 
 - The last snapshot of each saved machine is kept, so its rows appear the moment the popup
   opens, marked with their age in the header, until the fresh ones arrive. A copy older than
@@ -202,9 +200,8 @@ enabled = false        # see "Jump to another machine" for client, prefix and go
 ```
 
 [`config.example.toml`](config.example.toml) lists every option with its default and range. A
-mistake never stops the popup: a file that does not parse means all the defaults, a bad value
-means that option's default (a bad `prefix` or `goto` turns the jump off), and the header says
-what was wrong.
+mistake never stops the popup: the header says what it did instead (see
+[Troubleshooting](#troubleshooting)).
 
 ## How it compares
 
@@ -225,12 +222,14 @@ cover parts of this. Compared on 2026-11-13 from each project's README (and herd
 | herdr-picker | No (attaches the whole machine) | No | Blocked first | Yes | Yes | IDs only | Yes |
 
 ¹ Checked against `bin/switchboard` 0.1.0. ² Inferred; not written in that project's README.
-Corrections are welcome in an issue.
 
 ## Troubleshooting
 
 - **The key does nothing.** Check `herdr plugin list` on the machine your window is showing (see
   [Install](#install)), the `[[keys.command]]` block, and `herdr server reload-config`.
+- **It says there is no `python3` on the PATH the herdr server runs with.** herdr's server started
+  without it: install Python 3.9 or newer or add its directory to that `PATH`, then restart the
+  server, as the message says.
 - **It says fzf is missing or too old.** It looks on `PATH` and in the Homebrew directories.
   Distribution packages are often older than 0.71; see [Install](#install).
 - **It says herdr did not answer `api snapshot` in time.** This machine's herdr was slower than
@@ -239,11 +238,12 @@ Corrections are welcome in an issue.
   --version`; if it asks for a password or does not find `herdr`, fix the key or set
   `[remote] herdr`. Raise `[refresh] remote_timeout` for a slow link. `bin/switchboard --rows`
   (in the plugin's directory) prints the list without fzf.
-- **Rows marked `from 40 s ago` stay that way.** That machine has not answered yet; it is the
-  saved copy. If it never updates, see the previous point.
-- **The header starts with `config …`.** The config file has a problem; the message says which,
-  and the defaults are in use for it. When it says `so the jump is off`, copy the binding from
-  your herdr config's `[keys]`, within the set `config.example.toml` lists.
+- **The header keeps saying `server from 40 s ago`.** Those rows are the saved copy: that
+  machine has not answered yet. If it never does, see the previous point.
+- **The header starts with `config <path>:`.** Each problem says what happened: `unknown option X
+  (ignored)`, `bad value for X (default used)`, `[X] must be a table (defaults used)`, or `bad
+  value for jump.goto, so the jump is off` (copy the binding from your herdr `[keys]`, within the
+  set `config.example.toml` lists). A file that cannot be read or parsed ends `(defaults in use)`.
 - **The jump does not happen.** Check the [requirements](#jump-to-another-machine-opt-in), set
   `[jump] client`, and try `ssh -o BatchMode=yes <client> true` from the server. macOS may ask
   for Automation permission before it lets the helper control Ghostty.
@@ -263,11 +263,10 @@ Chromium and ImageMagick, uses no network, and leaves nothing behind.
 
 ## Security
 
-Switchboard runs the local herdr and fzf, reaches your saved machines through your own ssh (in
-batch mode) or `herdr --machine`, and opens no other connection. It keeps each saved machine's
-last snapshot and a small record of what you have seen, never pane output or credentials. The
-jump adds ssh from the server to your Mac. [SECURITY.md](SECURITY.md) has the details and how
-to report a vulnerability privately.
+Switchboard reaches your saved machines through your own ssh (in batch mode) or
+`herdr --machine`, and opens no other connection. It stores each saved machine's last snapshot
+and what you have seen, never pane output or credentials. The jump adds ssh from the server to
+your Mac. [SECURITY.md](SECURITY.md) has the details and how to report a vulnerability.
 
 ## Contributing
 
