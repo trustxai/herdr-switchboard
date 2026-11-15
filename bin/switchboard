@@ -1238,10 +1238,16 @@ class Recency:
     - you pick it with Enter (ack_tab);
     - the server had it done and turned it idle: you went there some other way;
     - it finished outside the active tab of its machine and is already idle: the same,
-      except the popup never saw it done.
+      except the popup never saw it done;
+    - it finished in the active tab of its machine and that machine's focus has since left
+      that tab: the server only marks it seen at completion when it was the active tab, so
+      the tab was in front at that moment, and leaving it took someone on that machine,
+      who had it on screen first. A move the popup made itself (Enter on a row there) does
+      not count: ack_tab records the tab it moved to.
 
     Otherwise it stays done: that is what finished in the tab left open on one machine while
-    you were on another. The first time a machine is seen everything counts as seen.
+    you were on another, until you go back there. The first time a machine is seen
+    everything counts as seen.
     """
 
     def __init__(self, persist=True, now=None):
@@ -1316,6 +1322,8 @@ class Recency:
                         ack = seq  # the server had it done and turned it idle: you went there
                     elif moved and e["tab"] not in (focus, last_focus):
                         ack = seq  # finished outside the active tab and already idle
+                    elif focus and last_focus and focus != last_focus and e["tab"] == last_focus:
+                        ack = seq  # the focus left the tab it finished in: someone was there
                     # Otherwise it finished in the tab left open on that machine; the server
                     # counts it as seen by itself, so it stays done until you go there.
                 if moved:
@@ -1347,7 +1355,13 @@ class Recency:
                     if k and k[3] < k[0]:
                         k[3] = k[0]
                         dirty = True
-            if dirty:
+            # Picking a row moves that machine's focus to its tab: record it as the last focus
+            # seen, so the next read does not take the popup's own move for someone leaving
+            # the tab that was in front (observe). It is saved, but changes no row.
+            moved = machine in self.focus and self.focus[machine] != tab
+            if moved:
+                self.focus[machine] = tab
+            if dirty or moved:
                 self._save()
         return dirty
 
