@@ -11,8 +11,10 @@ PYTHON ?= python3
 PROGRAM := bin/switchboard
 TESTS := tests/test_switchboard.py
 # Named, not globbed: a missing program or test file makes compile and ruff fail. The
-# converter behind the README images is checked the same way.
-SOURCES := $(PROGRAM) $(sort $(TESTS) $(wildcard tests/*.py)) docs/ansi2html.py
+# converter behind the README images and the scripts behind the demo video are checked the
+# same way.
+VIDEO_SCRIPTS := docs/video/check.py docs/video/el.py docs/video/schedule.py
+SOURCES := $(PROGRAM) $(sort $(TESTS) $(wildcard tests/*.py)) docs/ansi2html.py $(VIDEO_SCRIPTS)
 # bash scripts (bash -n) and POSIX sh scripts (sh -n).
 SCRIPTS := $(wildcard .github/scripts/*.sh)
 SH_SCRIPTS := docs/render.sh

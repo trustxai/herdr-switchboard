@@ -1,0 +1,14 @@
+{
+  "model": "eleven_v4",
+  "settings": {"stability": 0.3, "similarity_boost": 0.6, "style": 0.35, "use_speaker_boost": true, "speed": 1.05},
+  "lines": [
+    {"id": "v0-intro", "text": "Switchboard, a plugin for herdr."},
+    {"id": "v1-list", "text": "Every agent on every machine, in one popup."},
+    {"id": "v2-preview", "text": "Blocked ones first, with a live preview of each pane."},
+    {"id": "v3-live", "text": "And it keeps updating while it's open."},
+    {"id": "v4-filter", "text": "Type to filter by machine, project or pane."},
+    {"id": "v5-copy", "text": "Control-Y copies the agent's last reply."},
+    {"id": "v6-enter", "text": "Enter takes you to the pane, even on another machine."},
+    {"id": "v7-end", "text": "Free and open source. Link below."}
+  ]
+}

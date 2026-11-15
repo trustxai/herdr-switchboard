@@ -2,6 +2,14 @@
 __pycache__/
 *.py[oc]
 
+# Demo video (docs/video): everything its pipeline downloads or generates
+docs/video/out/
+docs/video/remotion/node_modules/
+docs/video/remotion/build/
+docs/video/remotion/public/
+docs/video/remotion/src/schedule.json
+docs/video/remotion/src/voice.json
+
 # Local tooling
 .venv/
 .ruff_cache/
