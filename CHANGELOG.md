@@ -7,6 +7,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The cross-machine jump is on by default (`[jump] enabled = true`): Enter on another machine's
+  row switches a herdr window running in Ghostty on macOS to that pane. When the jump cannot
+  happen (no herdr window in Ghostty on a Mac the server can reach over ssh, or a helper of an
+  older version on that Mac), Enter works as with the jump off: it focuses the pane on its
+  machine and the footer says so. `enabled = false` turns it off. If your herdr `[keys] prefix`
+  or `goto` are not herdr's defaults, set the same values under `[jump]`.
+
+### Fixed
+
+- With the jump on, Enter on another machine's row no longer holds the popup while the
+  connection to the Mac is set up: it waits for it 2 seconds at most, then focuses the pane
+  instead, and the popup's close never waits for an ssh lookup (before, up to about 12 seconds
+  with a Mac that did not answer).
+- The jump types only into a herdr window whose terminal is Ghostty's, so AppleScript is never
+  pointed at a Ghostty that is not running or not installed.
+
 ## [0.1.0] - 2026-11-15
 
 First public release.

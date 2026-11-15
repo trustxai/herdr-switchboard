@@ -16,9 +16,10 @@ needs you.
 - **All your machines in one list.** This machine and every machine saved in herdr
   (`herdr machine add`) show up together. Nothing is installed on the other machines:
   Switchboard runs their herdr CLI over ssh.
-- **Enter takes you to the pane.** On this machine it focuses it. On another machine it focuses
-  it there, and with the opt-in [cross-machine jump](#jump-to-another-machine-opt-in) (macOS
-  and Ghostty) your herdr window itself switches to it.
+- **Enter takes you to the pane.** On this machine it focuses it. On another machine, when your
+  herdr window runs in Ghostty on macOS, the window itself switches to it (the
+  [cross-machine jump](#jump-to-another-machine), on by default); otherwise it focuses the pane
+  there.
 - **Sorted by what needs you:** blocked, done, working, idle, unknown, then plain terminals.
   Inside a status the most recent change goes on top, whatever machine it happened on.
 - **`done` means "finished and not seen yet"**, tracked across machines, so work that finished
@@ -125,22 +126,30 @@ default adds the Homebrew directories to `PATH`).
   bottom; the others are not held up. A machine that stops answering while the popup is open
   keeps its last rows.
 
-**What Enter does on another machine's row**, with the jump off (the default): it focuses that
-pane on its machine through herdr's API, and the popup stays open with a footer, `focusing it on
-server…`, then `ready on server: switch to that machine to see it`. As of herdr 0.9.5, a focus
-through the API moves every window attached to that server, so switching to it (sidebar or
-navigator) lands on that pane. The focus runs in its own process: `esc` does not cancel it.
+**What Enter does on another machine's row** when the [jump](#jump-to-another-machine) does not
+happen (it is off, or it found no herdr window in Ghostty on a Mac it can reach): it focuses
+that pane on its machine through herdr's API, and the popup stays open with a footer,
+`focusing it on server…`, then `ready on server: switch to that machine to see it`. As of herdr
+0.9.5, a focus through the API moves every window attached to that server, so switching to it
+(sidebar or navigator) lands on that pane. The focus runs in its own process: `esc` does not
+cancel it.
 
-## Jump to another machine (opt-in)
+## Jump to another machine
 
 As of herdr 0.9.5, a plugin has no way to change which machine your window shows. On macOS,
 Ghostty accepts keystrokes through AppleScript, so the jump types into your window what you
-would: herdr's navigator, a search that matches just that pane, and Enter. It is **off by
-default**. To turn it on:
+would: herdr's navigator, a search that matches just that pane, and Enter. It is **on by
+default**. When it cannot happen, Enter focuses the pane on its machine as described above,
+with no error and no wait beyond the one below.
+
+**If your herdr `[keys] prefix` or `[keys] goto` are not herdr's defaults (`ctrl+b` and
+`prefix+g`), set the same values under `[jump]`, or turn the jump off.** The jump types the
+prefix, the navigator key, `/`, a search and Enter into your window; with other bindings those
+keys land in the pane you are on, and the Enter sends them.
 
 ```toml
 [jump]
-enabled = true
+enabled = true         # the default; false turns the jump off
 client = "laptop"      # the ssh target of the Mac running your herdr window, or "local"
 prefix = "ctrl+b"      # your herdr [keys] prefix; this is herdr's default
 goto = "prefix+g"      # your herdr [keys] goto (the navigator); this is herdr's default
@@ -151,8 +160,9 @@ It needs:
 - the herdr window running in **Ghostty 1.4 or newer on macOS**;
 - **non-interactive, key-based ssh from the herdr server to that Mac** (not needed with
   `client = "local"`, when the server is that Mac);
-- the plugin and `python3` on the Mac too, or `[jump] helper` set to the command that runs
-  this plugin's `bin/switchboard` there;
+- the plugin and `python3` on the Mac too, the same version as on the server (an older helper
+  never says it is ready, and Enter then focuses the pane instead), or `[jump] helper` set to
+  the command that runs this plugin's `bin/switchboard` there;
 - the machine you jump to saved in the Mac's herdr under the same label as on the server: the
   helper runs `herdr --machine <label>` there;
 - **`prefix` and `goto` matching the window's herdr config.** The jump types the prefix, the
@@ -168,16 +178,21 @@ last. Setting `client` is safer.
 
 **What it runs on the Mac**, over ssh: `herdr plugin list --json` to find the plugin (unless
 `helper` is set), then the plugin's helper, started with the popup so Enter has one line to
-send. On Enter the helper checks what it would type (keys, search, terminal) before anything
-else, and if one falls outside its character set it renames and types nothing. Otherwise it
-sends the keystrokes to the Ghostty terminal running herdr and asks herdr to focus the pane;
-when no search matches just that pane, it renames the pane for a moment. On `esc` it exits
-doing nothing. The server sends the normal API focus too, so the pane is ready on its machine
-even if the keystrokes do not arrive.
+send. The helper looks for a herdr window whose terminal is Ghostty's; without one it exits at
+once, and Enter focuses the pane instead. With one, it says it is ready, and only then does
+Enter jump. If you press Enter while that connection is still being set up, it waits for it at
+most 2 seconds; a Mac that does not answer never holds the popup longer than that. On Enter the
+helper checks what it would type (keys, search, terminal) before anything else, and if one
+falls outside its character set it renames and types nothing. Otherwise it sends the
+keystrokes to the Ghostty terminal running herdr and asks herdr to focus the pane; when no
+search matches just that pane, it renames the pane for a moment. On `esc` it exits doing
+nothing. The server sends the normal API focus too, so the pane is ready on its machine even if
+the keystrokes do not arrive.
 
-**The cost:** the server must be able to log in to your Mac, and anyone who controls the account
-running the herdr server can then type into your terminal. Read the jump section of
-[SECURITY.md](SECURITY.md) before you turn it on.
+**The cost:** when the herdr server can log in to your Mac with a key, the jump uses that login,
+and anyone who controls the account running the herdr server can then type into your terminal.
+Read the jump section of [SECURITY.md](SECURITY.md). To turn the jump off, set `enabled = false`
+under `[jump]`; the server then never connects back to your Mac for it.
 
 ## Configuration
 
@@ -196,7 +211,9 @@ local_timeout = 5      # seconds to wait for this machine's herdr; raise it if i
 accent = "magenta"     # palette names follow your terminal theme; "#rrggbb" works too
 
 [jump]
-enabled = false        # see "Jump to another machine" for client, prefix and goto
+enabled = true         # the default; see "Jump to another machine" for client, prefix and goto
+prefix = "ctrl+b"      # must match your herdr [keys] prefix
+goto = "prefix+g"      # must match your herdr [keys] goto
 ```
 
 [`config.example.toml`](config.example.toml) lists every option with its default and range. A
@@ -210,7 +227,7 @@ cover parts of this. Compared on 2026-11-13 from each project's README (and herd
 
 | | Other machines in one list | One step to a pane on another machine | Sorted by what needs you | Refreshes while open | Pane preview | Copy text | Plain terminals |
 |---|---|---|---|---|---|---|---|
-| herdr-switchboard¹ | Yes, nothing to install there | Opt-in (macOS + Ghostty); otherwise focuses it on its machine | Yes | Yes | Yes | Last reply, mouse selection | Yes |
+| herdr-switchboard¹ | Yes, nothing to install there | Yes with macOS + Ghostty; otherwise focuses it on its machine | Yes | Yes | Yes | Last reply, mouse selection | Yes |
 | herdr's own Goto / Agents panel | Yes | Yes (Goto) | Agents panel only | Yes² | No² | No² | Goto only |
 | paddock | Yes (python3 there) | Yes, inside its own view | Needs-you section on top | Yes | Last lines | Inside an opened pane | Yes |
 | herdr-mirror | As mirrored workspaces in the sidebar | Yes² (the mirror pane) | No (per-host groups) | Yes | No² | Yes | Yes² |
@@ -221,7 +238,8 @@ cover parts of this. Compared on 2026-11-13 from each project's README (and herd
 | herdr-bar | Desktop-app mod only | No | Yes | Yes | Yes | Not documented | Yes |
 | herdr-picker | No (attaches the whole machine) | No | Blocked first | Yes | Yes | IDs only | Yes |
 
-¹ Checked against `bin/switchboard` 0.1.0. ² Inferred; not written in that project's README.
+¹ Checked against `bin/switchboard` 0.1.0, where the jump was off by default; it is on since.
+² Inferred; not written in that project's README.
 
 ## Troubleshooting
 
@@ -244,9 +262,14 @@ cover parts of this. Compared on 2026-11-13 from each project's README (and herd
   (ignored)`, `bad value for X (default used)`, `[X] must be a table (defaults used)`, or `bad
   value for jump.goto, so the jump is off` (copy the binding from your herdr `[keys]`, within the
   set `config.example.toml` lists). A file that cannot be read or parsed ends `(defaults in use)`.
-- **The jump does not happen.** Check the [requirements](#jump-to-another-machine-opt-in), set
-  `[jump] client`, and try `ssh -o BatchMode=yes <client> true` from the server. macOS may ask
-  for Automation permission before it lets the helper control Ghostty.
+- **Enter on another machine shows `focusing it on …` instead of jumping.** The jump did not
+  find a herdr window in Ghostty on a Mac it can reach. Check the
+  [requirements](#jump-to-another-machine), set `[jump] client`, and try
+  `ssh -o BatchMode=yes <client> true` from the server. macOS may ask for Automation permission
+  before it lets the helper control Ghostty.
+- **Enter typed something like `g/w1:p3` into a pane.** Your herdr `[keys] prefix` or `goto`
+  differ from `[jump] prefix` and `goto`. Copy them from your herdr config into `[jump]`, or set
+  `[jump] enabled = false`.
 - **The order or the `done` marks look wrong.** They live in `recency.json` in the plugin's
   state directory; deleting it starts them over.
 
@@ -254,7 +277,8 @@ cover parts of this. Compared on 2026-11-13 from each project's README (and herd
 
 `python3 bin/switchboard --demo` shows the real interface over the invented machines and
 sessions in `demo/fixtures.json`. It needs no herdr, ssh or network, writes nothing outside
-temporary directories, and Enter prints what it would run.
+temporary directories, and Enter prints what it would run. The demo never jumps between
+machines.
 
 The images above come from it: `docs/render.sh` runs the demo in a tmux server of its own,
 captures each screen with its colours, draws it as a terminal window (`docs/ansi2html.py`) and
@@ -265,8 +289,9 @@ Chromium and ImageMagick, uses no network, and leaves nothing behind.
 
 Switchboard reaches your saved machines through your own ssh (in batch mode) or
 `herdr --machine`, and opens no other connection. It stores each saved machine's last snapshot
-and what you have seen, never pane output or credentials. The jump adds ssh from the server to
-your Mac. [SECURITY.md](SECURITY.md) has the details and how to report a vulnerability.
+and what you have seen, never pane output or credentials. The jump, on by default, adds ssh from
+the server back to your Mac when the server can log in there; `[jump] enabled = false` turns it
+off. [SECURITY.md](SECURITY.md) has the details and how to report a vulnerability.
 
 ## Contributing
 

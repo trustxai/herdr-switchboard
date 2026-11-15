@@ -34,9 +34,10 @@ the changelog unless you prefer otherwise.
 Switchboard is one Python script that uses only the standard library and drives
 [fzf](https://github.com/junegunn/fzf). It has no dependencies to install, no build step and no
 telemetry, and it opens no network connection of its own: it reaches other machines through
-`ssh` and through herdr. With the cross-machine jump off, which is the default, the sections
-below up to the state directory are everything it reaches outside its own process. The jump
-adds what its own section describes. All of it is the scope of this policy.
+`ssh` and through herdr. The cross-machine jump, which is on by default, adds what its own
+section describes; with it off (`[jump] enabled = false`), the sections below up to the state
+directory are everything it reaches outside its own process. All of it is the scope of this
+policy.
 
 ### The programs it runs
 
@@ -51,7 +52,7 @@ like) get `/dev/null` or one of its own pipes as their input, never the popup's 
 `SWITCHBOARD_RUN_DIR` (the run directory below, which its `--enter` and `--focus-wait` bindings
 need) and `SWITCHBOARD_LABELS` (the machines' labels). fzf runs its commands through `sh -c`
 (`--with-shell`): Switchboard itself with `--preview`, `--copy` (ctrl-y), `--select` (ctrl-o),
-`--enter` (Enter, when other machines are saved and the jump is off) and `--focus-wait` (the
+`--enter` (Enter, when other machines are saved) and `--focus-wait` (the
 background footer `--enter` asks for); `cat` of the rows file, for each reload of the list; and
 the ctrl-t query toggle, a `case` on `$FZF_QUERY`. All of them inherit fzf's environment,
 including the `FZF_*` variables fzf exports, such as `FZF_SOCK`, a path inside the run
@@ -70,8 +71,8 @@ It reads the workspaces, tabs, panes and agents of the local herdr (`herdr api s
 machines saved in it (`herdr machine list --json`; disabled ones are skipped), and the recent
 output of a pane (`herdr pane read`) for the preview, `ctrl-y` and `ctrl-o`. The one change it
 makes is focusing the pane you choose (`herdr agent focus`, or `herdr tab focus` for a plain
-terminal). It does not create or close anything, and it renames nothing unless the optional jump
-below is enabled.
+terminal). It does not create or close anything, and it renames nothing except, for a moment,
+through the jump below.
 
 ### What comes back from herdr is untrusted
 
@@ -105,7 +106,8 @@ When that ssh fails, or the saved machine has no ssh target, the same command go
 `herdr --machine <id>` instead, which uses herdr's own connection to that machine and herdr's
 own way of authenticating to it.
 
-With the jump off, it only reaches machines that are already saved in herdr.
+With the jump off (`[jump] enabled = false`), it only reaches machines that are already saved in
+herdr.
 
 ### The clipboard (OSC 52)
 
@@ -128,6 +130,8 @@ because a Unix socket path is limited to 104 bytes on macOS; the tests move it w
   local users could reach would let them drive fzf, and that is in scope.
 - `rows`, the list fzf reloads;
 - `acks` and `focus-<pid>-<ms>` files, for Enter on another machine's row (below);
+- `jump`, the state of the jump's connection to your Mac (`pending` or `ready`, one word), which
+  `--enter` reads to decide whether Enter jumps (below);
 - `closing`, an empty file the popup creates when it starts ending fzf on a signal (below).
 
 The parts of Switchboard that use the directory after the popup has started open it once, check
@@ -204,16 +208,23 @@ below a preview's helper, and osascript in the jump's helper
 (`--jump` and `--jump-server`). On a timeout, or an exit of the process waiting for it, that
 child alone is killed. fzf runs in the popup's own process group and ends as described above.
 Started and not waited for, each in a session of its own on purpose: the focus worker, the herdr
-that focuses another machine's row after Enter, the jump's connection and its launch. `--enter`
-starts only the focus worker, and `--focus-wait` starts nothing. Nothing ends a helper in a
+that focuses another machine's row after Enter, the jump's connection and its launch. A thread
+of the popup reads the connection's output (its ready line, then until it ends); the popup's
+close never waits for that thread, for the lookups that come before the connection, or for the
+connection itself: after Enter it writes one line to the connection, or starts the launch.
+`--enter` starts only the focus worker, and `--focus-wait` starts nothing. Nothing ends a helper in a
 session of its own once the process that started it was killed with SIGKILL, which skips that
 cleanup: it runs until it ends by itself (ssh's `ConnectTimeout=5` bounds only the connection,
 not a remote herdr that stops answering).
 
 ### Enter on another machine's row
 
-With the jump off, Enter on another machine's row records the row's tab as seen (one line in
-`acks`) and starts a worker, `bin/switchboard --focus`, in a session of its own, so neither Esc nor
+Enter on another machine's row runs `--enter`. It reads `jump` in the run directory (through the
+checked descriptor, like everything there): when the jump is on and its connection says `ready`,
+it lets fzf accept the row, the popup closes and the jump goes (next section). While the
+connection is still `pending` it waits for it, two seconds at most. Otherwise, which is also
+the case with the jump off, it records the row's tab as seen (one line in `acks`) and starts a
+worker, `bin/switchboard --focus`, in a session of its own, so neither Esc nor
 the popup closing can stop it. The worker runs the focus on that machine, by ssh or
 `herdr --machine` as above, writes a one-line result file in the run directory, and exits. It
 never receives the directory's path: it inherits a descriptor of it, opened and checked while
@@ -244,19 +255,31 @@ It keeps two things in the plugin's state directory: `$HERDR_PLUGIN_STATE_DIR`, 
 Switchboard writes no pane output and no credentials there. Deleting the directory is safe: the
 order inside each status and the `done` marks start over.
 
-### The optional cross-machine jump (off by default)
+### The cross-machine jump (on by default)
 
-With `[jump] enabled = true` in the config, choosing a pane on another machine also switches your
-herdr window to that machine. The window is driven from the Mac it runs on, so the machine where
-the popup runs (the herdr server) has to reach that Mac over ssh. When there is at least one
-saved machine, that connection is opened as soon as the popup opens, so Enter only has to send
-one line; Esc, or a row of the local machine, makes the Mac side exit without doing anything.
+The jump is **on by default**. Choosing a pane on another machine then also switches your herdr
+window to that machine. The window is driven from the Mac it runs on, so the machine where the
+popup runs (the herdr server) connects back to that Mac over ssh, in batch mode, with the keys it
+already has: it never asks for a password, so on a Mac it cannot log in to nothing happens beyond
+the attempt. There, the helper sends keystrokes to Ghostty through AppleScript (below). When
+there is at least one saved machine, that connection is opened as soon as the popup opens, so
+Enter only has to send one line; Esc, or a row of the local machine, makes the Mac side exit
+without doing anything.
+
+**To turn it off**, put `enabled = false` under `[jump]` in the config. The popup then never looks
+for the Mac of your window, never connects back to it for the jump and never types anything;
+Enter on another machine's row only focuses the pane through herdr (see *Enter on another
+machine's row* above).
+
+The helper tells the popup when it is ready (one line on its output); until then, Enter takes the
+focus path, and so it does when the helper never says so: no herdr window in Ghostty on that Mac,
+a Mac that cannot be reached, or a helper of an older version.
 
 **Which Mac.** If `[jump] client` is set, that ssh target is the Mac (`local` means the server
 itself), and nothing is detected. Otherwise Switchboard looks for it:
 
-- if the herdr server is itself a Mac with a herdr window open, that machine is a candidate, and
-  for it everything below runs locally instead of over ssh;
+- if the herdr server is itself a Mac with a herdr window open in Ghostty, that machine is a
+  candidate, and for it everything below runs locally instead of over ssh;
 - it finds herdr's `remote-client-bridge` processes, the windows attached to this server from
   other machines, and takes each one's source address from the `SSH_CONNECTION` variable of its
   environment (`/proc/<pid>/environ` on Linux, `ps -E` on macOS); nothing else is kept from it;
@@ -272,9 +295,12 @@ itself), and nothing is detected. Otherwise Switchboard looks for it:
 - `herdr plugin list --json` (through `[remote] herdr`), to find where the plugin is installed
   there, unless `[jump] helper` gives the command;
 - the plugin's own helper, `python3 <plugin directory>/bin/switchboard --jump-server`. It finds
-  the terminal of the herdr window on that Mac (`ps`), starts `osascript`, and waits for one line
-  with the chosen row; a line that is not exactly the nine string arguments it expects is
-  dropped. Then it uses AppleScript to send keystrokes to the Ghostty terminal on that tty:
+  the terminal of a herdr window on that Mac that runs in Ghostty (`ps`: a herdr process with a
+  terminal and Ghostty among its parent processes). Without one it exits at once, starting
+  nothing, so AppleScript is never pointed at a Ghostty that is not running or not installed.
+  With one, it starts `osascript`, prints that it is ready, and waits for one line with the
+  chosen row; a line that is not exactly the nine string arguments it expects is dropped. Then
+  it uses AppleScript to send keystrokes to the Ghostty terminal on that tty:
   herdr's prefix and navigator key (`[jump] prefix` and `goto`, by default `ctrl+b` and `g`,
   herdr's own defaults), `/` (which focuses the navigator's search), a query that matches only
   the chosen pane, and Enter. When no query matches only that pane, the helper gives the pane a
@@ -295,24 +321,29 @@ extra Enter):
 - the query may hold only `a-z 0-9 : . _ -` and space, and the tty must look like `/dev/<name>`
   (ASCII letters, digits, `_` and `.`).
 
-The helper checks all of that before it renames or types anything. When something is refused,
-or there is no herdr window on that Mac, it renames nothing, types nothing, stops the waiting
-`osascript` and only asks herdr to focus the pane. Once it has renamed the pane, the original
-name comes back and the focus is sent whatever happens to the typing: `osascript` timing out
+The helper checks all of that before it renames or types anything. When something is refused
+(or, for a jump started without the waiting helper, there is no herdr window in Ghostty), it
+renames nothing, types nothing, stops the waiting `osascript` and only asks herdr to focus the
+pane. Once it has renamed the pane, the original name comes back and the focus is sent whatever
+happens to the typing: `osascript` timing out
 after 10 seconds (for example while macOS waits for an Automation permission), `osascript`
 missing, or a SIGHUP or SIGTERM. The server also sends the usual focus through herdr's API, so
 if the keystrokes do not arrive the pane is still focused on its machine.
 
-This is the most sensitive part of the plugin, for two reasons. The herdr server must be able to
-log in to your Mac over ssh, and anyone who controls the account that runs the herdr server can
-then type into your terminal. And without `[jump] client`, the detection connects to addresses
-it learned from the system, not from your herdr configuration. So:
+This is the most sensitive part of the plugin, for two reasons. When the herdr server can log in
+to your Mac over ssh, anyone who controls the account that runs the herdr server can then type
+into your terminal. And without `[jump] client`, the detection connects to addresses it learned
+from the system, not from your herdr configuration. So:
 
-- turn the jump on only when the server is as trusted as the Mac;
+- keep the jump on only when the server is as trusted as the Mac; otherwise set
+  `[jump] enabled = false`;
 - **set `[jump] client`** to the Mac's ssh target, so the server connects to that host and
   nothing else;
 - give the server a key of its own for this, and restrict it in the Mac's `authorized_keys`
-  (for example with a `from=` option).
+  (for example with a `from=` option);
+- set `[jump] prefix` and `goto` to your herdr `[keys] prefix` and `goto` when they are not
+  herdr's defaults: otherwise the keystrokes land in the pane you are on, and the final Enter
+  sends them there.
 
 With the jump off (by `enabled = false` or by a refused key), or when anything it needs is
 missing, Switchboard only focuses the pane through herdr on that pane's machine.

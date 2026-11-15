@@ -60,12 +60,16 @@ fzf = ""
 herdr = 'PATH="/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:$PATH" herdr'
 
 [jump]
-# Enter on another machine's row. Off (the default): the pane is focused on that machine
-# through herdr's API and the footer says it is ready there; switch machines to see it.
-# On: the window itself jumps to that machine and pane. That needs the herdr window to run
-# in Ghostty 1.4 or newer on macOS, and non-interactive ssh from the herdr server back to
-# that Mac (key-based; Tailscale, when installed, helps find the Mac but is not required).
-enabled = false
+# Enter on another machine's row. On (the default): the window itself jumps to that
+# machine and pane. That needs the herdr window to run in Ghostty 1.4 or newer on macOS,
+# and non-interactive ssh from the herdr server back to that Mac (key-based; Tailscale,
+# when installed, helps find the Mac but is not required). When that is not there, or the
+# Mac does not answer, Enter works as with the jump off: the pane is focused on that
+# machine through herdr's API and the footer says it is ready there; switch machines to
+# see it. false turns the jump off: the server then never connects back to your Mac for it.
+# If your herdr [keys] prefix or goto are not herdr's defaults, set prefix and goto below
+# to the same values, or the jump types its keys into the pane you are on.
+enabled = true
 # ssh target of the Mac running the herdr window, or "local" when the window runs on this
 # same Mac. Empty means detect it.
 client = ""
@@ -77,7 +81,8 @@ helper = ""
 # then the navigator's key, then "/" (which focuses the navigator's search; herdr fixes that
 # one). They must match the window's herdr config, [keys] prefix and [keys] goto. These are
 # herdr's own defaults (prefix "ctrl+b", goto "prefix+g"); with other bindings, the jump
-# would type into the pane instead. Accepted, exactly:
+# would type into the pane instead: the prefix, the key, "/", a search and Enter. Accepted,
+# exactly:
 #   prefix  "ctrl+" and one lower-case letter a-z.
 #   goto    "prefix+" and one key: a lower-case letter a-z, a digit 0-9, or one of
 #           / ? ; , . = [ ] ' ` -
