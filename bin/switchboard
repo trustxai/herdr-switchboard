@@ -2966,10 +2966,34 @@ def explain_and_wait(problems):
     sys.stdout.write("\n".join(problems) + "\n\n")
     sys.stdout.flush()
     try:
-        input(tr("press_enter"))
+        wait_for_enter(tr("press_enter"))
     except (EOFError, KeyboardInterrupt):
         pass
     return 1
+
+
+WAIT_POLL = 0.05  # seconds: the longest a signal at a message that waits for Enter waits
+
+
+def wait_for_enter(prompt):
+    """Write `prompt` and wait for a line on stdin, as input() did; EOFError at the end of the
+    input.
+
+    input() has a blind spot: a SIGHUP or SIGTERM that lands after it wrote its prompt and
+    before its read began only marks the Python handler as due, the read is not interrupted,
+    and the handler waits for Enter. Here stdin is watched in selects of WAIT_POLL seconds, and
+    Python runs a due handler between two of them, so such a signal acts within WAIT_POLL; one
+    that lands during a select interrupts it at once."""
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    fd = sys.stdin.fileno()
+    while True:
+        if select.select([fd], [], [], WAIT_POLL)[0]:
+            data = os.read(fd, 4096)
+            if not data:
+                raise EOFError
+            if b"\n" in data:
+                return
 
 
 # --- demo -------------------------------------------------------------------------------
@@ -3127,9 +3151,9 @@ def popup(self_cmd, demo=False):
     except Exception as exc:
         try:
             if isinstance(exc, subprocess.TimeoutExpired):
-                input(tr("snapshot_timeout", "%g" % LOCAL_TIMEOUT, config_path()))
+                wait_for_enter(tr("snapshot_timeout", "%g" % LOCAL_TIMEOUT, config_path()))
             else:
-                input(tr("snapshot_failed", clean(str(exc))))
+                wait_for_enter(tr("snapshot_failed", clean(str(exc))))
         except (EOFError, KeyboardInterrupt):
             pass
         return 1

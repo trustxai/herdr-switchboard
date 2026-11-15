@@ -158,10 +158,9 @@ popup is already exiting changes nothing: the removal at exit ignores SIGHUP and
 removal takes only the directory that process created, which it keeps open; a directory made
 under the same name afterwards is left alone. A process killed with SIGKILL, or one that ends
 without running its exit hooks, removes nothing. That includes a command `--demo` runs under
-fzf, which has a state directory of its own: fzf kills a preview it replaces with SIGKILL, so a
-preview killed in the few milliseconds between creating its state directory and removing it
-leaves that directory behind (quick cursor moves in `--demo` did not hit it in about 1,200
-tries).
+fzf, which has a state directory of its own: fzf kills with SIGKILL a preview it replaces and a
+preview still running when fzf exits (on Esc or Enter), so a preview killed between creating its
+state directory and removing it leaves that directory behind.
 
 The popup also closes this way when its window or session goes away: SIGHUP and SIGTERM exit
 through the same cleanup, which ends the popup's own fzf and removes the run directory (and, for

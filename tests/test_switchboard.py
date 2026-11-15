@@ -151,7 +151,7 @@ What it has to get right, and how it fails otherwise:
    the temporary state directory goes on a normal exit and on a SIGHUP or SIGTERM at any moment
    from its creation, also when a signal cuts main's finally block short; a signal during the
    removal at exit cuts nothing short, and that removal never takes another directory made under
-   the same name.
+   the same name. The wait for Enter misses no signal, also one that lands just before it reads.
 
     python3 tests/test_switchboard.py
 """
@@ -4633,6 +4633,58 @@ if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
                                                   "leading" if leader else "not-leading"),
               prompt and rc == 128 + sig and took is not None and took < PROMPT_FAST and left == ([], []),
               (prompt, rc, took, left))
+
+# The wait for Enter misses no signal. input() could: a SIGTERM that lands after its prompt is
+# written and before its read begins only marks the Python handler as due, and the read then
+# waits for Enter (a slow CI runner hit it at the check above). Simulated: the main thread blocks
+# SIGTERM, so the kernel hands it to another thread and the main thread's read is not
+# interrupted, which is what that window leaves too. The wait ends with 143 (in about 0.4 s,
+# 0.3 s of it the delay before the signal); input() still waits there after 5 s. And no
+# message calls input() any more.
+master61e, slave61e = os.openpty()
+try:
+    code61e = ("import importlib.machinery, importlib.util, os, signal, sys, threading, time\n"
+               "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+               "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+               "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+               "for s in (signal.SIGHUP, signal.SIGTERM):\n"
+               "    signal.signal(s, sb._exit_on_signal)\n"
+               "def later():\n"
+               "    time.sleep(0.3)\n"
+               "    os.kill(os.getpid(), signal.SIGTERM)\n"
+               "threading.Thread(target=later, daemon=True).start()\n"
+               "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
+               "sys.exit(sb.explain_and_wait(['a message']))\n")
+    try:
+        rc61e = subprocess.run([sys.executable, "-c", code61e, str(TOOL)], stdin=slave61e, stdout=slave61e,
+                               stderr=slave61e, timeout=5).returncode
+    except subprocess.TimeoutExpired:
+        rc61e = None  # still waiting for Enter
+finally:
+    os.close(slave61e)
+    os.close(master61e)
+check("wait-for-enter-misses-no-signal", rc61e == 128 + 15, rc61e)
+# Enter and the end of the input end that wait as they did under input(): explain_and_wait
+# returns 1. Each is typed into the terminal before the program reads it.
+code61f = ("import importlib.machinery, importlib.util, sys\n"
+           "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+           "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+           "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+           "sys.exit(sb.explain_and_wait(['a message']))\n")
+for name61f, typed61f in (("enter", b"\r"), ("end-of-input", b"\x04")):
+    master61f, slave61f = os.openpty()
+    try:
+        os.write(master61f, typed61f)
+        try:
+            rc61f = subprocess.run([sys.executable, "-c", code61f, str(TOOL)], stdin=slave61f, stdout=slave61f,
+                                   stderr=slave61f, timeout=5).returncode
+        except subprocess.TimeoutExpired:
+            rc61f = None
+    finally:
+        os.close(slave61f)
+        os.close(master61f)
+    check("wait-for-enter-ends-on-%s" % name61f, rc61f == 1, rc61f)
+check("no-message-waits-in-input", "input(tr(" not in SOURCE and SOURCE.count("wait_for_enter(tr(") == 3)
 
 with tempfile.TemporaryDirectory(dir="/tmp") as d:
     tmpdir = private_tmp(d, "tmp")
