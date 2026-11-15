@@ -151,7 +151,8 @@ What it has to get right, and how it fails otherwise:
    the temporary state directory goes on a normal exit and on a SIGHUP or SIGTERM at any moment
    from its creation, also when a signal cuts main's finally block short; a signal during the
    removal at exit cuts nothing short, and that removal never takes another directory made under
-   the same name. The wait for Enter misses no signal, also one that lands just before it reads.
+   the same name. The wait for Enter misses no signal, also one that lands just before it reads,
+   and acts on it within one step of its select (WAIT_POLL), not only before a long timeout.
 
     python3 tests/test_switchboard.py
 """
@@ -4664,6 +4665,60 @@ finally:
     os.close(slave61e)
     os.close(master61e)
 check("wait-for-enter-misses-no-signal", rc61e == 128 + 15, rc61e)
+# ...and it acts within one step of its select, WAIT_POLL (0.05 s). The check above only asks for
+# 143 within 5 s, which a step of 3 s also passes. Here the same blind spot is set up, and the
+# module's select is watched so that the signal is sent just as the first select of the wait
+# begins: the worst case, where the handler runs only when that select ends, a whole step later.
+# The program writes the moment of the signal to a file, and the test takes the moment of the
+# exit from its wait. With the 0.05 s step that takes 0.06 to 0.08 s, and up to about 0.11 s on
+# one CPU shared with three busy loops. A longer step adds itself: 0.51 to 0.56 s with a step of
+# 0.5 s, about 3.03 s with one of 3 s, both past WAIT_FAST.
+WAIT_FAST = 0.4  # s: the 0.05 s step plus the exit, with room for a loaded runner
+code61g = ("import importlib.machinery, importlib.util, os, signal, sys, threading, time, types\n"
+           "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+           "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+           "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+           "for s in (signal.SIGHUP, signal.SIGTERM):\n"
+           "    signal.signal(s, sb._exit_on_signal)\n"
+           "real_select, steps, begun = sb.select.select, [], threading.Event()\n"
+           "def watched(r, w, x, timeout):\n"
+           "    steps.append(timeout)\n"
+           "    begun.set()\n"
+           "    return real_select(r, w, x, timeout)\n"
+           "sb.select = types.SimpleNamespace(select=watched)\n"
+           "def later():\n"
+           "    begun.wait(5)  # it runs on once the select has released the GIL: the signal lands in it\n"
+           "    with open(sys.argv[2], 'w') as f:\n"
+           "        f.write('%r %d' % (time.time(), len(steps)))\n"
+           "    os.kill(os.getpid(), signal.SIGTERM)\n"
+           "threading.Thread(target=later, daemon=True).start()\n"
+           "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
+           "sys.exit(sb.explain_and_wait(['a message']))\n")
+with tempfile.TemporaryDirectory(dir="/tmp") as d61g:
+    sent61g = os.path.join(d61g, "sent")
+    master61g, slave61g = os.openpty()
+    try:
+        proc61g = subprocess.Popen([sys.executable, "-c", code61g, str(TOOL), sent61g], stdin=slave61g,
+                                   stdout=slave61g, stderr=slave61g)
+        try:
+            rc61g = proc61g.wait(timeout=10)
+            exit61g = _time.time()
+        except subprocess.TimeoutExpired:
+            proc61g.kill()
+            proc61g.wait(timeout=5)
+            rc61g = exit61g = None  # still waiting for Enter
+    finally:
+        os.close(slave61g)
+        os.close(master61g)
+    try:
+        with open(sent61g) as f61g:
+            sent_at61g, selects61g = f61g.read().split()
+        took61g = round(exit61g - float(sent_at61g), 3) if exit61g else None
+        selects61g = int(selects61g)
+    except (OSError, ValueError):
+        took61g = selects61g = None  # the signal was never sent
+check("wait-for-enter-acts-within-its-step", rc61g == 128 + 15 and bool(selects61g) and took61g is not None
+      and took61g < WAIT_FAST, (rc61g, selects61g, took61g))
 # Enter and the end of the input end that wait as they did under input(): explain_and_wait
 # returns 1. Each is typed into the terminal before the program reads it.
 code61f = ("import importlib.machinery, importlib.util, sys\n"
