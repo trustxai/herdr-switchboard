@@ -147,6 +147,11 @@ What it has to get right, and how it fails otherwise:
 60. The run directory goes also when another process (the focus worker) writes into it during
    the removal, and a directory made under the same name afterwards is left alone. Once a close
    by signal starts, no rows are written and fzf is asked for no reload.
+61. --demo: a SIGTERM or SIGHUP at the message that waits for Enter ends the popup at once, and
+   the temporary state directory goes on a normal exit and on a SIGHUP or SIGTERM at any moment
+   from its creation, also when a signal cuts main's finally block short; a signal during the
+   removal at exit cuts nothing short, and that removal never takes another directory made under
+   the same name. The wait for Enter misses no signal, also one that lands just before it reads.
 
     python3 tests/test_switchboard.py
 """
@@ -4178,20 +4183,20 @@ block("58. a close waits for no read")
 CLOSE_FAST = 1.0  # s: a close used to take at least 2 s here (the wait for the read); now ~0.2 s
 
 
-def popup_in_pty(env, leader=True):
-    """Start the popup in a terminal with `env` added. leader=False: a parent leads the
-    terminal's session and outlives the popup. Returns (pid of the pty child, fd, d) where d
-    holds popup.pid and popup.rc (leader=False) once known."""
+def popup_in_pty(env, leader=True, args=()):
+    """Start the popup (with `args`) in a terminal with `env` added. leader=False: a parent
+    leads the terminal's session and outlives the popup. Returns (pid of the pty child, fd, d)
+    where d holds popup.pid and popup.rc (leader=False) once known."""
     d = tempfile.mkdtemp(prefix="pty58-", dir=_tmp_root)
     popup_pid, popup_rc = os.path.join(d, "popup.pid"), os.path.join(d, "popup.rc")
     pid, fd = _pty.fork()
     if pid == 0:
         os.environ.update(env)
         if leader:
-            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)] + list(args))
         inner = os.fork()
         if inner == 0:
-            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)])
+            os.execv(sys.executable, [sys.executable, "-B", str(TOOL)] + list(args))
         with open(popup_pid + ".tmp", "w") as f:
             f.write(str(inner))
         os.rename(popup_pid + ".tmp", popup_pid)
@@ -4408,8 +4413,9 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         release58.set()
         sb._STATE_CLOSED.discard(state58)
         sb.STATE_DIR = saved_state
-check("demo-closes-its-state-before-removing-it", "            close_state()  # a refresh that outlived the popup "
-      "writes nothing from here on\n            shutil.rmtree(STATE_DIR, ignore_errors=True)" in SOURCE)
+check("demo-closes-its-state-before-removing-it", "    close_state()\n    if _DEMO_STATE:\n"
+      "        remove_run_dir(STATE_DIR, _DEMO_STATE[0])" in SOURCE
+      and "            hold_signals()\n            remove_demo_state()\n" in SOURCE)
 
 # 59. No ps line the program matches is cut: ps cuts at $COLUMNS (fzf sets it for its
 # commands, and child_env() passes it on). With COLUMNS=20, a herdr remote-client-bridge and a
@@ -4575,10 +4581,208 @@ for leader in (True, False):
     check("no-reload-asked-of-fzf-once-the-close-starts-%s" % ("leading" if leader else "not-leading"),
           not late and rc == 128 + 15 and not left, (len(late), late[:3], rc, left))
 
-# In --demo the signal held during the close is acted on by main, after the temporary state
-# directory is gone too: popup() leaves it to main.
-check("demo-signals-released-after-the-state-dir", "    if not demo:\n        release_signals()" in SOURCE
-      and "            shutil.rmtree(STATE_DIR, ignore_errors=True)\n            release_signals()" in SOURCE)
+# In --demo, main removes the temporary state directory holding signals, and again at exit:
+# block 61 checks both ways out. (The popup itself releases them once the run directory is gone.)
+check("demo-state-dir-removed-in-main-and-at-exit", "        atexit.register(remove_demo_state_at_exit)" in SOURCE
+      and "            hold_signals()\n            remove_demo_state()\n            release_signals()" in SOURCE)
+
+# 61. --demo: a signal at the message that waits for Enter ends the popup at once, and the
+# temporary state directory goes on a normal exit and on a SIGHUP or SIGTERM. fzf refuses to
+# start when its socket path is too long (a run root of 100 characters more), the popup says
+# why and waits for Enter: a SIGTERM or SIGHUP there exits with its status within a second,
+# leading the session or not, and leaves nothing in the run root or in TMPDIR (where --demo
+# keeps its state). It used to be held until Enter. And a signal handled in main's finally
+# block before it holds signals (simulated: hold_signals raises the exit there, once) still
+# leaves no state directory: the removal runs again at exit. So does a signal at the directory's
+# creation, and one during the removal at exit.
+block("61. --demo: a signal at the prompt, and the state directory on the way out")
+PROMPT_FAST = 1.0  # s: it used to wait for Enter; now about 0.02 s
+
+
+def signal_at_the_prompt(sig, leader):
+    """(rc, seconds from the signal to the exit, what is left in the run root, in TMPDIR)."""
+    with tempfile.TemporaryDirectory(dir="/tmp") as d:
+        root = os.path.join(d, "r" * 100)
+        os.makedirs(root, 0o700)
+        tmpdir = private_tmp(d, "tmp")
+        env = dict(TERM="xterm-256color", SWITCHBOARD_RUN_ROOT=root, TMPDIR=tmpdir, HERDR_BIN_PATH="/bin/false")
+        pid, fd, pd = popup_in_pty(env, leader, args=("--demo",))
+        read_until(fd, lambda b: b"Enter" in b and os.path.exists(os.path.join(pd, "popup.pid")), 15)
+        prompt = bool(os.listdir(tmpdir))  # the state directory exists while the prompt waits
+        target = int(open(os.path.join(pd, "popup.pid")).read())
+        t0 = _time.time()
+        try:
+            os.kill(target, sig)
+        except ProcessLookupError:
+            pass  # it had already left: the checks below say so
+        rc, t_exit = popup_exit(pid, fd, pd, leader, 5)
+        took = (t_exit - t0) if t_exit else None
+        left = (sorted(os.listdir(root)), sorted(os.listdir(tmpdir)))
+        if rc is None:
+            os.write(fd, b"\r")  # the old behaviour: only Enter ends it
+            popup_exit(pid, fd, pd, leader, 5)
+        finish(pid, fd, 0)
+        shutil.rmtree(pd, ignore_errors=True)
+        return prompt, rc, took, left
+
+
+if fzf_real and not sb.dependency_problems(python=(3, 12, 0), fzf=fzf_real):
+    for sig, leader in ((_signal.SIGTERM, True), (_signal.SIGTERM, False), (_signal.SIGHUP, False)):
+        prompt, rc, took, left = signal_at_the_prompt(sig, leader)
+        check("demo-prompt-%s-%s-ends-at-once" % ("sigterm" if sig == _signal.SIGTERM else "sighup",
+                                                  "leading" if leader else "not-leading"),
+              prompt and rc == 128 + sig and took is not None and took < PROMPT_FAST and left == ([], []),
+              (prompt, rc, took, left))
+
+# The wait for Enter misses no signal. input() could: a SIGTERM that lands after its prompt is
+# written and before its read begins only marks the Python handler as due, and the read then
+# waits for Enter (a slow CI runner hit it at the check above). Simulated: the main thread blocks
+# SIGTERM, so the kernel hands it to another thread and the main thread's read is not
+# interrupted, which is what that window leaves too. The wait ends with 143 (in about 0.4 s,
+# 0.3 s of it the delay before the signal); input() still waits there after 5 s. And no
+# message calls input() any more.
+master61e, slave61e = os.openpty()
+try:
+    code61e = ("import importlib.machinery, importlib.util, os, signal, sys, threading, time\n"
+               "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+               "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+               "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+               "for s in (signal.SIGHUP, signal.SIGTERM):\n"
+               "    signal.signal(s, sb._exit_on_signal)\n"
+               "def later():\n"
+               "    time.sleep(0.3)\n"
+               "    os.kill(os.getpid(), signal.SIGTERM)\n"
+               "threading.Thread(target=later, daemon=True).start()\n"
+               "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
+               "sys.exit(sb.explain_and_wait(['a message']))\n")
+    try:
+        rc61e = subprocess.run([sys.executable, "-c", code61e, str(TOOL)], stdin=slave61e, stdout=slave61e,
+                               stderr=slave61e, timeout=5).returncode
+    except subprocess.TimeoutExpired:
+        rc61e = None  # still waiting for Enter
+finally:
+    os.close(slave61e)
+    os.close(master61e)
+check("wait-for-enter-misses-no-signal", rc61e == 128 + 15, rc61e)
+# Enter and the end of the input end that wait as they did under input(): explain_and_wait
+# returns 1. Each is typed into the terminal before the program reads it.
+code61f = ("import importlib.machinery, importlib.util, sys\n"
+           "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+           "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+           "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+           "sys.exit(sb.explain_and_wait(['a message']))\n")
+for name61f, typed61f in (("enter", b"\r"), ("end-of-input", b"\x04")):
+    master61f, slave61f = os.openpty()
+    try:
+        os.write(master61f, typed61f)
+        try:
+            rc61f = subprocess.run([sys.executable, "-c", code61f, str(TOOL)], stdin=slave61f, stdout=slave61f,
+                                   stderr=slave61f, timeout=5).returncode
+        except subprocess.TimeoutExpired:
+            rc61f = None
+    finally:
+        os.close(slave61f)
+        os.close(master61f)
+    check("wait-for-enter-ends-on-%s" % name61f, rc61f == 1, rc61f)
+check("no-message-waits-in-input", "input(tr(" not in SOURCE and SOURCE.count("wait_for_enter(tr(") == 3)
+
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    tmpdir = private_tmp(d, "tmp")
+    code61 = ("import importlib.machinery, importlib.util, signal, sys\n"
+              "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+              "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+              "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+              "real_hold, cut = sb.hold_signals, []\n"
+              "def cut_short():\n"
+              "    # main's finally block, the first time: the demo's directory exists by then\n"
+              "    if not cut and sys._getframe(1).f_code.co_name == 'main' and 'switchboard-demo-' in sb.STATE_DIR:\n"
+              "        cut.append(True)\n"
+              "        for s in (signal.SIGHUP, signal.SIGTERM):\n"
+              "            signal.signal(s, signal.SIG_IGN)\n"
+              "        raise SystemExit(128 + signal.SIGTERM)\n"
+              "    real_hold()\n"
+              "sb.hold_signals = cut_short\n"
+              "sys.exit(sb.main(['--demo', '--rows']))\n")
+    r61 = subprocess.run([sys.executable, "-c", code61, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, timeout=30, env=dict(os.environ, TMPDIR=tmpdir))
+    check("demo-state-dir-goes-when-a-signal-cuts-main-short", r61.returncode == 128 + 15 and os.listdir(tmpdir) == [],
+          (r61.returncode, os.listdir(tmpdir)))
+
+# The state directory from its very creation: a SIGTERM handled right after the mkdir inside
+# tempfile.mkdtemp (simulated: mkdtemp sends it to its own process before returning) waits
+# until the removal at exit is registered, then exits 143, and nothing is left. (CI has no
+# strace to inject it at the mkdir itself.) And the second removal, at exit, takes only the
+# directory this process created: one made under the same name once main's removal is done
+# (simulated in rmdir) is left alone, with what is in it.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    tmpdir = private_tmp(d, "tmp")
+    code61b = ("import importlib.machinery, importlib.util, os, signal, sys, tempfile, time\n"
+               "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+               "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+               "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+               "real = tempfile.mkdtemp\n"
+               "def signalled(*a, **kw):\n"
+               "    path = real(*a, **kw)\n"
+               "    os.kill(os.getpid(), signal.SIGTERM)\n"
+               "    time.sleep(0.2)\n"
+               "    return path\n"
+               "tempfile.mkdtemp = signalled\n"
+               "sys.exit(sb.main(['--demo', '--rows']))\n")
+    r61b = subprocess.run([sys.executable, "-c", code61b, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=30, env=dict(os.environ, TMPDIR=tmpdir))
+    check("demo-state-dir-goes-on-a-signal-at-its-creation", r61b.returncode == 128 + 15 and os.listdir(tmpdir) == [],
+          (r61b.returncode, os.listdir(tmpdir)))
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    tmpdir = private_tmp(d, "tmp")
+    code61c = ("import importlib.machinery, importlib.util, os, sys\n"
+               "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+               "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+               "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+               "real, made = os.rmdir, []\n"
+               "def rmdir_then_a_stranger(path, *a, **kw):\n"
+               "    result = real(path, *a, **kw)\n"
+               "    if not made and sb.STATE_DIR and not os.path.lexists(sb.STATE_DIR):\n"
+               "        made.append(True)\n"
+               "        os.mkdir(sb.STATE_DIR, 0o700)\n"
+               "        open(os.path.join(sb.STATE_DIR, 'theirs'), 'w').close()\n"
+               "    return result\n"
+               "os.rmdir = rmdir_then_a_stranger\n"
+               "sys.exit(sb.main(['--demo', '--rows']))\n")
+    r61c = subprocess.run([sys.executable, "-c", code61c, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL, timeout=30, env=dict(os.environ, TMPDIR=tmpdir))
+    kept = [n for n in os.listdir(tmpdir) if os.path.exists(os.path.join(tmpdir, n, "theirs"))]
+    check("demo-removal-at-exit-leaves-a-new-directory-of-the-same-name-alone", r61c.returncode == 0 and len(kept) == 1,
+          (r61c.returncode, os.listdir(tmpdir)))
+
+# A signal during the removal at exit (simulated: main's removal leaves the directory, and the
+# first removal at exit sends a SIGTERM to its own process) cuts nothing short: the exit is
+# under way with its status (0), the directory goes, and nothing is reported on stderr. Python
+# only reports a SystemExit raised in an exit hook, so the hook ignores both signals.
+with tempfile.TemporaryDirectory(dir="/tmp") as d:
+    tmpdir = private_tmp(d, "tmp")
+    code61d = ("import importlib.machinery, importlib.util, os, shutil, signal, sys, time\n"
+               "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
+               "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
+               "sb = importlib.util.module_from_spec(spec)\nloader.exec_module(sb)\n"
+               "real, exiting, sent = shutil.rmtree, [], []\n"
+               "def rmtree_at_exit(path, *a, **kw):\n"
+               "    if not exiting:\n"
+               "        return\n"
+               "    if not sent:\n"
+               "        sent.append(True)\n"
+               "        os.kill(os.getpid(), signal.SIGTERM)\n"
+               "        time.sleep(0.2)\n"
+               "    return real(path, *a, **kw)\n"
+               "shutil.rmtree = rmtree_at_exit\n"
+               "rc = sb.main(['--demo', '--rows'])\n"
+               "exiting.append(True)\n"
+               "sys.exit(rc)\n")
+    r61d = subprocess.run([sys.executable, "-c", code61d, str(TOOL)], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                          stderr=subprocess.PIPE, timeout=30, env=dict(os.environ, TMPDIR=tmpdir))
+    err61d = r61d.stderr.decode("utf-8", "replace")
+    check("demo-signal-during-the-removal-at-exit-cuts-nothing-short",
+          r61d.returncode == 0 and os.listdir(tmpdir) == [] and "Traceback" not in err61d
+          and "Exception ignored" not in err61d, (r61d.returncode, os.listdir(tmpdir), err61d[-300:]))
 
 sb.ssh_mux()
 check("ssh-sockets-under-the-test-root", sb._SSH_DIR and sb._SSH_DIR[0]
