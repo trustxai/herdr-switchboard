@@ -2365,19 +2365,21 @@ REMOVE_WAIT = 0.5  # seconds the removal of the run directory goes on while some
 
 
 def remove_run_dir(path, dir_fd):
-    """Remove the run directory, also when another process writes into it meanwhile.
+    """Remove a directory this process created and holds open: the popup's run directory, or
+    --demo's temporary state directory. Only while `path` is still that directory, the one
+    `dir_fd` refers to (held open since it was created, so its inode cannot be reused): a
+    directory made under the same name once it is gone is never touched, also when this is
+    called again later (--demo removes its state directory a second time at exit).
 
-    The focus worker can outlive the popup, and it writes its result file through a
-    descriptor of this directory whenever its focus is done. If that lands during a removal,
-    the final rmdir finds the directory not empty and the directory stays. So the removal is
-    repeated, for at most REMOVE_WAIT seconds, while `path` is still that directory: the one
-    `dir_fd` (held open since it was created, so its inode cannot be reused) refers to. Once
-    it is gone, nothing can be created in it: a write through a descriptor of a removed
+    Another process can write into the run directory meanwhile: the focus worker can outlive
+    the popup, and it writes its result file through a descriptor of this directory whenever
+    its focus is done. If that lands during a removal, the final rmdir finds the directory not
+    empty and the directory stays. So the removal is repeated, for at most REMOVE_WAIT seconds.
+    Once it is gone, nothing can be created in it: a write through a descriptor of a removed
     directory fails. True when it is gone."""
     end = time.time() + REMOVE_WAIT
     ours = os.fstat(dir_fd)
     while True:
-        shutil.rmtree(path, ignore_errors=True)
         try:
             st = os.lstat(path)
         except OSError:
@@ -2386,7 +2388,9 @@ def remove_run_dir(path, dir_fd):
             return True  # gone; what is there now is another directory
         if time.time() >= end:
             return False
-        time.sleep(0.01)
+        shutil.rmtree(path, ignore_errors=True)
+        if os.path.lexists(path):
+            time.sleep(0.01)
 
 
 def popup_closing():
@@ -3183,8 +3187,9 @@ def popup(self_cmd, demo=False):
                 writes.release()
             os.close(run_fd)
     # The run directory is gone: a signal held meanwhile acts now, and from here on one acts at
-    # once (the message below waits for Enter). In --demo, main removes the temporary state
-    # directory on the way out, whichever way that is.
+    # once (the message below waits for Enter). In --demo, main then removes the temporary state
+    # directory on the way out, and again at exit: on a normal exit, and on a SIGHUP or SIGTERM
+    # (not after a SIGKILL, or any other end that runs no exit hooks).
     release_signals()
     if proc.returncode == 2:
         # fzf refused its command line and drew nothing: say why instead of vanishing.
@@ -3231,14 +3236,30 @@ _HOLDING = [False]  # a close is under way: hold_signals() .. release_signals()
 _HELD = []  # the SIGHUP or SIGTERM that arrived meanwhile
 
 
+_DEMO_STATE = []  # in --demo: a descriptor of the temporary state directory, held until exit
+
+
 def remove_demo_state():
     """--demo's temporary state directory goes on the way out: from main's finally block, and
-    again at exit. A SIGHUP or SIGTERM handled in that block before hold_signals() raises there
-    and cuts the removal short; but it has set both signals to be ignored, so the second try,
-    at exit, runs whole. A refresh that outlived the popup writes nothing there once
+    again at exit (remove_demo_state_at_exit). A SIGHUP or SIGTERM handled in that block before
+    hold_signals() raises there and cuts the removal short; but it has set both signals to be
+    ignored, so the second try, at exit, runs whole. Each try removes only the directory this
+    process created (remove_run_dir, with the descriptor held since then), never another one
+    made under the same name. A refresh that outlived the popup writes nothing there once
     close_state() ran."""
     close_state()
-    shutil.rmtree(STATE_DIR, ignore_errors=True)
+    if _DEMO_STATE:
+        remove_run_dir(STATE_DIR, _DEMO_STATE[0])
+
+
+def remove_demo_state_at_exit():
+    """The second try, at exit, with SIGHUP and SIGTERM ignored. The exit is under way and its
+    status is set: a SystemExit raised in an exit hook is only reported, not obeyed, so a
+    signal could no longer end the popup with its own status; it could only cut this removal
+    short."""
+    for sig in (signal.SIGHUP, signal.SIGTERM):
+        signal.signal(sig, signal.SIG_IGN)
+    remove_demo_state()
 
 
 def _exit_on_signal(signum, frame):
@@ -3247,8 +3268,10 @@ def _exit_on_signal(signum, frame):
     sends SIGHUP right after SIGTERM, for example). For the same reason, during a close that
     already started (hold_signals(), once fzf has returned) a signal is only noted, and the
     popup's release_signals() acts on it once the run directory is gone; from then on a signal
-    acts at once again. In --demo the temporary state directory is removed on the way out,
-    held the same way in main's finally block, and again at exit (remove_demo_state)."""
+    acts at once again. In --demo signals are also held from the creation of the temporary
+    state directory until its removal at exit is registered, and while main's finally block
+    removes it; when that removal runs again at exit, both are ignored
+    (remove_demo_state_at_exit)."""
     if _HOLDING[0]:
         _HELD.append(signum)
         return
@@ -3289,9 +3312,14 @@ def main(argv):
     if demo:
         argv = argv[1:]
         DEMO = Demo()
-        # Nothing of the demo is written outside a temporary directory.
+        # Nothing of the demo is written outside a temporary directory. From its creation on,
+        # a SIGHUP or SIGTERM waits until its removal at exit is registered; the directory is
+        # held open, so that removal can only ever take this one.
+        hold_signals()
         STATE_DIR = tempfile.mkdtemp(prefix="switchboard-demo-")
-        atexit.register(remove_demo_state)
+        _DEMO_STATE.append(os.open(STATE_DIR, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_NOFOLLOW))
+        atexit.register(remove_demo_state_at_exit)
+        release_signals()
     self_cmd = " ".join(shlex.quote(x) for x in (sys.executable, os.path.abspath(__file__)))
     if demo:
         self_cmd += " --demo"

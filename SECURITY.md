@@ -149,9 +149,19 @@ open, so a new directory under the same name cannot be taken for it); nothing in
 writes there for that long, and once the directory is gone nothing can be created in it any
 more. A SIGHUP or SIGTERM that arrives once the close has started waits until the directory is
 gone, then ends the popup with its usual status; from then on one ends it at once, also while a
-message waits for Enter. In `--demo` the temporary state directory is removed on the way out,
-whichever way that is: a signal that cuts that removal short has already turned SIGHUP and
-SIGTERM off, and the removal runs again, whole, at exit.
+message waits for Enter. In `--demo` the temporary state directory is removed when the popup
+exits normally, and when a SIGHUP or SIGTERM that arrives at any moment from the directory's
+creation on ends it: one that arrives while it is being created waits until its removal at exit
+is in place, and one that cuts main's removal short has already turned SIGHUP and SIGTERM off,
+so the removal runs again, whole, at exit. One that arrives once main's removal is done and the
+popup is already exiting changes nothing: the removal at exit ignores SIGHUP and SIGTERM. Each
+removal takes only the directory that process created, which it keeps open; a directory made
+under the same name afterwards is left alone. A process killed with SIGKILL, or one that ends
+without running its exit hooks, removes nothing. That includes a command `--demo` runs under
+fzf, which has a state directory of its own: fzf kills a preview it replaces with SIGKILL, so a
+preview killed in the few milliseconds between creating its state directory and removing it
+leaves that directory behind (quick cursor moves in `--demo` did not hit it in about 1,200
+tries).
 
 The popup also closes this way when its window or session goes away: SIGHUP and SIGTERM exit
 through the same cleanup, which ends the popup's own fzf and removes the run directory (and, for
