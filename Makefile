@@ -11,8 +11,12 @@ PYTHON ?= python3
 PROGRAM := bin/switchboard
 TESTS := tests/test_switchboard.py
 # Named, not globbed: a missing program or test file makes compile and ruff fail. The
-# converter behind the README images is checked the same way.
-SOURCES := $(PROGRAM) $(sort $(TESTS) $(wildcard tests/*.py)) docs/ansi2html.py
+# converter behind the README images and the scripts behind the demo video are checked the
+# same way.
+# The scripts behind the demo video, and their tests (standard library only, no ffmpeg).
+VIDEO_SCRIPTS := docs/video/check.py docs/video/el.py docs/video/schedule.py docs/video/test_video.py
+VIDEO_TESTS := docs/video/test_video.py
+SOURCES := $(PROGRAM) $(sort $(TESTS) $(wildcard tests/*.py)) docs/ansi2html.py $(VIDEO_SCRIPTS)
 # bash scripts (bash -n) and POSIX sh scripts (sh -n).
 SCRIPTS := $(wildcard .github/scripts/*.sh)
 SH_SCRIPTS := docs/render.sh
@@ -46,7 +50,7 @@ FIND_PYCACHE := find . -path ./.git -prune -o -path ./.venv -prune -o -name __py
 .PHONY: help check test lint compile ruff scripts pycache secrets clean
 
 help:
-	@echo "make test     run the test suite ($(PYTHON) $(TESTS))"
+	@echo "make test     run the test suites ($(PYTHON) $(TESTS) $(VIDEO_TESTS))"
 	@echo "make lint     byte-compile, ruff, shell syntax, no bytecode left behind"
 	@echo "make secrets  scan the whole git history with gitleaks"
 	@echo "make check    all of the above: what CI runs"
@@ -58,6 +62,7 @@ check: test lint secrets
 
 test:
 	$(PYTHON) $(TESTS)
+	$(PYTHON) $(VIDEO_TESTS)
 
 lint: compile ruff scripts pycache
 
