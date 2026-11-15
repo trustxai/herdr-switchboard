@@ -22,7 +22,7 @@ The last step, ffmpeg's `loudnorm`, has no file of its own: it is one command.
 
 ## What you need
 
-The versions are the ones the published video was made with.
+The versions are the ones the launch video was made with.
 
 | Tool | Version | For |
 | --- | --- | --- |
@@ -44,7 +44,7 @@ Inter and JetBrains Mono from Google Fonts, so a render needs the network.
 
 - **The ElevenLabs API key** goes in `~/.config/elevenlabs/api_key`, alone on one line, readable
   only by you (`chmod 600`). It never goes in the repository, and `el.py` never prints it.
-- **`ELEVENLABS_VOICE_ID` is required.** The published video uses the voice of the person who
+- **`ELEVENLABS_VOICE_ID` is required.** The launch video uses the voice of the person who
   recorded it, and that voice is not part of this repository. Set it to any voice your account
   can use; `python3 el.py voices` lists them.
 - **One batch uses about 335 characters** of the plan (the eight lines). `python3 el.py user`
@@ -96,12 +96,12 @@ any directory.
 `python3 check.py all` runs the four checks below on `out/terminal.mp4` and
 `out/switchboard-demo.mp4`, prints what each measured, and exits with 1 when one fails. Each
 also takes a file of your choice: `python3 check.py narration other.mp4`. The figures in
-brackets are those of the published video.
+brackets are those of the launch video.
 
 - **`footage`: the VHS output lasts as long as the tape.** It adds up the visible part of
   `demo.tape` (each `Sleep`, and one typing delay per typed character and per key) and compares
   it with the length of `out/terminal.mp4`, within 0.15 s. [25.16 s against 25.17 s.] A shorter
-  file means VHS dropped frames: the same tape at 1920×930 and 30 fps came out at 24.76 s. Every
+  file means VHS dropped frames: the same keys at 1920×930 and 30 fps came out at 24.76 s. Every
   beat in `schedule.py` is a time in that file, so lower the frame rate or the size and record
   again before going on.
 - **`sheet`: a contact sheet to look at.** `out/sheet.png` holds a frame from the middle of the
@@ -121,8 +121,9 @@ brackets are those of the published video.
 - **What happens on screen:** edit `demo.tape`, then the `BEATS` of `schedule.py` (times in
   `out/terminal.mp4`; the comments in the tape give them) and, in `remotion/src/Demo.jsx`, the
   entries of `SHOTS`, `BOX_DEFS` and `CAPTION_TEXT`, one per beat.
-- **What is said:** edit `voice/spec.json` and run steps 2 to 6 again. Each beat stretches to
-  fit its line, so nothing else has to change.
+- **What is said:** edit the text of a line in `voice/spec.json` (and its caption in
+  `CAPTION_TEXT`, if they should match), then run steps 2 to 6 again. Each beat stretches to fit
+  its line, so the timing needs no change.
 
 ## Licences
 

@@ -9,7 +9,7 @@
 
 The API key is read from ~/.config/elevenlabs/api_key and is never printed. The voice is
 ELEVENLABS_VOICE_ID, which `batch` requires: it is not in the spec, because the voice of the
-published video belongs to whoever recorded it. Relative paths are taken from docs/video, so
+launch video belongs to whoever recorded it. Relative paths are taken from docs/video, so
 the script works from any directory.
 """
 import json
