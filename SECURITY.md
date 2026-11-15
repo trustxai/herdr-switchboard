@@ -273,7 +273,10 @@ machine's row* above).
 
 The helper tells the popup when it is ready (one line on its output); until then, Enter takes the
 focus path, and so it does when the helper never says so: no herdr window in Ghostty on that Mac,
-a Mac that cannot be reached, or a helper of an older version.
+herdr keys there that differ from `[jump]`'s (the helper says that instead, and the footer
+repeats it), a Mac that cannot be reached, or a helper of an older version. The popup gives the
+helper eight seconds from its start (ssh's `ConnectTimeout` plus three) to say either; after
+that, Enter takes the focus path at once.
 
 **Which Mac.** If `[jump] client` is set, that ssh target is the Mac (`local` means the server
 itself), and nothing is detected. Otherwise Switchboard looks for it:
@@ -294,12 +297,19 @@ itself), and nothing is detected. Otherwise Switchboard looks for it:
 
 - `herdr plugin list --json` (through `[remote] herdr`), to find where the plugin is installed
   there, unless `[jump] helper` gives the command;
-- the plugin's own helper, `python3 <plugin directory>/bin/switchboard --jump-server`. It finds
-  the terminal of a herdr window on that Mac that runs in Ghostty (`ps`: a herdr process with a
-  terminal and Ghostty among its parent processes). Without one it exits at once, starting
-  nothing, so AppleScript is never pointed at a Ghostty that is not running or not installed.
-  With one, it starts `osascript`, prints that it is ready, and waits for one line with the
-  chosen row; a line that is not exactly the nine string arguments it expects is dropped. Then
+- the plugin's own helper, `python3 <plugin directory>/bin/switchboard --jump-server <keys>`,
+  where `<keys>` is the text it would type to open the navigator (`[jump] prefix` and `goto`,
+  then `/`, in the closed set below). It finds the terminal of a herdr window on that Mac that
+  runs in Ghostty (`ps`: a herdr process with a terminal, no subcommand on its command line, and
+  Ghostty among its parent processes; with several, the one whose terminal got input last, and
+  none when that cannot be told). Without one it exits at once, starting nothing, so AppleScript
+  is never pointed at a Ghostty that is not running or not installed. Then it reads that Mac's
+  herdr config (`$HERDR_CONFIG_PATH`, else `$XDG_CONFIG_HOME/herdr/config.toml`, else
+  `~/.config/herdr/config.toml`; only its `[keys] prefix` and `goto`, herdr's defaults when
+  there is no file) and, when those are not `<keys>`, or the file cannot be read, says so and
+  exits, starting nothing. Otherwise it starts `osascript`, prints that it is ready, and waits
+  for one line with the chosen row; a line that is not exactly the nine string arguments it
+  expects is dropped. Then
   it uses AppleScript to send keystrokes to the Ghostty terminal on that tty:
   herdr's prefix and navigator key (`[jump] prefix` and `goto`, by default `ctrl+b` and `g`,
   herdr's own defaults), `/` (which focuses the navigator's search), a query that matches only
@@ -321,8 +331,9 @@ extra Enter):
 - the query may hold only `a-z 0-9 : . _ -` and space, and the tty must look like `/dev/<name>`
   (ASCII letters, digits, `_` and `.`).
 
-The helper checks all of that before it renames or types anything. When something is refused
-(or, for a jump started without the waiting helper, there is no herdr window in Ghostty), it
+The helper checks all of that, and the keys against that Mac's herdr config again, before it
+renames or types anything. When something is refused (or, for a jump started without the
+waiting helper, there is no herdr window in Ghostty), it
 renames nothing, types nothing, stops the waiting `osascript` and only asks herdr to focus the
 pane. Once it has renamed the pane, the original name comes back and the focus is sent whatever
 happens to the typing: `osascript` timing out
@@ -342,8 +353,9 @@ from the system, not from your herdr configuration. So:
 - give the server a key of its own for this, and restrict it in the Mac's `authorized_keys`
   (for example with a `from=` option);
 - set `[jump] prefix` and `goto` to your herdr `[keys] prefix` and `goto` when they are not
-  herdr's defaults: otherwise the keystrokes land in the pane you are on, and the final Enter
-  sends them there.
+  herdr's defaults. The helper refuses to type when they differ from what it reads in that Mac's
+  herdr config; if herdr reads its config from somewhere else there, keystrokes with the wrong
+  keys land in the pane you are on, and the final Enter sends them there.
 
 With the jump off (by `enabled = false` or by a refused key), or when anything it needs is
 missing, Switchboard only focuses the pane through herdr on that pane's machine.

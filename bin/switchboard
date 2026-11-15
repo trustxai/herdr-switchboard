@@ -158,8 +158,9 @@ STRINGS = {
                              " often older than %s.",
         "press_enter": "Press Enter to close. ",
         "demo_would": "demo: would run `herdr %s`",
-        "demo_jump_off": "demo: the cross-machine jump is off, so the pane would be ready on %s"
+        "demo_jump_off": "demo: the demo never jumps between machines; the pane would be ready on %s"
                          " when you switch to that machine",
+        "jump_keys_differ": "no jump: set [jump] prefix and goto to this window's herdr keys",
         "demo_nothing": "demo: nothing selected",
         "colors_rejected": "fzf rejected the colours in the config, so the defaults are in use",
         "fzf_failed": "fzf could not start: %s",
@@ -238,8 +239,9 @@ STRINGS = {
                              " anteriores a %s.",
         "press_enter": "Enter para cerrar. ",
         "demo_would": "demo: correría `herdr %s`",
-        "demo_jump_off": "demo: el salto entre máquinas está apagado, así que la pane quedaría"
-                         " lista en %s cuando pases a esa máquina",
+        "demo_jump_off": "demo: la demo nunca salta entre máquinas; la pane quedaría lista en %s"
+                         " cuando pases a esa máquina",
+        "jump_keys_differ": "sin salto: poné en [jump] prefix y goto las teclas de herdr de esta ventana",
         "demo_nothing": "demo: no se eligió nada",
         "colors_rejected": "fzf rechazó los colores de la config, así que se usan los de por defecto",
         "fzf_failed": "fzf no pudo arrancar: %s",
@@ -1739,9 +1741,10 @@ def enter(row_id, run_dir=None):
     """fzf's Enter when other machines are saved (`--enter`, through transform).
 
     A row of this machine is accepted as usual. So is a row of another machine when the jump
-    is on and the popup's link to the window's Mac is ready (jump_ready): the popup closes and
+    is on and the popup's link to the window's Mac is ready (jump_wait): the popup closes and
     the jump goes. Otherwise, which is also what happens when the jump cannot happen (no herdr
-    window in Ghostty on a Mac, a Mac that does not answer over ssh), the focus path:
+    window in Ghostty on a Mac, a Mac that does not answer over ssh, or that window's herdr
+    keys differ from [jump]'s, which the footer then says), the focus path:
     everything that must survive an Esc happens here, before fzf handles another key: the
     tab is recorded as seen, and a worker that does the focus is started in its own session,
     so neither fzf exiting nor the popup closing can stop it. Then it prints fzf actions at
@@ -1762,8 +1765,10 @@ def enter(row_id, run_dir=None):
         sys.stdout.write("accept\n")
         return 0
     run_fd = open_private_dir(run_dir or os.environ.get("SWITCHBOARD_RUN_DIR"))
+    state = ""
     try:
-        if JUMP_ENABLED and jump_ready(run_fd):
+        state = jump_wait(run_fd) if JUMP_ENABLED else ""
+        if state == "ready":
             sys.stdout.write("accept\n")
             return 0
         record_ack(target, run_fd)
@@ -1782,7 +1787,7 @@ def enter(row_id, run_dir=None):
         if run_fd is not None:
             os.close(run_fd)
     label = machine_labels().get(target["machine"]) or target["machine"]
-    actions = [fzf_action("change-footer", tr("remote_focusing", label))]
+    actions = [fzf_action("change-footer", tr("remote_focusing", label) + keys_note(state))]
     if name:
         self_cmd = " ".join(shlex.quote(x) for x in me)
         actions.append(fzf_action("bg-transform-footer", "%s --focus-wait %s %s"
@@ -1829,23 +1834,29 @@ def focus_wait(name, row_id):
     once, at the start, while the popup owns it, and only a regular file is read, never
     through a symlink. Its deadline is herdr_on_bound() of the remote timeout, the longest
     the worker's herdr_on() can take (the worker passes no profile, so that includes its
-    `herdr machine list`)."""
+    `herdr machine list`). When the jump did not happen because the window's herdr keys
+    differ from [jump] (the link's state is "keys"), the footer keeps saying so."""
     target = parse_id(row_id)
     label = (machine_labels().get(target["machine"]) or target["machine"]) if target else ""
     dir_fd = open_private_dir(os.environ.get("SWITCHBOARD_RUN_DIR")) if RESULT_NAME.fullmatch(name) else None
     deadline = time.time() + herdr_on_bound(REMOTE_TIMEOUT)
+    text = ""
     try:
-        while dir_fd is not None and time.time() < deadline:
+        while dir_fd is not None and time.time() < deadline and not text:
             text = clean((read_small(dir_fd, name) or "").strip())
-            if text:
-                sys.stdout.write(text + "\n")
-                return 0
-            time.sleep(0.05)
+            if not text:
+                time.sleep(0.05)
+        note = keys_note(jump_state(dir_fd))
     finally:
         if dir_fd is not None:
             os.close(dir_fd)
-    sys.stdout.write(tr("remote_failed", label) + "\n")
+    sys.stdout.write((text or tr("remote_failed", label)) + note + "\n")
     return 0
+
+
+def keys_note(state):
+    """What the footer adds when the jump did not happen because of the keys, else ""."""
+    return " · " + tr("jump_keys_differ") if state == "keys" else ""
 
 
 ANSI = re.compile(r"\x1b\[[0-9;:?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
@@ -2283,7 +2294,8 @@ def select_view(row_id, tty="/dev/tty"):
 TAILSCALE = ("tailscale", "/usr/local/bin/tailscale", "/Applications/Tailscale.app/Contents/MacOS/Tailscale")
 SSH = os.environ.get("SWITCHBOARD_SSH", "ssh")
 OSASCRIPT = os.environ.get("SWITCHBOARD_OSASCRIPT", "osascript")
-SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"]
+SSH_CONNECT_TIMEOUT = 5  # seconds
+SSH_OPTS = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=%d" % SSH_CONNECT_TIMEOUT]
 
 
 # ssh appends "/ssh-" and a 40-character hash to the directory, and a unix socket path is
@@ -2571,9 +2583,24 @@ def answers_as_mac(host):
     return bool(argv) and run_out(argv, timeout=8).strip() == "Darwin"
 
 
-# herdr's subcommands that are not a window, as the first argument of a herdr process.
-HERDR_NOT_A_WINDOW = ("server", "remote-client-bridge", "api", "agent", "pane", "tab", "machine", "status", "plugin")
+# The options of herdr's window (its TUI client) that take a value. Any other word on a herdr
+# command line that is not an option is a subcommand (agent, pane, server, ...): a CLI call.
+HERDR_WINDOW_VALUE_OPTIONS = ("--remote", "--session", "--machine", "--remote-session")
 ANCESTORS_MAX = 64  # parent links ghostty_tty follows at most
+
+
+def herdr_window(words):
+    """True when this split command line is herdr's window: `herdr` with options only, such as
+    `herdr --remote server` or `herdr --session work`. A subcommand anywhere makes it a CLI
+    call, not a window: `herdr server`, `herdr --machine server agent list`."""
+    if not words or os.path.basename(words[0]) != "herdr":
+        return False
+    i = 1
+    while i < len(words):
+        if not words[i].startswith("-"):
+            return False
+        i += 2 if words[i] in HERDR_WINDOW_VALUE_OPTIONS else 1
+    return True
 
 
 def _is_ghostty(command):
@@ -2583,14 +2610,25 @@ def _is_ghostty(command):
     return bool(words) and os.path.basename(words[0]).lower() == "ghostty"
 
 
-def ghostty_tty(ps_text=None):
-    """The tty of a herdr window on this machine that runs in Ghostty, or None.
+def tty_atime(tty):
+    """When the terminal last got input: its access time, which is what `w` reads as idle
+    time. None when it cannot be read."""
+    try:
+        return os.stat(tty).st_atime
+    except OSError:
+        return None
 
-    The window is a herdr process with a terminal whose first argument is none of herdr's
-    other subcommands; Ghostty must be one of its ancestors (by parent pid), because the jump
-    types through Ghostty's AppleScript. A herdr window in another terminal, or inside tmux
-    (whose server is not below Ghostty), gives None: nothing is typed, osascript never asks
-    for an application that is not there or not running, and Enter takes the focus path.
+
+def ghostty_tty(ps_text=None, atime=tty_atime):
+    """The tty of the herdr window on this machine that runs in Ghostty, or None.
+
+    A window is herdr_window(), on a terminal; Ghostty must be one of its ancestors (by parent
+    pid), because the jump types through Ghostty's AppleScript. A herdr window in another
+    terminal, or inside tmux (whose server is not below Ghostty), does not count: nothing is
+    typed, osascript never asks for an application that is not there or not running, and
+    Enter takes the focus path. With several such windows, the one whose terminal got input
+    last, which is the one that opened the popup; None when that cannot be told (a tie, or a
+    terminal it cannot read), rather than typing into the other one.
     ps_text is `ps -axo pid=,ppid=,tty=,command=`."""
     ps_text = ps_text if ps_text is not None else run_out(["ps", "-ww", "-axo", "pid=,ppid=,tty=,command="])
     procs = {}
@@ -2598,20 +2636,27 @@ def ghostty_tty(ps_text=None):
         parts = line.split(None, 3)
         if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
             procs[int(parts[0])] = (int(parts[1]), parts[2], parts[3])
+    ttys = []
     for pid in sorted(procs):
         ppid, tty, command = procs[pid]
-        words = command.split()
-        window = os.path.basename(words[0]) == "herdr" and tty not in ("??", "?") \
-            and not (len(words) > 1 and words[1] in HERDR_NOT_A_WINDOW)
-        if not window:
+        if tty in ("??", "?") or not herdr_window(command.split()):
             continue
         seen = set()
         while ppid in procs and ppid not in seen and len(seen) < ANCESTORS_MAX:
             seen.add(ppid)
             if _is_ghostty(procs[ppid][2]):
-                return tty if tty.startswith("/dev/") else "/dev/" + tty
+                path = tty if tty.startswith("/dev/") else "/dev/" + tty
+                if path not in ttys:
+                    ttys.append(path)
+                break
             ppid = procs[ppid][0]
-    return None
+    if len(ttys) <= 1:
+        return ttys[0] if ttys else None
+    stamped = [(atime(t), t) for t in ttys]
+    if any(when is None for when, _ in stamped):
+        return None
+    stamped.sort(reverse=True)
+    return stamped[0][1] if stamped[0][0] != stamped[1][0] else None
 
 
 IDLE_TIMEOUT = 6  # seconds for one HIDIdleTime probe (a single ioreg, over ssh or not)
@@ -2758,12 +2803,13 @@ def jump(label, kind, pane, tab, query, rename, old_label, keys=None, wait=0.15,
     started and waiting for the script on stdin.
 
     What it would type is checked before anything changes. With keys, a query or a tty
-    outside their closed sets, or no herdr window in Ghostty to type into, nothing is renamed
+    outside their closed sets, keys this machine's herdr does not bind to its prefix and
+    navigator (window_keys_match), or no herdr window in Ghostty to type into, nothing is renamed
     or typed and only the API focus goes out (the popup sent one already: the pane is ready
     on its machine). A rename that had to be undone after a refused script would leave the
     pane with the temporary name."""
     keys = keys or JUMP_KEYS
-    refused = not typeable(query, keys)
+    refused = not typeable(query, keys) or not window_keys_match(keys)
     tty = None if refused else (tty or ghostty_tty())
     script = None
     if tty:
@@ -2826,14 +2872,98 @@ def jump_argv(target, label, entries):
 
 
 JUMP_READY = "switchboard-jump-ready"  # the line --jump-server prints once it can type
+JUMP_KEYS_DIFFER = "switchboard-jump-keys-differ"  # ...or once it found the keys would not open the Goto
+HERDR_DEFAULT_KEYS = ("ctrl+b", "prefix+g")  # herdr's own [keys] prefix and goto (herdr 0.9.5)
 
 
-def jump_server(stdin=None, stdout=None):
-    """--jump-server: runs on the Mac of the window from the moment the popup opens.
+def herdr_config_path(env=None):
+    """herdr's config.toml on this machine, where herdr 0.9.5 reads it: $HERDR_CONFIG_PATH, else
+    $XDG_CONFIG_HOME/herdr/config.toml, else ~/.config/herdr/config.toml."""
+    env = os.environ if env is None else env
+    if env.get("HERDR_CONFIG_PATH"):
+        return env["HERDR_CONFIG_PATH"]
+    home = env.get("HOME") or os.path.expanduser("~")
+    return os.path.join(env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "herdr", "config.toml")
 
-    With a herdr window in Ghostty (ghostty_tty), it gets its tty and an osascript ready,
-    prints JUMP_READY, and waits for one line with the jump's arguments. Only after that line
-    does the popup let Enter jump; without it, Enter takes the focus path. With no such
+
+def _keys_table(text):
+    """{prefix, goto} as far as herdr's [keys] table sets them, for a Python without tomllib.
+    parse_toml_subset refuses a whole herdr config (its [[keys.command]] blocks, arrays), so
+    this reads only the lines of [keys], with the same string reader; every other table and
+    every other key is skipped. None when a prefix or goto line, or a table header, cannot
+    be read."""
+    keys, table = {}, None
+    for n, line in enumerate(text.split("\n"), 1):
+        s = line.rstrip("\r").strip(" \t")
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("["):
+            if "]" not in s:
+                return None  # a broken header: herdr would not read this file either
+            table = None if s.startswith("[[") else s[1:s.index("]")].strip(" \t")
+            continue
+        if table != "keys":
+            continue
+        try:
+            key, i = _key(s, 0, n)
+        except ConfigError:
+            continue
+        if key not in ("prefix", "goto"):
+            continue
+        i = _skip(s, i)
+        try:
+            if s[i:i + 1] != "=" or _skip(s, i + 1) >= len(s):
+                return None
+            value, i = _value(s, _skip(s, i + 1), n)
+        except ConfigError:
+            return None
+        if not _comment_only(s, i) or not isinstance(value, str):
+            return None
+        keys[key] = value
+    return keys
+
+
+def herdr_keys(text):
+    """(prefix, goto) of a herdr config.toml, herdr's defaults for what it does not set; None
+    when they cannot be read, and then the keys cannot be confirmed."""
+    if tomllib is not None:
+        try:
+            keys = tomllib.loads(text).get("keys", {})
+        except ValueError:
+            return None
+    else:
+        keys = _keys_table(text)
+    if not isinstance(keys, dict):
+        return None
+    prefix, goto = keys.get("prefix", HERDR_DEFAULT_KEYS[0]), keys.get("goto", HERDR_DEFAULT_KEYS[1])
+    return (prefix, goto) if isinstance(prefix, str) and isinstance(goto, str) else None
+
+
+def window_keys_match(keys, path=None):
+    """True when `keys`, the Ghostty text the jump types (JUMP_KEYS: [jump] prefix, goto, /),
+    is what this machine's herdr binds to its prefix and navigator, so the Goto opens instead
+    of the keys landing in a pane. Read from herdr's config.toml here (the window's herdr
+    resolves the keys, not the server's); no file means herdr's defaults. False when the
+    file cannot be read, or binds keys the jump could not type."""
+    try:
+        with open(path or herdr_config_path(), "rb") as f:
+            text = f.read().decode("utf-8")
+    except FileNotFoundError:
+        text = ""
+    except (OSError, ValueError):
+        return False
+    got = herdr_keys(text)
+    return got is not None and goto_keys(got[0].lower(), got[1]) == keys
+
+
+def jump_server(stdin=None, stdout=None, keys=None):
+    """--jump-server [KEYS]: runs on the Mac of the window from the moment the popup opens.
+
+    With a herdr window in Ghostty (ghostty_tty) whose herdr binds KEYS (the keys the popup
+    will have typed, window_keys_match), it gets the tty and an osascript ready, prints
+    JUMP_READY, and waits for one line with the jump's arguments. Only after JUMP_READY does
+    the popup let Enter jump. With keys that differ it prints JUMP_KEYS_DIFFER instead and
+    exits, starting nothing: Enter takes the focus path and its footer says why. With no such
     window it exits at once, printing nothing and starting nothing. On EOF with nothing (a
     row of the popup's own machine was picked, or Esc), it exits."""
     stdin = stdin or sys.stdin
@@ -2841,13 +2971,22 @@ def jump_server(stdin=None, stdout=None):
     tty = ghostty_tty()
     if not tty:
         return 0
-    osa = subprocess.Popen([OSASCRIPT, "-"], stdin=subprocess.PIPE,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env())
+    if keys is not None and not window_keys_match(keys):
+        say = JUMP_KEYS_DIFFER
+    else:
+        say = JUMP_READY
+    osa = None
+    if say == JUMP_READY:
+        osa = subprocess.Popen([OSASCRIPT, "-"], stdin=subprocess.PIPE,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env())
     try:
-        stdout.write(JUMP_READY + "\n")
+        stdout.write(say + "\n")
         stdout.flush()
     except (OSError, ValueError):  # the popup is gone
-        osa.kill()
+        say = None
+    if say != JUMP_READY:
+        if osa is not None:
+            osa.kill()
         return 0
     line = stdin.readline()
     try:
@@ -2865,28 +3004,35 @@ def jump_server(stdin=None, stdout=None):
 
 JUMP_STATE = "jump"  # in the run directory: the link's state, for --enter (jump_state)
 JUMP_ENTER_WAIT = 2.0  # seconds --enter waits for a link that is still being set up
-READY_LINES = 20  # lines the link reads at most for JUMP_READY (a shell profile may print first)
+READY_LINES = 20  # lines the link reads at most for the helper's word (a shell profile may print first)
+# Seconds the link gives the helper, from its start, to say JUMP_READY or JUMP_KEYS_DIFFER:
+# ssh's connect timeout plus the helper's own start (Python, ps, osascript). One that says
+# neither in time (an older helper never does) settles the link as not ready, so no later
+# Enter waits for it.
+READY_WAIT = SSH_CONNECT_TIMEOUT + 3
 
 
 def jump_state(dir_fd):
     """The link's state in the run directory `dir_fd`: "pending" while it is being set up,
-    "ready" once the helper on the Mac said it can type, "" otherwise (no link, no herdr
-    window in Ghostty, a Mac that cannot be reached, or a helper that ended)."""
+    "ready" once the helper on the Mac said it can type, "keys" when it said the window's
+    herdr keys differ from [jump]'s, "" otherwise (no link, no herdr window in Ghostty, a Mac
+    that cannot be reached, a helper that said nothing in time, or one that ended)."""
     text = (read_small(dir_fd, JUMP_STATE, 64) or "").strip() if dir_fd is not None else ""
-    return text if text in ("pending", "ready") else ""
+    return text if text in ("pending", "ready", "keys") else ""
 
 
-def jump_ready(dir_fd, wait=None):
-    """--enter's question: may Enter on another machine's row jump? While the link is still
-    being set up it waits for it, at most JUMP_ENTER_WAIT seconds: a Mac that does not answer
-    fails only at ssh's ConnectTimeout, and resolve_helper allows its ssh 10 s. Once the link
-    has settled, either way, it answers at once."""
+def jump_wait(dir_fd, wait=None):
+    """--enter's question: may Enter on another machine's row jump? The link's state, once
+    settled: "ready" means yes. While the link is still being set up it waits for it, at most
+    JUMP_ENTER_WAIT seconds: a Mac that does not answer fails only at ssh's ConnectTimeout,
+    and resolve_helper allows its ssh 10 s. Once the link has settled, either way, it answers
+    at once."""
     deadline = time.time() + (JUMP_ENTER_WAIT if wait is None else wait)
     state = jump_state(dir_fd)
     while state == "pending" and time.time() < deadline:
         time.sleep(0.02)
         state = jump_state(dir_fd)
-    return state == "ready"
+    return state
 
 
 class JumpLink:
@@ -2947,12 +3093,13 @@ class JumpLink:
         if not self.client:
             return
         if self.client[0] == "local":
-            argv = [sys.executable, os.path.abspath(__file__), "--jump-server"]
+            argv = [sys.executable, os.path.abspath(__file__), "--jump-server", JUMP_KEYS]
         else:
             self.command = self.helper(self.client[1])
             if not self.command:
                 return  # nothing to run there: the API focus is all there is
-            argv = ssh_argv(self.client[1], self.command + " --jump-server")
+            # The keys go along so the helper can check them against the window's herdr.
+            argv = ssh_argv(self.client[1], self.command + " --jump-server " + shlex.quote(JUMP_KEYS))
             if not argv:
                 return
         self.proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -2965,29 +3112,49 @@ class JumpLink:
             self.proc = None
         finally:
             self.started.set()
+        final = ""  # the state once the helper is done: "keys" stays, so the footer can say why
         try:
-            if self.proc is not None and self._said_ready():
+            said = self._said() if self.proc is not None else None
+            if said == JUMP_KEYS_DIFFER:
+                final = "keys"
+            elif said == JUMP_READY:
                 self.was_up = True
                 self.up.set()
                 self._mark("ready")
-                while self.proc.stdout.read1(65536):  # until the helper ends
+                fd = self.proc.stdout.fileno()
+                while os.read(fd, 65536):  # until the helper ends
                     pass
         except Exception:
             pass
         finally:
             self.up.clear()
-            self._mark("")
+            self._mark(final)
 
-    def _said_ready(self):
-        """True once the helper prints JUMP_READY among its first READY_LINES lines; False when
-        it ends or prints something else."""
-        for _ in range(READY_LINES):
-            line = self.proc.stdout.readline(256)
-            if not line:
-                return False
-            if line.strip() == JUMP_READY.encode():
-                return True
-        return False
+    def _said(self):
+        """The helper's word, JUMP_READY or JUMP_KEYS_DIFFER, if it says one among its first
+        READY_LINES lines within READY_WAIT seconds of its start; None when it ends, says
+        something else, or takes longer (then the link settles as not ready)."""
+        fd = self.proc.stdout.fileno()
+        deadline = time.time() + READY_WAIT
+        buf, lines = b"", 0
+        while lines < READY_LINES and len(buf) <= 4096:
+            left = deadline - time.time()
+            if left <= 0:
+                return None
+            readable, _, _ = select.select([fd], [], [], left)
+            if not readable:
+                continue
+            data = os.read(fd, 4096)
+            if not data:
+                return None
+            buf += data
+            while b"\n" in buf and lines < READY_LINES:
+                line, buf = buf.split(b"\n", 1)
+                lines += 1
+                word = line.strip().decode("ascii", "replace")
+                if word in (JUMP_READY, JUMP_KEYS_DIFFER):
+                    return word
+        return None
 
     def send(self, args):
         """Send the jump to the helper, without waiting for anything. False when the helper
@@ -3333,7 +3500,7 @@ def popup(self_cmd, demo=False):
     watcher = threading.Thread(target=watch, args=(live, sock, rows_file, stop, acks, writes), daemon=True)
     proc, terminal, link = None, None, None
     try:
-        # Its state goes in the run directory, for --enter (jump_ready).
+        # Its state goes in the run directory, for --enter (jump_wait).
         link = JumpLink().start(tmp) if open_link else None
         terminal = saved_terminal()
         proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, universal_newlines=True,
@@ -3522,7 +3689,7 @@ def main(argv):
         if argv[:1] == ["--focus-wait"] and len(argv) == 3:
             return focus_wait(argv[1], argv[2])
         if argv[:1] == ["--jump-server"]:
-            return jump_server()
+            return jump_server(keys=argv[1] if len(argv) > 1 else None)
         if argv[:1] == ["--jump"] and len(argv) == 9:
             return jump(argv[1], argv[2], argv[3], argv[4], argv[5], argv[6] == "1", argv[7], keys=argv[8])
         if argv[:1] == ["--rows"]:

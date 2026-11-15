@@ -143,9 +143,14 @@ default**. When it cannot happen, Enter focuses the pane on its machine as descr
 with no error and no wait beyond the one below.
 
 **If your herdr `[keys] prefix` or `[keys] goto` are not herdr's defaults (`ctrl+b` and
-`prefix+g`), set the same values under `[jump]`, or turn the jump off.** The jump types the
-prefix, the navigator key, `/`, a search and Enter into your window; with other bindings those
-keys land in the pane you are on, and the Enter sends them.
+`prefix+g`), set the same values under `[jump]`.** The jump types the prefix, the navigator key,
+`/`, a search and Enter into your window, and with other bindings those keys would land in the
+pane you are on. So before it types anything, the helper on the Mac reads that Mac's herdr
+config where herdr 0.9.5 does (`$HERDR_CONFIG_PATH`, else `$XDG_CONFIG_HOME/herdr/config.toml`,
+else `~/.config/herdr/config.toml`; no file means herdr's defaults) and compares its
+`[keys] prefix` and `goto` with `[jump]`'s. When they differ there is
+no jump: Enter focuses the pane on its machine, and the footer adds `no jump: set [jump] prefix
+and goto to this window's herdr keys`.
 
 ```toml
 [jump]
@@ -160,14 +165,16 @@ It needs:
 - the herdr window running in **Ghostty 1.4 or newer on macOS**;
 - **non-interactive, key-based ssh from the herdr server to that Mac** (not needed with
   `client = "local"`, when the server is that Mac);
-- the plugin and `python3` on the Mac too, the same version as on the server (an older helper
-  never says it is ready, and Enter then focuses the pane instead), or `[jump] helper` set to
-  the command that runs this plugin's `bin/switchboard` there;
+- the plugin and `python3` on the Mac too, the same version as on the server, or `[jump]
+  helper` set to the command that runs this plugin's `bin/switchboard` there. A helper of an
+  older version never says it is ready: Enter then focuses the pane instead, after waiting for
+  it at most 2 seconds, and only until the popup gives up on it, 8 seconds after starting it;
 - the machine you jump to saved in the Mac's herdr under the same label as on the server: the
   helper runs `herdr --machine <label>` there;
 - **`prefix` and `goto` matching the window's herdr config.** The jump types the prefix, the
   navigator key, `/` (which focuses the navigator's search), the search and Enter; with other
-  bindings those keys would land in your pane. Each value must be in the small set that
+  bindings those keys would land in your pane, so the helper checks them first (above) and does
+  not jump when they differ. Each value must be in the small set that
   [`config.example.toml`](config.example.toml) lists. One that is not turns the jump off for
   that run: the header says `bad value for jump.goto, so the jump is off` (or `jump.prefix`),
   and Enter works as with `enabled = false`.
@@ -178,10 +185,13 @@ last. Setting `client` is safer.
 
 **What it runs on the Mac**, over ssh: `herdr plugin list --json` to find the plugin (unless
 `helper` is set), then the plugin's helper, started with the popup so Enter has one line to
-send. The helper looks for a herdr window whose terminal is Ghostty's; without one it exits at
-once, and Enter focuses the pane instead. With one, it says it is ready, and only then does
-Enter jump. If you press Enter while that connection is still being set up, it waits for it at
-most 2 seconds; a Mac that does not answer never holds the popup longer than that. On Enter the
+send. The helper looks for a herdr window whose terminal is Ghostty's (with several, the one you
+typed into last; when it cannot tell, none), and checks that Mac's herdr keys against `[jump]`;
+without such a window, or with keys that differ, it exits at once, and Enter focuses the pane
+instead. Otherwise it says it is ready, and only then does Enter jump. If you press Enter while
+that connection is still being set up, it waits for it at most 2 seconds; a Mac that does not
+answer, or a helper that says nothing within 8 seconds of starting, never holds the popup
+longer than that, and once the popup has given up on it, Enter focuses the pane at once. On Enter the
 helper checks what it would type (keys, search, terminal) before anything else, and if one
 falls outside its character set it renames and types nothing. Otherwise it sends the
 keystrokes to the Ghostty terminal running herdr and asks herdr to focus the pane; when no
@@ -262,14 +272,17 @@ cover parts of this. Compared on 2026-11-13 from each project's README (and herd
   (ignored)`, `bad value for X (default used)`, `[X] must be a table (defaults used)`, or `bad
   value for jump.goto, so the jump is off` (copy the binding from your herdr `[keys]`, within the
   set `config.example.toml` lists). A file that cannot be read or parsed ends `(defaults in use)`.
-- **Enter on another machine shows `focusing it on …` instead of jumping.** The jump did not
-  find a herdr window in Ghostty on a Mac it can reach. Check the
+- **Enter on another machine shows `focusing it on …` instead of jumping.** With `no jump: set
+  [jump] prefix and goto …` after it, your herdr keys on that Mac differ from `[jump]`: copy them
+  from its herdr `[keys]`. Without it, the jump did not find a herdr window in Ghostty on a Mac it
+  can reach. Check the
   [requirements](#jump-to-another-machine), set `[jump] client`, and try
   `ssh -o BatchMode=yes <client> true` from the server. macOS may ask for Automation permission
   before it lets the helper control Ghostty.
 - **Enter typed something like `g/w1:p3` into a pane.** Your herdr `[keys] prefix` or `goto`
-  differ from `[jump] prefix` and `goto`. Copy them from your herdr config into `[jump]`, or set
-  `[jump] enabled = false`.
+  differ from `[jump] prefix` and `goto`, and the helper did not see it (for example, herdr reads
+  its config from somewhere else on that Mac). Copy them from your herdr config into `[jump]`, or
+  set `[jump] enabled = false`.
 - **The order or the `done` marks look wrong.** They live in `recency.json` in the plugin's
   state directory; deleting it starts them over.
 
@@ -289,9 +302,11 @@ Chromium and ImageMagick, uses no network, and leaves nothing behind.
 
 Switchboard reaches your saved machines through your own ssh (in batch mode) or
 `herdr --machine`, and opens no other connection. It stores each saved machine's last snapshot
-and what you have seen, never pane output or credentials. The jump, on by default, adds ssh from
-the server back to your Mac when the server can log in there; `[jump] enabled = false` turns it
-off. [SECURITY.md](SECURITY.md) has the details and how to report a vulnerability.
+and what you have seen, never pane output or credentials. The jump, on by default, tries ssh from
+the server each time the popup opens, when windows are attached to it from other machines, in
+batch mode: `herdr plugin list --json` and the helper on a Mac that Tailscale names or that
+`[jump] client` sets, or, without Tailscale, `uname -s` to the address of each attached window.
+`[jump] enabled = false` turns it off. [SECURITY.md](SECURITY.md) has the details and how to report a vulnerability.
 
 ## Contributing
 

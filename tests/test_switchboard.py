@@ -841,6 +841,28 @@ check("tty-window-inside-tmux", sb.ghostty_tty(in_tmux) is None, sb.ghostty_tty(
 check("tty-no-window", sb.ghostty_tty("  700 1 ??  /Applications/Ghostty.app/Contents/MacOS/ghostty\n"
                                       "96578 700 ??  /opt/homebrew/bin/herdr server") is None)
 check("tty-parent-loop-ends", sb.ghostty_tty("5 6 ttys000 /opt/homebrew/bin/herdr\n6 5 ttys000 -zsh") is None)
+# A window is herdr with options only; a subcommand anywhere makes it a CLI call.
+check("herdr-window-words", sb.herdr_window(["herdr"]) and sb.herdr_window("/x/herdr --remote server --handoff".split())
+      and sb.herdr_window("herdr --session work".split()) and not sb.herdr_window(["herdr", "server"])
+      and not sb.herdr_window("herdr --machine server agent list".split()) and not sb.herdr_window(["zsh"]))
+# A one-off `herdr --machine server agent list` in a Ghostty tab is not a window...
+cli_call = ["  720   700 ttys002  /usr/bin/login -flp user /bin/zsh", "  721   720 ttys002  -zsh",
+            "  722   721 ttys002  /opt/homebrew/bin/herdr --machine server agent list"]
+cli_only = "\n".join(TUI.splitlines()[:4] + cli_call)
+check("tty-cli-call-is-not-a-window", sb.ghostty_tty(cli_only, atime=lambda t: 1.0) is None, sb.ghostty_tty(cli_only))
+check("tty-window-beside-a-cli-call", sb.ghostty_tty(TUI + "\n" + "\n".join(cli_call), atime=lambda t: 1.0)
+      == "/dev/ttys000", sb.ghostty_tty(TUI + "\n" + "\n".join(cli_call), atime=lambda t: 1.0))
+# ...and with two windows in Ghostty the jump goes to the one whose terminal got input last
+# (the newer process here, so not simply the lowest pid), or to none when that cannot be told.
+two = "\n".join(TUI.splitlines() + ["  710   700 ttys001  /usr/bin/login -flp user /bin/zsh",
+                                    "  711   710 ttys001  -zsh",
+                                    "70000   711 ttys001  /opt/homebrew/bin/herdr --remote server"])
+typed = {"/dev/ttys000": 100.0, "/dev/ttys001": 200.0}
+check("tty-two-windows-the-one-typed-into-last", sb.ghostty_tty(two, atime=typed.get) == "/dev/ttys001"
+      and sb.ghostty_tty(two, atime={"/dev/ttys000": 300.0, "/dev/ttys001": 200.0}.get) == "/dev/ttys000",
+      sb.ghostty_tty(two, atime=typed.get))
+check("tty-two-windows-ambiguous-is-none", sb.ghostty_tty(two, atime=lambda t: 100.0) is None
+      and sb.ghostty_tty(two, atime=lambda t: None) is None and sb.ghostty_tty(two, atime={"/dev/ttys000": 1.0}.get) is None)
 
 
 def ent(machine, pane_id, **kw):
@@ -991,7 +1013,7 @@ import io as _io
 with tempfile.TemporaryDirectory() as d:
     d = pathlib.Path(d)
     # The helper on the Mac, over ssh: it says it can type, then takes one line.
-    fake_ssh = executable(d / "ssh", '#!/bin/sh\necho "$@" > "%s/argv"\necho %s\ncat > "%s/stdin"\n'
+    fake_ssh = executable(d / "ssh", '#!/bin/sh\nprintf "%%s\\n" "$*" > "%s/argv"\necho %s\ncat > "%s/stdin"\n'
                           % (d, sb.JUMP_READY, d))
     old_ssh = sb.SSH
     sb.SSH = str(fake_ssh)
@@ -1015,8 +1037,9 @@ with tempfile.TemporaryDirectory() as d:
     check("link-state-ready-then-gone", ready13 == "ready" and state13("") == "", (ready13, sb.jump_state(fd13)))
     os.close(fd13)
     argv = (d / "argv").read_text()
+    # The keys it will type go to the helper, which checks them against the window's herdr.
     check("link-ssh-with-controlmaster", "ControlMaster=auto" in argv and "ControlPersist=600" in argv
-          and argv.strip().endswith("sb-helper --jump-server") and "mac1" in argv, argv)
+          and argv.strip().endswith("sb-helper --jump-server " + sb.shlex.quote(sb.JUMP_KEYS)) and "mac1" in argv, argv)
     check("link-one-json-line", json.loads((d / "stdin").read_text()) == args, (d / "stdin").read_text())
     # A helper that ends without the ready line (an older one, or no herdr window in Ghostty
     # there): the link is never up, and nothing is sent.
@@ -1047,7 +1070,8 @@ with tempfile.TemporaryDirectory() as d:
         sb.JumpLink(find=lambda: ("local", None)).start().started.wait(2)
     finally:
         sb.subprocess.Popen = orig_popen
-    check("link-local-no-ssh", calls2 and calls2[0][-1] == "--jump-server" and calls2[0][0] == sys.executable, calls2)
+    check("link-local-no-ssh", calls2 and calls2[0][-2:] == ["--jump-server", sb.JUMP_KEYS]
+          and calls2[0][0] == sys.executable, calls2)
 
 got_jump = []
 killed = []
@@ -1087,6 +1111,31 @@ try:
     rc = sb.jump_server(line, said)
     check("server-without-a-window-says-nothing", rc == 0 and said.getvalue() == "" and not osas
           and line.tell() == 0 and not got_jump, (rc, said.getvalue(), osas, line.tell()))
+    # The keys the popup will type (--jump-server KEYS) against this Mac's herdr config: when
+    # they match it says it is ready; when they differ it says so instead, starts no osascript
+    # and reads no line, and the popup's Enter takes the focus path. No config: herdr's defaults.
+    sb.ghostty_tty = lambda ps_text=None: "/dev/ttys000"
+    keys_dir = tempfile.mkdtemp(dir=_tmp_root)
+    herdr_cfg = os.path.join(keys_dir, "config.toml")
+    with open(herdr_cfg, "w") as f:
+        f.write('[keys]\ngoto = "prefix+/"\n\n[[keys.command]]\nkey = "prefix+space"\ntype = "plugin_action"\n')
+    told = {}
+    os.environ["HERDR_CONFIG_PATH"] = herdr_cfg
+    try:
+        for name, keys, path in (("match", "\\x02//", herdr_cfg), ("goto", "\\x02g/", herdr_cfg),
+                                 ("prefix", "\\x01//", herdr_cfg), ("none", "\\x02g/", herdr_cfg + ".none"),
+                                 ("none-differs", "\\x02//", herdr_cfg + ".none")):
+            os.environ["HERDR_CONFIG_PATH"] = path
+            said, line, osas[:], got_jump[:] = _io.StringIO(), _io.StringIO(json.dumps(["--jump"] * 9) + "\n"), [], []
+            sb.jump_server(line, said, keys=keys)
+            told[name] = (said.getvalue().strip(), len(osas), line.tell() > 0)
+    finally:
+        del os.environ["HERDR_CONFIG_PATH"]
+    check("server-ready-when-the-keys-match", told["match"] == (sb.JUMP_READY, 1, True)
+          and told["none"] == (sb.JUMP_READY, 1, True), told)
+    check("server-says-the-keys-differ", all(told[k] == (sb.JUMP_KEYS_DIFFER, 0, False)
+                                             for k in ("goto", "prefix", "none-differs")), told)
+    check("main-hands-the-keys-to-the-helper", "return jump_server(keys=argv[1] if len(argv) > 1 else None)" in SOURCE)
 finally:
     sb.jump, sb.ghostty_tty, sb.subprocess.Popen = orig
 
@@ -1627,8 +1676,10 @@ try:
     out = sb.demo_outcome(sb.make_id("", "a", "w1:p1", "w1:t1"), {"workstation": "workstation"})
     check("demo-enter-local", out == ["demo: would run `herdr agent focus w1:p1`"], out)
     out = sb.demo_outcome(sb.make_id("workstation", "a", "w1:p3", "w1:t2"), {"workstation": "workstation"})
+    # The demo never jumps, whatever the jump's setting (on by default), and says only that.
     check("demo-enter-remote", len(out) == 2 and "--machine workstation agent focus w1:p3" in out[0]
-          and "workstation" in out[1], out)
+          and out[1] == "demo: the demo never jumps between machines; the pane would be ready on workstation"
+          " when you switch to that machine", out)
 finally:
     sb.DEMO = saved_demo
 with tempfile.TemporaryDirectory() as d:
@@ -1826,7 +1877,8 @@ with tempfile.TemporaryDirectory() as d:
           (on_ready, off_ready))
     # No client found: the popup's link settles at once and leaves no state; Enter takes the
     # focus path without waiting, as with the jump off. (on_ready shows the jump is on here.)
-    state.unlink()
+    if state.exists():
+        state.unlink()
     nolink24 = sb.JumpLink(find=lambda: None).start(str(run_dir))
     settled = nolink24.started.wait(5)
     end24 = _time.time() + 5
@@ -1853,7 +1905,67 @@ with tempfile.TemporaryDirectory() as d:
     flip.join(5)
     check("enter-jumps-once-a-pending-link-is-ready", out_flip == "accept" and took_flip is not None
           and 0.4 <= took_flip < sb.JUMP_ENTER_WAIT + 1.0, (out_flip, took_flip))
-    state.unlink()
+    if state.exists():
+        state.unlink()
+
+    # A helper that starts and never says it is ready (one of an older version, or a shell
+    # profile that prints instead): the link gives it READY_WAIT from its start, then settles as
+    # not ready, so later Enters take the focus path at once instead of waiting
+    # JUMP_ENTER_WAIT each. It is still running then: the deadline did it, not its end.
+    # (No exec: the shell keeps its output open, as a helper that is still running does.)
+    silent_ssh = executable(d / "ssh-silent", '#!/bin/sh\necho "a profile line"\ncat > /dev/null\n')
+    saved_link = (sb.SSH, sb.READY_WAIT)
+    sb.SSH, sb.READY_WAIT = str(silent_ssh), 0.6
+    try:
+        silent24 = sb.JumpLink(find=lambda: ("ssh", "mac1"), helper=lambda h: "sb-helper").start(str(run_dir))
+        t0 = _time.time()
+        pending24 = state.read_text() if state.exists() else None
+        end24 = t0 + 5
+        while state.exists() and _time.time() < end24:
+            _time.sleep(0.02)
+        gave_up = round(_time.time() - t0, 3)
+        alive24 = silent24.proc is not None and silent24.proc.poll() is None
+        later = [enter_timed() for _ in range(2)]
+    finally:
+        sb.SSH, sb.READY_WAIT = saved_link
+        silent24.close()
+        silent24.detach()
+    check("silent-helper-later-enters-take-the-focus-path-at-once", pending24 == "pending\n"
+          and 0.5 <= gave_up < 3 and alive24 and not silent24.up.is_set()
+          and all((o or "").startswith(FOOTER) and t is not None and t < 1.2 for o, t in later),
+          (pending24, gave_up, alive24, later))
+    if silent24.proc:
+        silent24.proc.wait(5)
+
+    # A helper that says the window's herdr keys differ from [jump]'s: the state stays "keys",
+    # Enter takes the focus path at once, and its footer, then the focus result, say why.
+    keys_ssh = executable(d / "ssh-keys", '#!/bin/sh\necho %s\n' % sb.JUMP_KEYS_DIFFER)
+    saved_link = sb.SSH
+    sb.SSH = str(keys_ssh)
+    try:
+        keys24 = sb.JumpLink(find=lambda: ("ssh", "mac1"), helper=lambda h: "sb-helper").start(str(run_dir))
+        keys24.started.wait(5)
+        if keys24.proc:
+            keys24.proc.wait(5)
+        end24 = _time.time() + 5
+        while not (state.exists() and state.read_text() == "keys\n") and _time.time() < end24:
+            _time.sleep(0.02)
+        _time.sleep(0.1)  # the link is done with the helper: "keys" stays
+        kept24 = state.read_text() if state.exists() else None
+    finally:
+        sb.SSH = saved_link
+        keys24.detach()
+    out_keys, took_keys = enter_timed()
+    note = " · no jump: set [jump] prefix and goto to this window's herdr keys"
+    m24 = re.search(r"--focus-wait (\S+) ", out_keys or "")
+    waited24 = run_mode("--focus-wait", m24.group(1), "m1|a|w1:p4|w1:t2") if m24 else ""
+    check("keys-differ-footer-says-why", kept24 == "keys\n" and not keys24.was_up
+          and (out_keys or "").startswith("change-footer(focusing it on box1…" + note + ")+bg-transform-footer")
+          and took_keys is not None and took_keys < 1.2
+          and waited24 == "ready on box1: switch to that machine to see it · esc closes" + note,
+          (kept24, out_keys, took_keys, waited24))
+    if state.exists():
+        state.unlink()
 
     # The popup's close never waits for the link: neither one still looking for the client
     # (stuck here, as on a Mac that does not answer) nor one whose helper never said it was
@@ -3236,6 +3348,35 @@ for prefix, goto in (("f12", "prefix+g"), ("ctrl+B", "prefix+g"), ("ctrl+b", "g"
                      ("ctrl+b", 'prefix+"'), ("ctrl+b", "prefix+\\"), ("ctrl+b", "prefix+gg"), ("ctrl+b\n", "prefix+g"),
                      ("ctrl+b", "prefix+g\n"), ("", "")):
     check("jump-keys-refused %r" % ((prefix, goto),), sb.goto_keys(prefix, goto) is None)
+# The window's herdr keys, read from a herdr config.toml: [keys] prefix and goto, herdr's defaults
+# for what it does not set. Without tomllib (Python 3.9 and 3.10) only [keys] is read, line by
+# line: [[keys.command]] blocks, arrays and other tables (a `prefix` in [ui]) are skipped.
+HERDR_CFG = ('onboarding = false\n[keys]\nsettings = "prefix+."\ngoto = "prefix+/"  # the navigator\n\n'
+             '[[keys.command]]\nkey = "prefix+space"\ntype = "plugin_action"\n[ui]\nprefix = "ctrl+z"\nlist = [1, 2]\n')
+check("herdr-keys-read", sb.herdr_keys(HERDR_CFG) == ("ctrl+b", "prefix+/"), sb.herdr_keys(HERDR_CFG))
+check("herdr-keys-without-tomllib", sb._keys_table(HERDR_CFG) == {"goto": "prefix+/"}
+      and sb._keys_table('[keys]\nprefix = "ctrl+a"\n') == {"prefix": "ctrl+a"}, sb._keys_table(HERDR_CFG))
+check("herdr-keys-defaults", sb.herdr_keys("") == ("ctrl+b", "prefix+g") and sb._keys_table("") == {})
+check("herdr-keys-unreadable", sb._keys_table('[keys]\ngoto =\n') is None and sb._keys_table('[keys]\ngoto = 7\n') is None
+      and sb.herdr_keys('[keys]\ngoto = 7\n') is None and sb.herdr_keys("[keys\n") is None)
+check("herdr-config-path", sb.herdr_config_path({"HERDR_CONFIG_PATH": "/c/h.toml", "XDG_CONFIG_HOME": "/x", "HOME": "/h"})
+      == "/c/h.toml" and sb.herdr_config_path({"XDG_CONFIG_HOME": "/x", "HOME": "/h"}) == "/x/herdr/config.toml"
+      and sb.herdr_config_path({"HOME": "/h"}) == "/h/.config/herdr/config.toml")
+with tempfile.TemporaryDirectory() as d41:
+    def match41(text, keys):
+        path = os.path.join(d41, "config.toml")
+        with open(path, "wb") as f:
+            f.write(text if isinstance(text, bytes) else text.encode())
+        return sb.window_keys_match(keys, path)
+    check("window-keys-match", match41('[keys]\ngoto = "prefix+slash"\n', "\\x02//")
+          and match41('[keys]\nprefix = "ctrl+a"\n', "\\x01g/") and match41(HERDR_CFG, "\\x02//")
+          and sb.window_keys_match("\\x02g/", os.path.join(d41, "none.toml")))
+    check("window-keys-differ", not match41('[keys]\ngoto = "prefix+/"\n', "\\x02g/")
+          and not match41('[keys]\nprefix = "ctrl+a"\n', "\\x02g/")
+          and not match41('[keys]\ngoto = "prefix+shift+g"\n', "\\x02g/")
+          and not sb.window_keys_match("\\x02//", os.path.join(d41, "none.toml")))
+    check("window-keys-unreadable-is-no", not match41(b'[keys]\ngoto = "prefix+\xff"\n', "\\x02g/")
+          and not match41('[keys]\ngoto = 7\n', "\\x02g/"))
 cfg, problems = sb.merge_config({"jump": {"prefix": "ctrl+a", "goto": 'prefix+" & do shell script "x'}})
 check("jump-keys-bad-config-is-default", cfg["jump"]["prefix"] == "ctrl+a" and cfg["jump"]["goto"] == "prefix+g"
       and any("jump.goto" in p for p in problems), (cfg["jump"], problems))
@@ -3378,6 +3519,20 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         check("jump-good-renames-types-restores", rc == 0 and lines == [
             "--machine box1 pane rename w1:p1 sbjabc", "--machine box1 pane rename w1:p1 logs",
             "--machine box1 agent focus w1:p1"] and osa.script and b"sbjabc" in osa.script, (rc, lines))
+        # Keys this machine's herdr does not bind (its goto is prefix+/ here): nothing renamed
+        # or typed, only the focus. This also covers a helper started by an older popup.
+        cfg44 = os.path.join(d, "herdr-config.toml")
+        with open(cfg44, "w") as f:
+            f.write('[keys]\ngoto = "prefix+/"\n')
+        os.environ["HERDR_CONFIG_PATH"] = cfg44
+        try:
+            osa = Osa44()
+            rc = sb.jump(osa=osa, **good)
+        finally:
+            del os.environ["HERDR_CONFIG_PATH"]
+        lines = took_calls()
+        check("jump-refuses-keys-the-window-does-not-bind", rc == 2 and lines == ["--machine box1 agent focus w1:p1"]
+              and osa.killed and osa.script is None, (rc, lines))
         # Through --jump-server, a line with a refused query.
         orig44 = (sb.ghostty_tty, sb.subprocess.Popen)
         osa = Osa44()
@@ -4624,9 +4779,10 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
                               start_new_session=True, env=dict(os.environ, SSH_CONNECTION="box9 1 box9 22"))
     tui, tui_fd = _pty.fork()
     if tui == 0:
-        # The window stays a child of "ghostty": the trailing ":" keeps the shell from exec'ing it.
+        # The window is `herdr` with no arguments (a shell reading the terminal, so it waits),
+        # a child of "ghostty": the trailing ":" keeps that shell from exec'ing it.
         os.execv(os.path.join(long_dir, "ghostty"), [os.path.join(long_dir, "ghostty"), "-c",
-                                                     '"%s" -c "sleep 30; :"; :' % os.path.join(long_dir, "herdr")])
+                                                     '"%s"; :' % os.path.join(long_dir, "herdr")])
     try:
         _time.sleep(0.5)
         code59 = ("import importlib.machinery, importlib.util, json, sys\n"

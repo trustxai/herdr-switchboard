@@ -217,7 +217,7 @@ animation() {
   settle 'copied: the last reply'
   grab 4-copy --list || return 1
   tm send-keys -t sb Enter
-  settle 'demo: the cross-machine jump is off'
+  settle 'demo: the demo never jumps'
   grab 5-enter
   demo_gone || die "the demo did not exit after Enter"
 }
