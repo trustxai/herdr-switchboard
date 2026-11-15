@@ -17,9 +17,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that differ from `[jump]`'s, or a helper of an older version on that Mac), Enter works as with
   the jump off: it focuses the pane on its machine and the footer says so. If your herdr
   `[keys] prefix` or `goto` are not herdr's defaults, set the same values under `[jump]`.
-  **This changes what the plugin does after an update:** each time the popup opens, the herdr
-  server looks for the Mac of your window and connects to it over ssh, in batch mode with the
-  keys it already has, to start the helper that types into Ghostty there. See
+  **This changes what the plugin does after an update:** each time the popup opens with at least
+  one machine saved in herdr, the herdr server looks for the Mac of your window and, when that
+  Mac is another machine, connects to it over ssh, in batch mode with the keys it already has, to
+  start the helper that types into Ghostty there (finding that Mac can also mean an ssh to an
+  address it cannot identify otherwise). See
   [SECURITY.md](SECURITY.md#the-cross-machine-jump-on-by-default) for everything it runs.
   `[jump] enabled = false` turns all of that off.
 - The demo's Enter line says that the demo never jumps between machines.

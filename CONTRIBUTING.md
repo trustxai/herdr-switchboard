@@ -99,8 +99,7 @@ what the popup draws, run `docs/render.sh` and commit the new `docs/assets/` fil
   `docs:`, `test:`, `ci:`, `chore:`, `refactor:`. Say in the body why the change is needed.
 - Keep pull requests small and focused, and fill in the template.
 - `make check` must pass before you ask for a review.
-- A change users will notice gets a line in `CHANGELOG.md`: under `## [Unreleased]`, except
-  before the first tag (see [Releases](#releases)).
+- A change users will notice gets a line in `CHANGELOG.md`, under `## [Unreleased]`.
 
 ## Releases
 
