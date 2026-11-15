@@ -4666,14 +4666,18 @@ finally:
     os.close(master61e)
 check("wait-for-enter-misses-no-signal", rc61e == 128 + 15, rc61e)
 # ...and it acts within one step of its select, WAIT_POLL (0.05 s). The check above only asks for
-# 143 within 5 s, which a step of 3 s also passes. Here the same blind spot is set up, and the
-# module's select is watched so that the signal is sent just as the first select of the wait
-# begins: the worst case, where the handler runs only when that select ends, a whole step later.
-# The program writes the moment of the signal to a file, and the test takes the moment of the
-# exit from its wait. With the 0.05 s step that takes 0.06 to 0.08 s, and up to about 0.11 s on
-# one CPU shared with three busy loops. A longer step adds itself: 0.51 to 0.56 s with a step of
-# 0.5 s, about 3.03 s with one of 3 s, both past WAIT_FAST.
-WAIT_FAST = 0.4  # s: the 0.05 s step plus the exit, with room for a loaded runner
+# 143 within 5 s, which a step of 3 s also passes. The module's select is watched, and two things
+# are held. The step itself: the longest timeout the wait passes to select must be WAIT_STEP,
+# with nothing timed, so any longer step fails. And that a signal there acts within that step:
+# the same blind spot is set up, and the signal is sent just as the first select of the wait
+# begins, the worst case, where the handler runs only when that select ends. The program notes
+# the moment of the signal and the test the moment of the exit from its wait, both on the
+# monotonic clock, one clock for the whole system on Linux and macOS. That takes about 0.06 s on
+# Python 3.15 and 0.07 to 0.11 s on 3.9 to 3.14, where the test's wait() polls with sleeps of up
+# to 50 ms; up to 0.12 s on one CPU, also shared with three busy loops. The timed check alone
+# would pass a step of 0.35 s; the check of the timeout is what holds it at 0.05 s.
+WAIT_STEP = 0.05  # s: the step wait_for_enter must use
+WAIT_FAST = 0.4  # s: that step plus the exit, with room for a loaded runner
 code61g = ("import importlib.machinery, importlib.util, os, signal, sys, threading, time, types\n"
            "loader = importlib.machinery.SourceFileLoader('switchboard', sys.argv[1])\n"
            "spec = importlib.util.spec_from_loader('switchboard', loader)\n"
@@ -4689,7 +4693,7 @@ code61g = ("import importlib.machinery, importlib.util, os, signal, sys, threadi
            "def later():\n"
            "    begun.wait(5)  # it runs on once the select has released the GIL: the signal lands in it\n"
            "    with open(sys.argv[2], 'w') as f:\n"
-           "        f.write('%r %d' % (time.time(), len(steps)))\n"
+           "        f.write('%r %d %r' % (time.monotonic(), len(steps), max(steps or [0.0])))\n"
            "    os.kill(os.getpid(), signal.SIGTERM)\n"
            "threading.Thread(target=later, daemon=True).start()\n"
            "signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})\n"
@@ -4702,7 +4706,7 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d61g:
                                    stdout=slave61g, stderr=slave61g)
         try:
             rc61g = proc61g.wait(timeout=10)
-            exit61g = _time.time()
+            exit61g = _time.monotonic()
         except subprocess.TimeoutExpired:
             proc61g.kill()
             proc61g.wait(timeout=5)
@@ -4712,13 +4716,15 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d61g:
         os.close(master61g)
     try:
         with open(sent61g) as f61g:
-            sent_at61g, selects61g = f61g.read().split()
-        took61g = round(exit61g - float(sent_at61g), 3) if exit61g else None
-        selects61g = int(selects61g)
+            sent_at61g, selects61g, step61g = f61g.read().split()
+        took61g = round(exit61g - float(sent_at61g), 3) if exit61g is not None else None
+        selects61g, step61g = int(selects61g), float(step61g)
     except (OSError, ValueError):
-        took61g = selects61g = None  # the signal was never sent
+        took61g = selects61g = step61g = None  # the signal was never sent
+check("wait-for-enter-polls-in-steps-of-0.05-s", bool(selects61g) and step61g is not None and step61g <= WAIT_STEP,
+      (selects61g, step61g))
 check("wait-for-enter-acts-within-its-step", rc61g == 128 + 15 and bool(selects61g) and took61g is not None
-      and took61g < WAIT_FAST, (rc61g, selects61g, took61g))
+      and 0 <= took61g < WAIT_FAST, (rc61g, selects61g, took61g))
 # Enter and the end of the input end that wait as they did under input(): explain_and_wait
 # returns 1. Each is typed into the terminal before the program reads it.
 code61f = ("import importlib.machinery, importlib.util, sys\n"
