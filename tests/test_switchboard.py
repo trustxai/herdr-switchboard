@@ -2130,7 +2130,7 @@ MANIFEST = (ROOT / "herdr-plugin.toml").read_text()
 if HAVE_TOMLLIB:
     man = sb.tomllib.loads(MANIFEST)
     check("manifest-metadata", man.get("id") == "trustxai.switchboard" and man.get("name")
-          and man.get("version") == "0.1.0" and man.get("min_herdr_version") == "0.9.5"
+          and man.get("version") == sb.VERSION and man.get("min_herdr_version") == "0.9.5"
           and man.get("platforms") == ["linux", "macos"] and man.get("description"), man)
     panes = man.get("panes") or []
     actions = man.get("actions") or []
@@ -2153,7 +2153,7 @@ if HAVE_TOMLLIB:
                            universal_newlines=True, timeout=20)
         check("manifest-pane-runs-the-program", r.returncode != 0 and "fzf" in r.stdout, r.stdout[-200:])
 else:
-    for line in ('id = "trustxai.switchboard"', 'version = "0.1.0"', 'min_herdr_version = "0.9.5"',
+    for line in ('id = "trustxai.switchboard"', 'version = "%s"' % sb.VERSION, 'min_herdr_version = "0.9.5"',
                  'platforms = ["linux", "macos"]', 'placement = "popup"', 'id = "open"', "[[panes]]", "[[actions]]"):
         check("manifest-has %s" % line, line in MANIFEST)
 check("program-executable", os.access(str(TOOL), os.X_OK) and SOURCE.startswith("#!/usr/bin/env python3\n"))

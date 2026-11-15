@@ -15,7 +15,7 @@
 
 id = "trustxai.switchboard"
 name = "Switchboard"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.5"
 description = "Every agent on every saved machine in one popup, ordered by priority, with live preview."
 platforms = ["linux", "macos"]

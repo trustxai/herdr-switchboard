@@ -108,7 +108,8 @@ Versioning is manual and nothing runs on a tag: no workflow builds or publishes 
 release of version `X.Y.Z` is these steps, in this order:
 
 1. Open a pull request against `main` that:
-   - sets `version = "X.Y.Z"` in `herdr-plugin.toml`;
+   - sets `version = "X.Y.Z"` in `herdr-plugin.toml` and `VERSION = "X.Y.Z"` in
+     `bin/switchboard` (the tests check that they match);
    - in `CHANGELOG.md`, renames `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, dated the day
      you will tag, and adds a new, empty `## [Unreleased]` above it;
    - updates the links at the bottom of `CHANGELOG.md`: `[Unreleased]` compares
