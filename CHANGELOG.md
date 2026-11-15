@@ -46,6 +46,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A helper on the Mac that never says it is ready (an older version does not) no longer makes
   every Enter wait: after 8 seconds the popup stops waiting for it, and Enter focuses the pane
   at once.
+- Work that finished in the tab in front on a machine no longer stays `done` after you left that
+  tab there: once that machine's focus moves to another tab (other than by Enter in the popup),
+  the work counts as seen. Before, it stayed `done` until you opened the popup on that tab or
+  picked it with Enter, also when herdr's own panel already showed it as seen. The trade-off,
+  described in the README: reaching another tab of that machine without passing through that
+  one (herdr's navigator from another machine, the jump, a script) also counts as seen, while
+  herdr's panel still shows the work `done`.
 
 ## [0.1.0] - 2026-11-15
 

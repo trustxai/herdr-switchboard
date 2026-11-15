@@ -1211,6 +1211,11 @@ def fmt_age(seconds):
     return tr("age_s", seconds) if seconds < 60 else tr("age_min", seconds // 60)
 
 
+# Seconds a focus the popup moved (ack_tab) has to show up in that machine's snapshots; until
+# then, reads still showing the old tab are taken as from before the move (Recency.observe).
+FOCUS_SETTLE = 10.0
+
+
 class Recency:
     """Which agent changed last, across machines: what orders the rows inside a status.
 
@@ -1238,10 +1243,20 @@ class Recency:
     - you pick it with Enter (ack_tab);
     - the server had it done and turned it idle: you went there some other way;
     - it finished outside the active tab of its machine and is already idle: the same,
-      except the popup never saw it done.
+      except the popup never saw it done;
+    - it finished in the active tab of its machine and that machine's focus has since left
+      that tab: the server only marks it seen at completion when it was the active tab, so
+      the tab was in front at that moment, and leaving it usually means someone on that
+      machine had it on screen first. A move the popup made itself (Enter on a row there)
+      does not count: ack_tab records the tab it moved to, and reads from before that move
+      are not taken for a new focus (expect). A move made from elsewhere straight to another
+      tab (herdr's navigator from another machine, a script) does count, although that tab
+      was never drawn: the API does not say who moved the focus, and this is the side
+      chosen, so that work you watched finish does not stay done.
 
     Otherwise it stays done: that is what finished in the tab left open on one machine while
-    you were on another. The first time a machine is seen everything counts as seen.
+    you were on another, until you go back there. The first time a machine is seen
+    everything counts as seen.
     """
 
     def __init__(self, persist=True, now=None):
@@ -1251,6 +1266,7 @@ class Recency:
         self.seen = {}
         self.focus = {}      # machine -> its focused tab at the last read
         self.fresh = set()   # machines already read since this popup opened
+        self.expect = {}     # machine -> (tab the popup moved its focus to, until when)
         self.lock = threading.Lock()
         if self.path:
             try:
@@ -1299,6 +1315,15 @@ class Recency:
             known = self.seen.setdefault(machine, {})
             before = json.dumps([known, self.focus.get(machine)], sort_keys=True)
             last_focus = self.focus.get(machine)
+            # After the popup moved this machine's focus (ack_tab), a read that does not show
+            # the new tab yet is from before the move: it neither infers nor records a focus.
+            stale = False
+            expected = self.expect.get(machine)
+            if expected and focus:
+                if focus == expected[0] or (now or time.time()) > expected[1]:
+                    del self.expect[machine]
+                else:
+                    stale = True
             agents = [e for e in entries if e["kind"] == "a"]
             changed = []
             for e in agents:
@@ -1316,6 +1341,9 @@ class Recency:
                         ack = seq  # the server had it done and turned it idle: you went there
                     elif moved and e["tab"] not in (focus, last_focus):
                         ack = seq  # finished outside the active tab and already idle
+                    elif (not stale and focus and last_focus and focus != last_focus
+                          and e["tab"] == last_focus):
+                        ack = seq  # the focus left the tab it finished in: someone was there
                     # Otherwise it finished in the tab left open on that machine; the server
                     # counts it as seen by itself, so it stays done until you go there.
                 if moved:
@@ -1328,7 +1356,7 @@ class Recency:
             alive = set(e["pane"] for e in agents)
             for p in [p for p in known if p not in alive]:
                 del known[p]
-            if focus:
+            if focus and not stale:
                 self.focus[machine] = focus
             self.apply(entries)
             dirty = before != json.dumps([known, self.focus.get(machine)], sort_keys=True)
@@ -1336,7 +1364,7 @@ class Recency:
                 self._save()
         return dirty
 
-    def ack_tab(self, machine, tab, entries):
+    def ack_tab(self, machine, tab, entries, now=None):
         """A row of that tab was picked: whatever finished there counts as seen."""
         with self.lock:
             known = self.seen.get(machine, {})
@@ -1347,7 +1375,14 @@ class Recency:
                     if k and k[3] < k[0]:
                         k[3] = k[0]
                         dirty = True
-            if dirty:
+            # Picking a row moves that machine's focus to its tab: record it as the last focus
+            # seen, so the next read does not take the popup's own move for someone leaving
+            # the tab that was in front (observe). It is saved, but changes no row.
+            moved = machine in self.focus and self.focus[machine] != tab
+            if moved:
+                self.focus[machine] = tab
+                self.expect[machine] = (tab, (now or time.time()) + FOCUS_SETTLE)
+            if dirty or moved:
                 self._save()
         return dirty
 
