@@ -270,7 +270,7 @@ cover parts of this. Compared on 2026-11-13 from each project's README (and herd
 | herdr-bar | Desktop-app mod only | No | Yes | Yes | Yes | Not documented | Yes |
 | herdr-picker | No (attaches the whole machine) | No | Blocked first | Yes | Yes | IDs only | Yes |
 
-¹ Checked against `bin/switchboard` 0.1.0, where the jump was off by default; it is on since.
+¹ Checked against `bin/switchboard` 0.1.0, where the jump was off by default; it is on by default since 0.2.0.
 ² Inferred; not written in that project's README.
 
 ## Troubleshooting

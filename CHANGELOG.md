@@ -15,9 +15,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   row switches a herdr window running in Ghostty on macOS to that pane. When the jump cannot
   happen (no herdr window in Ghostty on a Mac the server can reach over ssh, herdr keys there
   that differ from `[jump]`'s, or a helper of an older version on that Mac), Enter works as with
-  the jump off: it focuses the pane on its machine and the footer says so. `enabled = false`
-  turns it off. If your herdr `[keys] prefix` or `goto` are not herdr's defaults, set the same
-  values under `[jump]`.
+  the jump off: it focuses the pane on its machine and the footer says so. If your herdr
+  `[keys] prefix` or `goto` are not herdr's defaults, set the same values under `[jump]`.
+  **This changes what the plugin does after an update:** each time the popup opens, the herdr
+  server looks for the Mac of your window and connects to it over ssh, in batch mode with the
+  keys it already has, to start the helper that types into Ghostty there. See
+  [SECURITY.md](SECURITY.md#the-cross-machine-jump-on-by-default) for everything it runs.
+  `[jump] enabled = false` turns all of that off.
 - The demo's Enter line says that the demo never jumps between machines.
 
 ### Fixed

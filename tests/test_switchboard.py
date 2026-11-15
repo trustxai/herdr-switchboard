@@ -2156,6 +2156,12 @@ else:
     for line in ('id = "trustxai.switchboard"', 'version = "%s"' % sb.VERSION, 'min_herdr_version = "0.9.5"',
                  'platforms = ["linux", "macos"]', 'placement = "popup"', 'id = "open"', "[[panes]]", "[[actions]]"):
         check("manifest-has %s" % line, line in MANIFEST)
+CHANGELOG = (ROOT / "CHANGELOG.md").read_text()
+heads = re.findall(r"^## \[([^\]]+)\]", CHANGELOG, re.M)
+check("changelog-latest-release-is-VERSION", heads[:1] == ["Unreleased"] and heads[1:2] == [sb.VERSION]
+      and ("[%s]: https://github.com/trustxai/herdr-switchboard/releases/tag/v%s" % (sb.VERSION, sb.VERSION)) in CHANGELOG
+      and ("[Unreleased]: https://github.com/trustxai/herdr-switchboard/compare/v%s...HEAD" % sb.VERSION) in CHANGELOG,
+      heads[:3])
 check("program-executable", os.access(str(TOOL), os.X_OK) and SOURCE.startswith("#!/usr/bin/env python3\n"))
 std = set(getattr(sys, "stdlib_module_names", ())) or {
     "base64", "copy", "glob", "json", "os", "re", "select", "shlex", "shutil", "socket", "subprocess", "sys",
@@ -2295,7 +2301,7 @@ with tempfile.TemporaryDirectory() as d:
         (pathlib.Path(env["HERDR_PLUGIN_CONFIG_DIR"]) / "config.toml").write_bytes(text.encode())
         r = subprocess.run([sys.executable, str(TOOL), "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                            stderr=subprocess.PIPE, universal_newlines=True, env=env, timeout=20)
-        check("config-version-survives %r" % text[:40], r.returncode == 0 and r.stdout.startswith("switchboard ")
+        check("config-version-survives %r" % text[:40], r.returncode == 0 and r.stdout == "switchboard %s\n" % sb.VERSION
               and not r.stderr, (r.returncode, r.stderr[-200:]))
     # In range, a fraction is kept as it is (it used to be truncated to an integer).
     (d / "half.toml").write_text("[refresh]\ncache_max_age = 0.5\nlocal_seconds = 0.2\nremote_timeout = 120\n")
