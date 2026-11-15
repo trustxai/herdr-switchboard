@@ -26,20 +26,33 @@ VOICE_ENV = "ELEVENLABS_VOICE_ID"
 
 
 def key():
+    """The API key: printable ASCII with no space, alone on one line. No message shows it."""
     try:
-        with open(KEY_FILE) as f:
+        with open(KEY_FILE, "rb") as f:
             value = f.read().strip()
     except OSError as e:
         sys.exit("el.py: cannot read the API key from %s (%s)" % (KEY_FILE, e.strerror))
     if not value:
         sys.exit("el.py: %s is empty" % KEY_FILE)
-    return value
+    if any(b < 0x21 or b > 0x7E for b in value):
+        sys.exit("el.py: %s must hold the key alone on one line, with no space and nothing outside"
+                 " printable ASCII (the value is not shown)" % KEY_FILE)
+    return value.decode("ascii")
 
 
 def call(method, path, body=None, accept="application/json"):
+    secret = key()
+
+    def hide(text):
+        # Also the escaped form, as a repr() inside an exception would show it.
+        for form in (secret, secret.encode("unicode_escape").decode("ascii")):
+            text = text.replace(form, "<api key>")
+        return text
+
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(API + path, data=data, method=method)
-    req.add_header("xi-api-key", key())
+    # Unredirected: a redirect never carries the key to another address.
+    req.add_unredirected_header("xi-api-key", secret)
     req.add_header("User-Agent", "switchboard-video/1.0")
     req.add_header("Accept", accept)
     if data is not None:
@@ -48,9 +61,15 @@ def call(method, path, body=None, accept="application/json"):
         with urllib.request.urlopen(req, timeout=60) as r:
             return r.read()
     except urllib.error.HTTPError as e:
-        sys.exit("el.py: HTTP %d on %s: %s" % (e.code, path, e.read()[:400].decode(errors="replace")))
-    except urllib.error.URLError as e:
-        sys.exit("el.py: %s: %s" % (path, e.reason))
+        try:
+            text = e.read(65536).decode(errors="replace")
+        except Exception:
+            text = ""
+        # The key is taken out before the cut, so a reply that echoes it never shows a piece of it.
+        sys.exit("el.py: HTTP %d on %s: %s" % (e.code, path, hide(text)[:400]))
+    except Exception as e:
+        # Whatever fails, its message goes out without the key and without a traceback.
+        sys.exit("el.py: %s on %s: %s" % (type(e).__name__, path, hide(str(e))[:400]))
 
 
 def here(path):

@@ -8,7 +8,7 @@ docs/video/remotion/node_modules/
 docs/video/remotion/build/
 docs/video/remotion/public/
 docs/video/remotion/src/schedule.json
-docs/video/remotion/src/voice.json
+docs/video/remotion/src/schedule.json.tmp
 
 # Local tooling
 .venv/

@@ -29,6 +29,16 @@ const END_LENGTH = SCHEDULE.end;
 export const TOTAL_SECONDS = END_START + END_LENGTH;
 const B = SCHEDULE.beats; // c0, c1: seconds of the fitted footage
 
+// SHOT_DEFS and CAPTION_TEXT below go with the beats by position, BOX_DEFS by beat number. A
+// schedule with another number of beats stops the render here, before any of them is read wrong.
+function mustMatch(name, length) {
+  if (length !== B.length) {
+    throw new Error(
+      `Demo.jsx: ${name} has ${length} entries, and schedule.json has ${B.length} beats (schedule.py BEATS)`
+    );
+  }
+}
+
 // Tokyo Night palette.
 const C = {
   bg: "#1a1b26",
@@ -50,14 +60,16 @@ const VIEW = { w: WIN.w, h: Math.round((WIN.w * 1760) / 3600) };
 // Camera: one shot per beat (fx, fy: the point of the footage, 0..1, to centre), eased in
 // over MOVE seconds from the start of the beat.
 const MOVE = 0.7;
-const SHOTS = [
+const SHOT_DEFS = [
   { s: 1.0, fx: 0.5, fy: 0.5 },
   { s: 1.25, fx: 0.4, fy: 0.5 },
   { s: 2.0, fx: 0.25, fy: 0.2 },
   { s: 1.8, fx: 0.27, fy: 0.22 },
   { s: 1.45, fx: 0.35, fy: 0.445 },
   { s: 1.0, fx: 0.5, fy: 0.5 },
-].map((shot, i) => ({ ...shot, t: B[i].c0 }));
+];
+mustMatch("SHOT_DEFS", SHOT_DEFS.length);
+const SHOTS = SHOT_DEFS.map((shot, i) => ({ ...shot, t: B[i].c0 }));
 
 // Boxes drawn over the footage (normalized footage coordinates), per beat, from `from`
 // seconds into the beat until just before it ends.
@@ -65,6 +77,11 @@ const BOX_DEFS = [
   { beat: 2, from: 1.0, x: 0.024, y: 0.103, w: 0.395, h: 0.044 },
   { beat: 4, from: 0.5, x: 0.022, y: 0.477, w: 0.532, h: 0.044 },
 ];
+for (const b of BOX_DEFS) {
+  if (!(b.beat >= 0 && b.beat < B.length)) {
+    throw new Error(`Demo.jsx: BOX_DEFS names beat ${b.beat}, and schedule.json has ${B.length} beats`);
+  }
+}
 const BOXES = BOX_DEFS.map((b) => ({ ...b, t: B[b.beat].c0 + b.from, end: B[b.beat].c1 - 0.2 }));
 
 function Key({ children }) {
@@ -80,6 +97,7 @@ const CAPTION_TEXT = [
   <><Key>ctrl-y</Key> copies the agent's last reply</>,
   <><Key>enter</Key> jumps to the pane, on any machine</>,
 ];
+mustMatch("CAPTION_TEXT", CAPTION_TEXT.length);
 const CAPTIONS = CAPTION_TEXT.map((text, i) => ({ text, t: B[i].c0, end: B[i].c1 }));
 
 const ease = Easing.inOut(Easing.cubic);
@@ -398,17 +416,12 @@ export const Demo = () => {
       <Sequence from={Math.round(END_START * fps)}>
         <EndCard />
       </Sequence>
-      <Sequence from={Math.round(0.25 * fps)}>
-        <Audio src={staticFile("voice/v0-intro.mp3")} />
-      </Sequence>
-      {B.map((b) => (
-        <Sequence key={b.voice} from={Math.round((INTRO + b.c0 + SCHEDULE.lead) * fps)}>
-          <Audio src={staticFile(`voice/${b.voice}.mp3`)} />
+      {/* Every line where schedule.py placed it, which is where check.py looks for it. */}
+      {SCHEDULE.narration.map((line) => (
+        <Sequence key={line.voice} from={Math.round(line.at * fps)}>
+          <Audio src={staticFile(`voice/${line.voice}.mp3`)} />
         </Sequence>
       ))}
-      <Sequence from={Math.round((END_START + 0.5) * fps)}>
-        <Audio src={staticFile("voice/v7-end.mp3")} />
-      </Sequence>
     </AbsoluteFill>
   );
 };

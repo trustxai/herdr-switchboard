@@ -5,6 +5,11 @@
 # that the camera zooms in the video stay sharp. 15 frames per second on purpose: at 30, VHS
 # dropped frames (even at 1920x930) and the MP4 came out shorter than the tape's real time,
 # which shifts every beat that schedule.py cuts. `python3 check.py footage` measures it.
+#
+# The comments below say what each part shows, not when: `python3 check.py live` prints the
+# time at which every change shows up in out/terminal.mp4, and BEATS in schedule.py are cut at
+# those times. A Sleep here does not end where a sum of the Sleeps says: each key adds the
+# typing delay, and in the footage a key shows about 0.1 s before that sum.
 Output out/terminal.mp4
 
 Require python3
@@ -29,29 +34,32 @@ Wait+Screen@20s /18 agents/
 Sleep 1.5s
 Show
 
-# 0.0  The list: every machine, blocked first.
+# The list: every machine, blocked first.
 Sleep 3.5s
 
-# 3.5  Moving changes the live preview.
+# Moving changes the live preview.
 Down
 Sleep 1.3s
 Down
 Sleep 2.7s
 
-# 7.5  The sample timeline turns a working agent into done while the popup is open.
+# The demo's timeline turns a working agent into done while the popup is open, with no key:
+# 8 s after the demo starts, about 7.3 s into the footage.
 Sleep 4.3s
 
-# 11.8 Type to filter by machine, then narrow to one pane.
+# Type to filter by machine, then narrow to one pane.
 Type "workstation"
 Sleep 1.6s
 Type " landing"
 Sleep 1.4s
 
-# 16.5 ctrl-y copies the agent's last reply.
+# ctrl-y copies the agent's last reply.
 Ctrl+Y
 Sleep 3.3s
 
-# 19.8 Enter and the install line.
+# The same screen while the caption and the narration say what Enter does. No key is sent:
+# the video tells what Enter does, it does not show it. The install line is on the end card,
+# which the composition draws.
 Sleep 5.2s
 
 Hide
