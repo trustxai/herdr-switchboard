@@ -1363,15 +1363,77 @@ rd.observe("", ents17("", 0, ag17("L", "working", 1, T1)), focus=T1, here=True)
 e = ents17("", 0, ag17("L", "idle", 2, T1, 2))
 rd.observe("", e, now=101.0, focus=T1, here=True)
 check("done-in-front-of-you-no", st(e) == {"L": "idle"}, st(e))
-# Finished in the tab you were on and left: done until you open the popup there.
+# Finished in the tab that was in front, and the focus has since left it: someone was there.
 rd = sb.Recency(persist=False, now=100.0)
 rd.observe("", ents17("", 0, ag17("L", "working", 1, T1)), focus=T1, here=True)
 e = ents17("", 0, ag17("L", "idle", 2, T1, 2))
 rd.observe("", e, now=101.0, focus=T2, here=True)
-check("done-you-left-the-tab", st(e) == {"L": "done"}, st(e))
-e = ents17("", 0, ag17("L", "idle", 2, T1, 2))
-rd.observe("", e, now=102.0, focus=T1, here=True)
-check("done-back-on-the-tab", st(e) == {"L": "idle"}, st(e))
+check("done-you-left-the-tab", st(e) == {"L": "idle"}, st(e))
+# Another machine: A finished in the tab in front there, so it shows done; once that
+# machine's focus leaves the tab, someone was there after it finished, and it is seen. The
+# same when the popup first sees it already finished with the focus elsewhere.
+rd = sb.Recency(persist=False, now=100.0)
+rd.observe("m1", ents17("m1", 1, ag17("A", "working", 5, T1), ag17("B", "working", 6, T1)), focus=T1)
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("B", "working", 6, T1))
+rd.observe("m1", e, now=101.0, focus=T1)
+check("done-focus-still-on-the-tab", st(e) == {"A": "done", "B": "working"}, st(e))
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("B", "working", 6, T1))
+rd.observe("m1", e, now=102.0, focus=T2)
+check("done-focus-left-the-tab-it-finished-in", st(e) == {"A": "idle", "B": "working"}, st(e))
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("B", "idle", 8, T1, 8))
+rd.observe("m1", e, now=103.0, focus=T2)
+check("done-finished-outside-the-tab-in-front", st(e)["B"] == "idle", st(e))
+rd = sb.Recency(persist=False, now=100.0)
+rd.observe("m1", ents17("m1", 1, ag17("C", "working", 5, T1)), focus=T1)
+e = ents17("m1", 1, ag17("C", "idle", 7, T1, 7))
+rd.observe("m1", e, now=101.0, focus=T2)
+check("done-finished-and-left-while-closed", st(e) == {"C": "idle"}, st(e))
+# A focus moved by the popup itself (Enter on a row in another tab of that machine) is not
+# someone leaving the tab: A stays done.
+rd = sb.Recency(persist=False, now=100.0)
+rd.observe("m1", ents17("m1", 1, ag17("A", "working", 5, T1), ag17("D", "idle", 3, T2)), focus=T1)
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("D", "idle", 3, T2))
+rd.observe("m1", e, now=101.0, focus=T1)
+rd.ack_tab("m1", T2, e)
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("D", "idle", 3, T2))
+rd.observe("m1", e, now=102.0, focus=T2)
+check("done-popup-move-is-not-leaving", st(e)["A"] == "done", st(e))
+check("done-popup-move-records-the-focus", rd.focus.get("m1") == T2, rd.focus)
+# A read from before the popup's move lands after it (the refresh threads): it neither puts
+# the old focus back nor lets the next read take the move for someone leaving the tab.
+rd = sb.Recency(persist=False, now=100.0)
+rd.observe("m1", ents17("m1", 1, ag17("A", "working", 5, T1), ag17("D", "idle", 3, T2)), focus=T1)
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("D", "idle", 3, T2))
+rd.observe("m1", e, now=101.0, focus=T1)
+rd.ack_tab("m1", T2, e, now=102.0)
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("D", "idle", 3, T2))
+rd.observe("m1", e, now=103.0, focus=T1)
+check("done-stale-read-keeps-the-move", rd.focus.get("m1") == T2 and st(e)["A"] == "done", (rd.focus, st(e)))
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("D", "idle", 3, T2))
+rd.observe("m1", e, now=104.0, focus=T2)
+check("done-stale-read-then-the-move", st(e)["A"] == "done" and "m1" not in rd.expect, (st(e), rd.expect))
+# A move that never shows up stops being waited for after FOCUS_SETTLE seconds.
+rd = sb.Recency(persist=False, now=100.0)
+rd.observe("m1", ents17("m1", 1, ag17("A", "working", 5, T1)), focus=T1)
+e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7))
+rd.observe("m1", e, now=101.0, focus=T1)
+rd.ack_tab("m1", T2, e, now=102.0)
+rd.observe("m1", e, now=102.0 + sb.FOCUS_SETTLE + 1, focus=T1)
+check("done-move-not-shown-expires", rd.focus.get("m1") == T1 and "m1" not in rd.expect
+      and st(e)["A"] == "done", (rd.focus, rd.expect, st(e)))
+# Across popups: the focus at the last read is kept on disk, so a later popup sees it moved.
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    r1 = sb.Recency(now=100.0)
+    r1.observe("m1", ents17("m1", 1, ag17("A", "working", 5, T1)), focus=T1)
+    e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7))
+    r1.observe("m1", e, now=101.0, focus=T1)
+    check("done-before-leaving-persisted", st(e) == {"A": "done"}, st(e))
+    r2 = sb.Recency(now=200.0)
+    e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7))
+    r2.observe("m1", e, focus=T2)
+    check("done-left-between-popups", st(e) == {"A": "idle"}, st(e))
+    sb.STATE_DIR = STATE
 # An idle that closed no work does not rise; working and blocked do not change.
 rd = sb.Recency(persist=False, now=100.0)
 rd.observe("m1", ents17("m1", 1, ag17("N", "working", 1, T1), ag17("O", "working", 2, T1),
