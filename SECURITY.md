@@ -303,11 +303,20 @@ itself), and nothing is detected. Otherwise Switchboard looks for it:
   runs in Ghostty (`ps`: a herdr process with a terminal, no subcommand on its command line, and
   Ghostty among its parent processes; with several, the one whose terminal got input last, and
   none when that cannot be told). Without one it exits at once, starting nothing, so AppleScript
-  is never pointed at a Ghostty that is not running or not installed. Then it reads that Mac's
-  herdr config (`$HERDR_CONFIG_PATH`, else `$XDG_CONFIG_HOME/herdr/config.toml`, else
-  `~/.config/herdr/config.toml`; only its `[keys] prefix` and `goto`, herdr's defaults when
-  there is no file) and, when those are not `<keys>`, or the file cannot be read, says so and
-  exits, starting nothing. Otherwise it starts `osascript`, prints that it is ready, and waits
+  is never pointed at a Ghostty that is not running or not installed. Then it checks that
+  `<keys>` open that window's navigator. It reads three variables of the window process's own
+  environment (`/proc/<pid>/environ` on Linux, `ps -E` on macOS; `HERDR_CONFIG_PATH`,
+  `XDG_CONFIG_HOME` and `HOME`, nothing else is kept) to find the config that window reads, as
+  herdr 0.9.5 picks it; it reads that file's `[keys]` table and the `key` of each
+  `[[keys.command]]` (herdr's defaults when there is no file); and it runs `herdr config check`
+  with `HERDR_CONFIG_PATH` set to that file. It says the keys differ, and exits starting
+  nothing, when the prefix and goto are not `<keys>`; when another binding is on goto's key or
+  on the prefix; when `herdr config check` reports a parse or read error, says anything about
+  `keys.prefix` or `keys.goto`, fails, prints something else or takes more than 5 seconds; when
+  the window was started with `--remote-keybindings server`; and when anything is unsure: an
+  environment it cannot read, a relative or empty path, a path that names nothing (a value with
+  a space comes out of `ps -E` cut short), or, without `tomllib`, a config it cannot read line
+  by line for sure. Otherwise it starts `osascript`, prints that it is ready, and waits
   for one line with the chosen row; a line that is not exactly the nine string arguments it
   expects is dropped. Then
   it uses AppleScript to send keystrokes to the Ghostty terminal on that tty:
@@ -331,8 +340,9 @@ extra Enter):
 - the query may hold only `a-z 0-9 : . _ -` and space, and the tty must look like `/dev/<name>`
   (ASCII letters, digits, `_` and `.`).
 
-The helper checks all of that, and the keys against that Mac's herdr config again, before it
-renames or types anything. When something is refused (or, for a jump started without the
+The helper checks all of that before it renames or types anything; a jump started without the
+waiting helper (or a line whose keys it did not check) finds the window and checks its keys
+again, the same way. When something is refused (or, for a jump started without the
 waiting helper, there is no herdr window in Ghostty), it
 renames nothing, types nothing, stops the waiting `osascript` and only asks herdr to focus the
 pane. Once it has renamed the pane, the original name comes back and the focus is sent whatever
@@ -353,9 +363,10 @@ from the system, not from your herdr configuration. So:
 - give the server a key of its own for this, and restrict it in the Mac's `authorized_keys`
   (for example with a `from=` option);
 - set `[jump] prefix` and `goto` to your herdr `[keys] prefix` and `goto` when they are not
-  herdr's defaults. The helper refuses to type when they differ from what it reads in that Mac's
-  herdr config; if herdr reads its config from somewhere else there, keystrokes with the wrong
-  keys land in the pane you are on, and the final Enter sends them there.
+  herdr's defaults. The helper refuses to type when they differ from what it finds for that
+  window (above); a herdr that resolves its keys some way the helper does not know of would
+  still get keystrokes with the wrong keys, which land in the pane you are on, and the final
+  Enter sends them there.
 
 With the jump off (by `enabled = false` or by a refused key), or when anything it needs is
 missing, Switchboard only focuses the pane through herdr on that pane's machine.

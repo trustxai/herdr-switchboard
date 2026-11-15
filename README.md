@@ -145,12 +145,23 @@ with no error and no wait beyond the one below.
 **If your herdr `[keys] prefix` or `[keys] goto` are not herdr's defaults (`ctrl+b` and
 `prefix+g`), set the same values under `[jump]`.** The jump types the prefix, the navigator key,
 `/`, a search and Enter into your window, and with other bindings those keys would land in the
-pane you are on. So before it types anything, the helper on the Mac reads that Mac's herdr
-config where herdr 0.9.5 does (`$HERDR_CONFIG_PATH`, else `$XDG_CONFIG_HOME/herdr/config.toml`,
-else `~/.config/herdr/config.toml`; no file means herdr's defaults) and compares its
-`[keys] prefix` and `goto` with `[jump]`'s. When they differ there is
-no jump: Enter focuses the pane on its machine, and the footer adds `no jump: set [jump] prefix
-and goto to this window's herdr keys`.
+pane you are on. So before it types anything, the helper on the Mac checks the window it would
+type into. It finds that window's herdr config from the window's own environment, as herdr
+0.9.5 picks it (`HERDR_CONFIG_PATH`, else `$XDG_CONFIG_HOME/herdr/config.toml`, else
+`~/.config/herdr/config.toml`; no file means herdr's defaults), reads its `[keys]` and
+`[[keys.command]]` bindings, and runs `herdr config check` on it. There is no jump when:
+
+- its `[keys] prefix` and `goto` are not `[jump]`'s;
+- another action, or a `[[keys.command]]`, is bound to goto's key or to the prefix;
+- `herdr config check` reports a parse or read error (herdr then uses every default) or says
+  anything about `keys.prefix` or `keys.goto`, or herdr is not there to ask;
+- the window was started with `--remote-keybindings server`, so it uses the server's keys;
+- anything is unsure: an environment it cannot read, a relative or missing path, or, on a Python
+  without `tomllib` (the `/usr/bin/python3` of macOS is 3.9), a config it cannot read line by
+  line for sure (a multi-line string, a quoted table name, `keys` set at the top level).
+
+Enter then focuses the pane on its machine, and the footer adds `no jump: set [jump] prefix and
+goto to this window's herdr keys`.
 
 ```toml
 [jump]
@@ -186,8 +197,8 @@ last. Setting `client` is safer.
 **What it runs on the Mac**, over ssh: `herdr plugin list --json` to find the plugin (unless
 `helper` is set), then the plugin's helper, started with the popup so Enter has one line to
 send. The helper looks for a herdr window whose terminal is Ghostty's (with several, the one you
-typed into last; when it cannot tell, none), and checks that Mac's herdr keys against `[jump]`;
-without such a window, or with keys that differ, it exits at once, and Enter focuses the pane
+typed into last; when it cannot tell, none), and checks that window's herdr keys (above);
+without such a window, or with keys it cannot confirm, it exits at once, and Enter focuses the pane
 instead. Otherwise it says it is ready, and only then does Enter jump. If you press Enter while
 that connection is still being set up, it waits for it at most 2 seconds; a Mac that does not
 answer, or a helper that says nothing within 8 seconds of starting, never holds the popup

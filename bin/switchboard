@@ -921,9 +921,9 @@ def header(entries, machines, pending, down, stale=()):
 DEMO = None  # a Demo when running --demo: herdr calls are answered from the fixtures
 
 
-def child_env(run_dir=None):
+def child_env(run_dir=None, extra=None):
     """The environment for anything started outside fzf: herdr, ssh, osascript, the jump
-    helper and the --enter worker.
+    helper and the --enter worker, plus the variables in `extra`.
 
     fzf exports its state to the commands it runs (FZF_SOCK is the socket inside the run
     directory, FZF_CURRENT_ITEM a row's text, and about thirty more FZF_* variables), and
@@ -931,9 +931,11 @@ def child_env(run_dir=None):
     variable, both SWITCHBOARD_RUN_* ones, and any other variable whose value holds the
     run directory's path."""
     run_dir = run_dir or os.environ.get("SWITCHBOARD_RUN_DIR") or ""
-    return {k: v for k, v in os.environ.items()
-            if not k.startswith("FZF_") and k not in ("SWITCHBOARD_RUN_DIR", "SWITCHBOARD_RUN_FD")
-            and not (run_dir and run_dir in v)}
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("FZF_") and k not in ("SWITCHBOARD_RUN_DIR", "SWITCHBOARD_RUN_FD")
+           and not (run_dir and run_dir in v)}
+    env.update(extra or {})
+    return env
 
 
 _RUNNING = set()  # children run_child() started that have not finished yet
@@ -948,7 +950,7 @@ KILL_WAIT = 2  # seconds run_child waits for a killed child's output pipe to clo
 PREVIEW_MODE = False
 
 
-def run_child(argv, timeout):
+def run_child(argv, timeout, extra_env=None):
     """subprocess.run for herdr, ssh and the like, bounded for real. Returns a
     CompletedProcess; raises TimeoutExpired like subprocess.run.
 
@@ -969,7 +971,7 @@ def run_child(argv, timeout):
     then runs until it ends by itself."""
     own_group = not PREVIEW_MODE
     p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                         universal_newlines=True, start_new_session=own_group, env=child_env())
+                         universal_newlines=True, start_new_session=own_group, env=child_env(extra=extra_env))
     p.switchboard_own_group = own_group
     with _RUNNING_LOCK:
         _RUNNING.add(p)
@@ -2583,24 +2585,36 @@ def answers_as_mac(host):
     return bool(argv) and run_out(argv, timeout=8).strip() == "Darwin"
 
 
-# The options of herdr's window (its TUI client) that take a value. Any other word on a herdr
-# command line that is not an option is a subcommand (agent, pane, server, ...): a CLI call.
-HERDR_WINDOW_VALUE_OPTIONS = ("--remote", "--session", "--machine", "--remote-session")
-ANCESTORS_MAX = 64  # parent links ghostty_tty follows at most
+# The options of herdr's window (its TUI client) that take a value, as `--opt value`; the
+# `--opt=value` form is one word. Any other word on a herdr command line that is not an option
+# is a subcommand (agent, pane, server, ...): a CLI call. `herdr session attach <name>` is the
+# one subcommand that opens a window.
+HERDR_WINDOW_VALUE_OPTIONS = ("--remote", "--session", "--machine", "--remote-session", "--remote-keybindings")
+ANCESTORS_MAX = 64  # parent links ghostty_window follows at most
 
 
 def herdr_window(words):
     """True when this split command line is herdr's window: `herdr` with options only, such as
-    `herdr --remote server` or `herdr --session work`. A subcommand anywhere makes it a CLI
-    call, not a window: `herdr server`, `herdr --machine server agent list`."""
+    `herdr --remote server` or `herdr --session work`, or `herdr session attach <name>`. Any
+    other subcommand makes it a CLI call, not a window: `herdr server`,
+    `herdr --machine server agent list`."""
     if not words or os.path.basename(words[0]) != "herdr":
         return False
-    i = 1
+    i = 4 if words[1:3] == ["session", "attach"] and len(words) > 3 else 1
     while i < len(words):
         if not words[i].startswith("-"):
             return False
         i += 2 if words[i] in HERDR_WINDOW_VALUE_OPTIONS else 1
     return True
+
+
+def server_keybindings(words):
+    """True when this window was started with `--remote-keybindings server`: it then uses the
+    keys of the herdr server it is attached to, not this machine's config."""
+    for i, w in enumerate(words):
+        if w == "--remote-keybindings=server" or (w == "--remote-keybindings" and words[i + 1:i + 2] == ["server"]):
+            return True
+    return False
 
 
 def _is_ghostty(command):
@@ -2612,23 +2626,27 @@ def _is_ghostty(command):
 
 def tty_atime(tty):
     """When the terminal last got input: its access time, which is what `w` reads as idle
-    time. None when it cannot be read."""
+    time. Input is not only keys: the terminal's own reports (focus in and out, a colour
+    scheme change) move it too, and on macOS devfs updates it lazily, about once a second
+    (DEVFS_LAZY_UPDATE_SECONDS), so two windows used within the same second can tie. None
+    when it cannot be read."""
     try:
         return os.stat(tty).st_atime
     except OSError:
         return None
 
 
-def ghostty_tty(ps_text=None, atime=tty_atime):
-    """The tty of the herdr window on this machine that runs in Ghostty, or None.
+def ghostty_window(ps_text=None, atime=tty_atime):
+    """(pid, tty, words) of the herdr window on this machine that runs in Ghostty, or None.
 
     A window is herdr_window(), on a terminal; Ghostty must be one of its ancestors (by parent
     pid), because the jump types through Ghostty's AppleScript. A herdr window in another
     terminal, or inside tmux (whose server is not below Ghostty), does not count: nothing is
     typed, osascript never asks for an application that is not there or not running, and
     Enter takes the focus path. With several such windows, the one whose terminal got input
-    last, which is the one that opened the popup; None when that cannot be told (a tie, or a
-    terminal it cannot read), rather than typing into the other one.
+    last (tty_atime), which is the one that opened the popup; None when that cannot be told
+    (a tie, or a terminal it cannot read), rather than typing into the other one. Two herdr
+    processes on the same terminal: the one with the higher pid, which started later.
     ps_text is `ps -axo pid=,ppid=,tty=,command=`."""
     ps_text = ps_text if ps_text is not None else run_out(["ps", "-ww", "-axo", "pid=,ppid=,tty=,command="])
     procs = {}
@@ -2636,27 +2654,36 @@ def ghostty_tty(ps_text=None, atime=tty_atime):
         parts = line.split(None, 3)
         if len(parts) == 4 and parts[0].isdigit() and parts[1].isdigit():
             procs[int(parts[0])] = (int(parts[1]), parts[2], parts[3])
-    ttys = []
+    windows = {}  # tty: (pid, words)
     for pid in sorted(procs):
         ppid, tty, command = procs[pid]
-        if tty in ("??", "?") or not herdr_window(command.split()):
+        words = command.split()
+        if tty in ("??", "?") or not herdr_window(words):
             continue
         seen = set()
         while ppid in procs and ppid not in seen and len(seen) < ANCESTORS_MAX:
             seen.add(ppid)
             if _is_ghostty(procs[ppid][2]):
-                path = tty if tty.startswith("/dev/") else "/dev/" + tty
-                if path not in ttys:
-                    ttys.append(path)
+                windows[tty if tty.startswith("/dev/") else "/dev/" + tty] = (pid, words)
                 break
             ppid = procs[ppid][0]
-    if len(ttys) <= 1:
-        return ttys[0] if ttys else None
-    stamped = [(atime(t), t) for t in ttys]
-    if any(when is None for when, _ in stamped):
-        return None
-    stamped.sort(reverse=True)
-    return stamped[0][1] if stamped[0][0] != stamped[1][0] else None
+    if len(windows) > 1:
+        stamped = [(atime(t), t) for t in windows]
+        if any(when is None for when, _ in stamped):
+            return None
+        stamped.sort(reverse=True)
+        if stamped[0][0] == stamped[1][0]:
+            return None
+        windows = {stamped[0][1]: windows[stamped[0][1]]}
+    for tty, (pid, words) in windows.items():
+        return pid, tty, words
+    return None
+
+
+def ghostty_tty(ps_text=None, atime=tty_atime):
+    """The tty of ghostty_window(), or None."""
+    window = ghostty_window(ps_text, atime)
+    return window[1] if window else None
 
 
 IDLE_TIMEOUT = 6  # seconds for one HIDIdleTime probe (a single ioreg, over ssh or not)
@@ -2799,18 +2826,24 @@ def ghostty_keys_script(tty, query, keys=None):
 def jump(label, kind, pane, tab, query, rename, old_label, keys=None, wait=0.15, tty=None, osa=None):
     """Runs on the Mac of the window, while the popup closes.
 
-    tty and osa come ready from --jump-server: the window's tty and an osascript already
-    started and waiting for the script on stdin.
+    tty and osa come ready from --jump-server: the window's tty, once it checked the window
+    and these keys, and an osascript already started and waiting for the script on stdin.
+    Without a tty, jump() finds the window (ghostty_window) and checks the keys itself
+    (window_keys_match).
 
     What it would type is checked before anything changes. With keys, a query or a tty
-    outside their closed sets, keys this machine's herdr does not bind to its prefix and
-    navigator (window_keys_match), or no herdr window in Ghostty to type into, nothing is renamed
-    or typed and only the API focus goes out (the popup sent one already: the pane is ready
-    on its machine). A rename that had to be undone after a refused script would leave the
-    pane with the temporary name."""
+    outside their closed sets, keys that would not open that window's navigator, or no herdr
+    window in Ghostty to type into, nothing is renamed or typed and only the API focus goes
+    out (the popup sent one already: the pane is ready on its machine). A rename that had to
+    be undone after a refused script would leave the pane with the temporary name."""
     keys = keys or JUMP_KEYS
-    refused = not typeable(query, keys) or not window_keys_match(keys)
-    tty = None if refused else (tty or ghostty_tty())
+    refused = not typeable(query, keys)
+    if not refused and not tty:
+        window = ghostty_window()
+        if window is not None and window_keys_match(keys, window):
+            tty = window[1]
+        elif window is not None:
+            refused = True
     script = None
     if tty:
         try:
@@ -2874,104 +2907,248 @@ def jump_argv(target, label, entries):
 JUMP_READY = "switchboard-jump-ready"  # the line --jump-server prints once it can type
 JUMP_KEYS_DIFFER = "switchboard-jump-keys-differ"  # ...or once it found the keys would not open the Goto
 HERDR_DEFAULT_KEYS = ("ctrl+b", "prefix+g")  # herdr's own [keys] prefix and goto (herdr 0.9.5)
+HERDR_CHECK_TIMEOUT = 5  # seconds for `herdr config check`
+WINDOW_ENV = ("HERDR_CONFIG_PATH", "XDG_CONFIG_HOME", "HOME")  # what decides the window's config
 
 
-def herdr_config_path(env=None):
-    """herdr's config.toml on this machine, where herdr 0.9.5 reads it: $HERDR_CONFIG_PATH, else
-    $XDG_CONFIG_HOME/herdr/config.toml, else ~/.config/herdr/config.toml."""
-    env = os.environ if env is None else env
-    if env.get("HERDR_CONFIG_PATH"):
-        return env["HERDR_CONFIG_PATH"]
-    home = env.get("HOME") or os.path.expanduser("~")
-    return os.path.join(env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "herdr", "config.toml")
+def window_env(pid):
+    """{name: value} of the WINDOW_ENV variables the window process started with (only those
+    that are set), or None when its environment cannot be read. The helper's own environment
+    is not the window's: a non-interactive ssh shell does not read the profile files where
+    these are usually exported. Linux: /proc/<pid>/environ. macOS: `ps -E`, which separates
+    variables with spaces, so a value with a space comes out cut short; window_config_path()
+    then finds nothing there and refuses it."""
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as f:
+            pairs = [kv.split("=", 1) for kv in f.read().decode("utf-8", "replace").split("\0") if "=" in kv]
+        return {k: v for k, v in pairs if k in WINDOW_ENV}
+    except OSError:
+        pass
+    out = run_out(["ps", "-wwE", "-p", str(pid), "-o", "command="])
+    if not out.strip():
+        return None
+    found = {}
+    for name in WINDOW_ENV:
+        m = re.search(r"(?:^|\s)%s=(\S*)" % name, out)
+        if m:
+            found[name] = m.group(1)
+    return found
+
+
+def window_config_path(env):
+    """The herdr config.toml a window with this environment reads, picked as herdr 0.9.5
+    does (measured with `herdr config check`): HERDR_CONFIG_PATH when it is set, even empty;
+    else $XDG_CONFIG_HOME/herdr/config.toml when that is set; else
+    $HOME/.config/herdr/config.toml. None when that cannot be relied on: an empty or relative
+    path (herdr reads it from its own working directory), a HERDR_CONFIG_PATH that is not a
+    file, or an XDG_CONFIG_HOME or HOME that is not a directory (a value cut short by ps
+    looks like that)."""
+    if "HERDR_CONFIG_PATH" in env:
+        path = env["HERDR_CONFIG_PATH"]
+        return path if os.path.isabs(path) and os.path.isfile(path) else None
+    if "XDG_CONFIG_HOME" in env:
+        base = env["XDG_CONFIG_HOME"]
+        if not (os.path.isabs(base) and os.path.isdir(base)):
+            return None
+    else:
+        home = env.get("HOME") or os.path.expanduser("~")
+        if not (os.path.isabs(home) and os.path.isdir(home)):
+            return None
+        base = os.path.join(home, ".config")
+    return os.path.join(base, "herdr", "config.toml")
+
+
+_HEADER = re.compile(r"(\[\[?)[ \t]*([A-Za-z0-9_-]+(?:[ \t]*\.[ \t]*[A-Za-z0-9_-]+)*)[ \t]*(\]\]?)")
+MULTILINE_QUOTES = ('"' * 3, "'" * 3)
 
 
 def _keys_table(text):
-    """{prefix, goto} as far as herdr's [keys] table sets them, for a Python without tomllib.
-    parse_toml_subset refuses a whole herdr config (its [[keys.command]] blocks, arrays), so
-    this reads only the lines of [keys], with the same string reader; every other table and
-    every other key is skipped. None when a prefix or goto line, or a table header, cannot
-    be read."""
-    keys, table = {}, None
+    """({name: value} of herdr's [keys] table, [the key of each [[keys.command]]]), read line by
+    line for a Python without tomllib: parse_toml_subset refuses a whole herdr config (its
+    [[keys.command]] blocks, arrays). It reads [keys] with the same string reader and skips the
+    other tables. None, so that the keys count as differing, for anything it cannot be sure
+    of: a multi-line string anywhere (it can hold lines that look like a table), a table
+    header with quotes or anything but plain names, a table under keys other than [keys]
+    and [[keys.command]], a `keys` key at the top level (dotted, `keys.prefix = ...`, or
+    inline, `keys = {...}`), and in [keys] any line that is not `name = value` with a single
+    value, or a prefix or goto that is not a string."""
+    if any(q in text for q in MULTILINE_QUOTES):
+        return None
+    table, keys, commands = None, {}, []
     for n, line in enumerate(text.split("\n"), 1):
         s = line.rstrip("\r").strip(" \t")
         if not s or s.startswith("#"):
             continue
         if s.startswith("["):
-            if "]" not in s:
-                return None  # a broken header: herdr would not read this file either
-            table = None if s.startswith("[[") else s[1:s.index("]")].strip(" \t")
+            m = _HEADER.match(s)
+            if not m or len(m.group(1)) != len(m.group(3)) or not _comment_only(s, m.end()):
+                return None
+            name, array = re.sub(r"[ \t]", "", m.group(2)), m.group(1) == "[["
+            if name.split(".")[0] != "keys":
+                table = "other"
+            elif (name, array) == ("keys", False):
+                table = "keys"
+            elif (name, array) == ("keys.command", True):
+                table = "command"
+            else:
+                return None
             continue
-        if table != "keys":
+        if table == "other":
             continue
         try:
             key, i = _key(s, 0, n)
         except ConfigError:
-            continue
-        if key not in ("prefix", "goto"):
+            if table == "keys":
+                return None
+            continue  # say, a line of a multi-line array
+        if table is None:
+            if key == "keys":
+                return None
             continue
         i = _skip(s, i)
+        if table == "command" and (key != "key" or s[i:i + 1] != "="):
+            continue
         try:
             if s[i:i + 1] != "=" or _skip(s, i + 1) >= len(s):
                 return None
             value, i = _value(s, _skip(s, i + 1), n)
         except ConfigError:
             return None
-        if not _comment_only(s, i) or not isinstance(value, str):
+        if not _comment_only(s, i):
             return None
-        keys[key] = value
-    return keys
+        if table == "command":
+            if not isinstance(value, str):
+                return None
+            commands.append(value)
+        elif isinstance(value, str):
+            keys[key] = value
+        elif key in ("prefix", "goto"):
+            return None
+    return keys, commands
 
 
-def herdr_keys(text):
-    """(prefix, goto) of a herdr config.toml, herdr's defaults for what it does not set; None
-    when they cannot be read, and then the keys cannot be confirmed."""
+def herdr_bindings(text):
+    """What a herdr config.toml binds, as far as the jump needs: (prefix, goto, others), with
+    herdr's defaults for prefix and goto, and in `others` every other key bound in [keys] and
+    by its [[keys.command]] blocks. None when it cannot be read for sure; then the keys count
+    as differing."""
     if tomllib is not None:
         try:
             keys = tomllib.loads(text).get("keys", {})
         except ValueError:
             return None
+        if not isinstance(keys, dict):
+            return None
+        table, commands = {}, []
+        for name, value in keys.items():
+            if name == "command":
+                if not isinstance(value, list) or not all(isinstance(c, dict) for c in value):
+                    return None
+                for c in value:
+                    if "key" in c:
+                        if not isinstance(c["key"], str):
+                            return None
+                        commands.append(c["key"])
+            elif isinstance(value, str):
+                table[name] = value
+            elif name in ("prefix", "goto") or isinstance(value, (list, dict)):
+                return None
     else:
-        keys = _keys_table(text)
-    if not isinstance(keys, dict):
-        return None
-    prefix, goto = keys.get("prefix", HERDR_DEFAULT_KEYS[0]), keys.get("goto", HERDR_DEFAULT_KEYS[1])
-    return (prefix, goto) if isinstance(prefix, str) and isinstance(goto, str) else None
+        got = _keys_table(text)
+        if got is None:
+            return None
+        table, commands = dict(got[0]), got[1]
+    prefix = table.pop("prefix", HERDR_DEFAULT_KEYS[0])
+    goto = table.pop("goto", HERDR_DEFAULT_KEYS[1])
+    return prefix, goto, list(table.values()) + commands
 
 
-def window_keys_match(keys, path=None):
-    """True when `keys`, the Ghostty text the jump types (JUMP_KEYS: [jump] prefix, goto, /),
-    is what this machine's herdr binds to its prefix and navigator, so the Goto opens instead
-    of the keys landing in a pane. Read from herdr's config.toml here (the window's herdr
-    resolves the keys, not the server's); no file means herdr's defaults. False when the
-    file cannot be read, or binds keys the jump could not type."""
+def herdr_keys(text):
+    """(prefix, goto) of a herdr config.toml, or None (herdr_bindings)."""
+    got = herdr_bindings(text)
+    return got[:2] if got else None
+
+
+def same_key(a, b):
+    """True when two herdr key strings may name the same key: equal ignoring case, or the
+    same character after prefix+, written as itself or by herdr's name for it."""
+    if a.lower() == b.lower():
+        return True
+    ca = goto_char(a)
+    return ca is not None and ca == goto_char(b)
+
+
+def herdr_config_check(path):
+    """True when `herdr config check`, run on that file, says nothing that touches the prefix
+    or the navigator: not "using defaults" or "keeping current config" (a parse or read
+    error makes herdr use every default), and no diagnostic that names keys.prefix or
+    keys.goto (another action bound to goto's key disables goto). Other diagnostics, such as
+    an unknown key elsewhere, do not count. False when herdr is not there, fails, says
+    something else or takes longer than HERDR_CHECK_TIMEOUT. Its output as of herdr 0.9.5."""
     try:
-        with open(path or herdr_config_path(), "rb") as f:
+        r = run_child([HERDR, "config", "check"], HERDR_CHECK_TIMEOUT, extra_env={"HERDR_CONFIG_PATH": path})
+    except (OSError, subprocess.SubprocessError):
+        return False
+    out = r.stdout or ""
+    lines = out.strip().splitlines()
+    if r.returncode not in (0, 1) or not lines or lines[0].strip() not in ("config: ok", "config: issues found"):
+        return False
+    return not any(w in out.lower() for w in ("using defaults", "keeping current config", "keys.prefix", "keys.goto"))
+
+
+def window_keys_match(keys, window, env_of=None):
+    """True when `keys`, the Ghostty text the jump types (JUMP_KEYS: [jump] prefix, goto, /),
+    opens the navigator of that herdr window, (pid, tty, words) from ghostty_window(). Every
+    doubt counts as no:
+    - the window uses the server's keys (`--remote-keybindings server`);
+    - its config cannot be located from its own environment (window_env, window_config_path)
+      or read for sure (herdr_bindings); no file there means herdr's defaults;
+    - its prefix and goto are not those keys;
+    - another binding in [keys] or a [[keys.command]] is on goto's key or on the prefix;
+    - `herdr config check` on that file says anything about them (herdr_config_check)."""
+    pid, _tty, words = window
+    if server_keybindings(words):
+        return False
+    env = (env_of or window_env)(pid)
+    path = window_config_path(env) if env is not None else None
+    if path is None:
+        return False
+    try:
+        with open(path, "rb") as f:
             text = f.read().decode("utf-8")
     except FileNotFoundError:
         text = ""
     except (OSError, ValueError):
         return False
-    got = herdr_keys(text)
-    return got is not None and goto_keys(got[0].lower(), got[1]) == keys
+    got = herdr_bindings(text)
+    if got is None:
+        return False
+    prefix, goto, others = got
+    if goto_keys(prefix.lower(), goto) != keys:
+        return False
+    if any(same_key(b, goto) or same_key(b, prefix) for b in others):
+        return False
+    return herdr_config_check(path)
 
 
 def jump_server(stdin=None, stdout=None, keys=None):
     """--jump-server [KEYS]: runs on the Mac of the window from the moment the popup opens.
 
-    With a herdr window in Ghostty (ghostty_tty) whose herdr binds KEYS (the keys the popup
-    will have typed, window_keys_match), it gets the tty and an osascript ready, prints
+    With a herdr window in Ghostty (ghostty_window) that KEYS open the navigator of (the keys
+    the popup will have typed, window_keys_match), it gets an osascript ready, prints
     JUMP_READY, and waits for one line with the jump's arguments. Only after JUMP_READY does
-    the popup let Enter jump. With keys that differ it prints JUMP_KEYS_DIFFER instead and
-    exits, starting nothing: Enter takes the focus path and its footer says why. With no such
-    window it exits at once, printing nothing and starting nothing. On EOF with nothing (a
-    row of the popup's own machine was picked, or Esc), it exits."""
+    the popup let Enter jump. When KEYS would not open it, it prints JUMP_KEYS_DIFFER instead
+    and exits, starting nothing: Enter takes the focus path and its footer says why. With no
+    such window it exits at once, printing nothing and starting nothing. On EOF with nothing
+    (a row of the popup's own machine was picked, or Esc), it exits. A line whose keys are not
+    the KEYS it checked (or no KEYS, from an older popup) goes to jump() without the tty, which
+    then finds and checks the window itself."""
     stdin = stdin or sys.stdin
     stdout = stdout or sys.stdout
-    tty = ghostty_tty()
-    if not tty:
+    window = ghostty_window()
+    if not window:
         return 0
-    if keys is not None and not window_keys_match(keys):
+    if keys is not None and not window_keys_match(keys, window):
         say = JUMP_KEYS_DIFFER
     else:
         say = JUMP_READY
@@ -2998,8 +3175,11 @@ def jump_server(stdin=None, stdout=None, keys=None):
         osa.kill()
         return 0
     # jump() checks the query and the keys before it renames or types anything.
+    if args[8] != keys:
+        osa.kill()
+        return jump(args[1], args[2], args[3], args[4], args[5], args[6] == "1", args[7], keys=args[8], wait=0.05)
     return jump(args[1], args[2], args[3], args[4], args[5], args[6] == "1", args[7], keys=args[8],
-                wait=0.05, tty=tty, osa=osa)
+                wait=0.05, tty=window[1], osa=osa)
 
 
 JUMP_STATE = "jump"  # in the run directory: the link's state, for --enter (jump_state)

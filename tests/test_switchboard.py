@@ -861,6 +861,19 @@ typed = {"/dev/ttys000": 100.0, "/dev/ttys001": 200.0}
 check("tty-two-windows-the-one-typed-into-last", sb.ghostty_tty(two, atime=typed.get) == "/dev/ttys001"
       and sb.ghostty_tty(two, atime={"/dev/ttys000": 300.0, "/dev/ttys001": 200.0}.get) == "/dev/ttys000",
       sb.ghostty_tty(two, atime=typed.get))
+# The window process comes along: its environment and arguments decide its keys (block 41).
+check("window-process-of-the-tty", sb.ghostty_window(two, atime=typed.get) == (70000, "/dev/ttys001",
+                                                                             ["/opt/homebrew/bin/herdr", "--remote", "server"]))
+# `herdr session attach <name>` is a window too, and --remote-keybindings takes a value.
+attach = "\n".join(TUI.splitlines()[:4] + ["  730   702 ttys000  /opt/homebrew/bin/herdr session attach work"])
+check("tty-session-attach-is-a-window", sb.ghostty_tty(attach) == "/dev/ttys000"
+      and sb.herdr_window("herdr --remote server --remote-keybindings server".split())
+      and sb.herdr_window("herdr --remote server --remote-keybindings=local".split())
+      and not sb.herdr_window("herdr session list".split()) and not sb.herdr_window("herdr session attach".split()),
+      sb.ghostty_tty(attach))
+check("server-keybindings-seen", sb.server_keybindings("herdr --remote s --remote-keybindings server".split())
+      and sb.server_keybindings("herdr --remote-keybindings=server".split())
+      and not sb.server_keybindings("herdr --remote-keybindings local".split()) and not sb.server_keybindings(["herdr"]))
 check("tty-two-windows-ambiguous-is-none", sb.ghostty_tty(two, atime=lambda t: 100.0) is None
       and sb.ghostty_tty(two, atime=lambda t: None) is None and sb.ghostty_tty(two, atime={"/dev/ttys000": 1.0}.get) is None)
 
@@ -888,9 +901,10 @@ for bad in (("/dev/ttys000", 'x" & do shell script "rm'), ("/dev/tty; rm", "w1:p
         pass
 
 calls = []
-orig = (sb.run_out, sb.ghostty_tty, sb.subprocess.run, sb.time.sleep, sb.local_label)
+orig = (sb.run_out, sb.ghostty_window, sb.window_keys_match, sb.subprocess.run, sb.time.sleep, sb.local_label)
 sb.run_out = lambda argv, timeout=5: calls.append(("herdr", argv[1:])) or ""
-sb.ghostty_tty = lambda ps_text=None: "/dev/ttys000"
+sb.ghostty_window = lambda ps_text=None, atime=None: (60526, "/dev/ttys000", ["herdr"])
+sb.window_keys_match = lambda keys, window, env_of=None: True  # its own checks are in block 41
 sb.subprocess.run = lambda argv, **kw: calls.append(("osa", argv[0])) or None
 sb.time.sleep = lambda s: None
 sb.local_label = lambda: "mac1"
@@ -908,7 +922,7 @@ try:
     sb.jump("box1", "a", "w1:p1", "w1:t1", "sbjabc", True, "logs")
     check("jump-restores-the-name", ("herdr", ["--machine", "box1", "pane", "rename", "w1:p1", "logs"]) in calls, calls)
 finally:
-    sb.run_out, sb.ghostty_tty, sb.subprocess.run, sb.time.sleep, sb.local_label = orig
+    sb.run_out, sb.ghostty_window, sb.window_keys_match, sb.subprocess.run, sb.time.sleep, sb.local_label = orig
 
 args = sb.jump_argv({"machine": "m1", "kind": "a", "pane": "w1:p1", "tab": "w1:t1"}, "box1",
                     ents[:3] + [ent("m2", "w1:p1", pane_label="logs")])
@@ -1086,58 +1100,68 @@ class FakeOsa:
         killed.append(1)
 
 
-orig = (sb.jump, sb.ghostty_tty, sb.subprocess.Popen)
+orig = (sb.jump, sb.ghostty_window, sb.window_env, sb.herdr_config_check, sb.subprocess.Popen)
+WIN13 = (60526, "/dev/ttys000", ["/opt/homebrew/bin/herdr"])
 sb.jump = lambda *a, **kw: got_jump.append((a, kw)) or 0
-sb.ghostty_tty = lambda ps_text=None: "/dev/ttys000"
+sb.ghostty_window = lambda ps_text=None, atime=None: WIN13
+sb.herdr_config_check = lambda path: True  # its own checks are in block 41
 sb.subprocess.Popen = lambda argv, **kw: FakeOsa()
+keys_dir = tempfile.mkdtemp(dir=_tmp_root)
+os.mkdir(os.path.join(keys_dir, "home"))
+herdr_cfg = os.path.join(keys_dir, "config.toml")
+with open(herdr_cfg, "w") as f:
+    f.write('[keys]\ngoto = "prefix+/"\n\n[[keys.command]]\nkey = "prefix+space"\ntype = "plugin_action"\n')
+sb.window_env = lambda pid: {"HERDR_CONFIG_PATH": herdr_cfg} if pid == WIN13[0] else None
 try:
     said = _io.StringIO()
-    sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", "w1:p1", "1", "logs", "\\x01//"])
-                                + "\n"), said)
+    sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", "w1:p1", "1", "logs", "\\x02//"])
+                                + "\n"), said, keys="\\x02//")
     check("server-says-it-is-ready", said.getvalue() == sb.JUMP_READY + "\n", said.getvalue())
     check("server-jumps-with-what-is-ready", got_jump and got_jump[0][0] == ("box1", "a", "w1:p1", "w1:t1", "w1:p1", True, "logs")
           and got_jump[0][1].get("tty") == "/dev/ttys000" and isinstance(got_jump[0][1].get("osa"), FakeOsa)
-          and got_jump[0][1].get("keys") == "\\x01//", got_jump)
+          and got_jump[0][1].get("keys") == "\\x02//", got_jump)
+    # A line whose keys it did not check (an older popup passes none): jump() gets no tty and
+    # finds and checks the window itself.
     got_jump.clear()
-    sb.jump_server(_io.StringIO(""), _io.StringIO())
+    sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", "w1:p1", "1", "logs", "\\x02//"])
+                                + "\n"), _io.StringIO())
+    check("server-unchecked-keys-go-to-jump-without-the-tty", got_jump and "tty" not in got_jump[0][1]
+          and "osa" not in got_jump[0][1], got_jump)
+    got_jump.clear()
+    sb.jump_server(_io.StringIO(""), _io.StringIO(), keys="\\x02//")
     check("server-no-line-no-jump", not got_jump and killed, (got_jump, killed))
     killed.clear()
-    sb.jump_server(_io.StringIO("not json\n"), _io.StringIO())
+    sb.jump_server(_io.StringIO("not json\n"), _io.StringIO(), keys="\\x02//")
     check("server-broken-line-no-jump", not got_jump and killed)
     # No herdr window in Ghostty on this Mac: it says nothing, starts no osascript and reads no
     # line, so the popup's Enter takes the focus path.
-    sb.ghostty_tty = lambda ps_text=None: None
+    sb.ghostty_window = lambda ps_text=None, atime=None: None
     said, line, osas[:] = _io.StringIO(), _io.StringIO(json.dumps(["--jump"] * 9) + "\n"), []
-    rc = sb.jump_server(line, said)
+    rc = sb.jump_server(line, said, keys="\\x02//")
     check("server-without-a-window-says-nothing", rc == 0 and said.getvalue() == "" and not osas
           and line.tell() == 0 and not got_jump, (rc, said.getvalue(), osas, line.tell()))
-    # The keys the popup will type (--jump-server KEYS) against this Mac's herdr config: when
-    # they match it says it is ready; when they differ it says so instead, starts no osascript
-    # and reads no line, and the popup's Enter takes the focus path. No config: herdr's defaults.
-    sb.ghostty_tty = lambda ps_text=None: "/dev/ttys000"
-    keys_dir = tempfile.mkdtemp(dir=_tmp_root)
-    herdr_cfg = os.path.join(keys_dir, "config.toml")
-    with open(herdr_cfg, "w") as f:
-        f.write('[keys]\ngoto = "prefix+/"\n\n[[keys.command]]\nkey = "prefix+space"\ntype = "plugin_action"\n')
+    # The keys the popup will type (--jump-server KEYS) against the window's herdr config, found
+    # from the window's own environment: when they match it says it is ready; when they differ it
+    # says so instead, starts no osascript and reads no line, and the popup's Enter takes the
+    # focus path. No config file (the window's HOME without one): herdr's defaults.
+    sb.ghostty_window = lambda ps_text=None, atime=None: WIN13
     told = {}
-    os.environ["HERDR_CONFIG_PATH"] = herdr_cfg
-    try:
-        for name, keys, path in (("match", "\\x02//", herdr_cfg), ("goto", "\\x02g/", herdr_cfg),
-                                 ("prefix", "\\x01//", herdr_cfg), ("none", "\\x02g/", herdr_cfg + ".none"),
-                                 ("none-differs", "\\x02//", herdr_cfg + ".none")):
-            os.environ["HERDR_CONFIG_PATH"] = path
-            said, line, osas[:], got_jump[:] = _io.StringIO(), _io.StringIO(json.dumps(["--jump"] * 9) + "\n"), [], []
-            sb.jump_server(line, said, keys=keys)
-            told[name] = (said.getvalue().strip(), len(osas), line.tell() > 0)
-    finally:
-        del os.environ["HERDR_CONFIG_PATH"]
+    for name, keys, env in (("match", "\\x02//", {"HERDR_CONFIG_PATH": herdr_cfg}),
+                            ("goto", "\\x02g/", {"HERDR_CONFIG_PATH": herdr_cfg}),
+                            ("prefix", "\\x01//", {"HERDR_CONFIG_PATH": herdr_cfg}),
+                            ("none", "\\x02g/", {"HOME": os.path.join(keys_dir, "home")}),
+                            ("none-differs", "\\x02//", {"HOME": os.path.join(keys_dir, "home")})):
+        sb.window_env = lambda pid, env=env: env
+        said, line, osas[:], got_jump[:] = _io.StringIO(), _io.StringIO(json.dumps(["--jump"] * 9) + "\n"), [], []
+        sb.jump_server(line, said, keys=keys)
+        told[name] = (said.getvalue().strip(), len(osas), line.tell() > 0)
     check("server-ready-when-the-keys-match", told["match"] == (sb.JUMP_READY, 1, True)
           and told["none"] == (sb.JUMP_READY, 1, True), told)
     check("server-says-the-keys-differ", all(told[k] == (sb.JUMP_KEYS_DIFFER, 0, False)
                                              for k in ("goto", "prefix", "none-differs")), told)
     check("main-hands-the-keys-to-the-helper", "return jump_server(keys=argv[1] if len(argv) > 1 else None)" in SOURCE)
 finally:
-    sb.jump, sb.ghostty_tty, sb.subprocess.Popen = orig
+    sb.jump, sb.ghostty_window, sb.window_env, sb.herdr_config_check, sb.subprocess.Popen = orig
 
 # 14. No child reads the popup's terminal.
 block("14. No child reads the popup's terminal")
@@ -3348,35 +3372,170 @@ for prefix, goto in (("f12", "prefix+g"), ("ctrl+B", "prefix+g"), ("ctrl+b", "g"
                      ("ctrl+b", 'prefix+"'), ("ctrl+b", "prefix+\\"), ("ctrl+b", "prefix+gg"), ("ctrl+b\n", "prefix+g"),
                      ("ctrl+b", "prefix+g\n"), ("", "")):
     check("jump-keys-refused %r" % ((prefix, goto),), sb.goto_keys(prefix, goto) is None)
-# The window's herdr keys, read from a herdr config.toml: [keys] prefix and goto, herdr's defaults
-# for what it does not set. Without tomllib (Python 3.9 and 3.10) only [keys] is read, line by
-# line: [[keys.command]] blocks, arrays and other tables (a `prefix` in [ui]) are skipped.
+# The window's herdr keys, read from that window's config.toml: [keys] prefix and goto, herdr's
+# defaults for what it does not set, and every other key bound in [keys] and [[keys.command]].
+# Without tomllib (Python 3.9 and 3.10, the /usr/bin/python3 of the Macs) the file is read line
+# by line, [keys] and the keys of [[keys.command]] only; what that cannot be sure of is None.
 HERDR_CFG = ('onboarding = false\n[keys]\nsettings = "prefix+."\ngoto = "prefix+/"  # the navigator\n\n'
              '[[keys.command]]\nkey = "prefix+space"\ntype = "plugin_action"\n[ui]\nprefix = "ctrl+z"\nlist = [1, 2]\n')
-check("herdr-keys-read", sb.herdr_keys(HERDR_CFG) == ("ctrl+b", "prefix+/"), sb.herdr_keys(HERDR_CFG))
-check("herdr-keys-without-tomllib", sb._keys_table(HERDR_CFG) == {"goto": "prefix+/"}
-      and sb._keys_table('[keys]\nprefix = "ctrl+a"\n') == {"prefix": "ctrl+a"}, sb._keys_table(HERDR_CFG))
-check("herdr-keys-defaults", sb.herdr_keys("") == ("ctrl+b", "prefix+g") and sb._keys_table("") == {})
+check("herdr-keys-read", sb.herdr_keys(HERDR_CFG) == ("ctrl+b", "prefix+/")
+      and sb.herdr_bindings(HERDR_CFG) == ("ctrl+b", "prefix+/", ["prefix+.", "prefix+space"]), sb.herdr_bindings(HERDR_CFG))
+check("herdr-keys-without-tomllib", sb._keys_table(HERDR_CFG) == ({"settings": "prefix+.", "goto": "prefix+/"}, ["prefix+space"])
+      and sb._keys_table('[keys]\nprefix = "ctrl+a"\n') == ({"prefix": "ctrl+a"}, []), sb._keys_table(HERDR_CFG))
+check("herdr-keys-defaults", sb.herdr_keys("") == ("ctrl+b", "prefix+g") and sb._keys_table("") == ({}, []))
 check("herdr-keys-unreadable", sb._keys_table('[keys]\ngoto =\n') is None and sb._keys_table('[keys]\ngoto = 7\n') is None
       and sb.herdr_keys('[keys]\ngoto = 7\n') is None and sb.herdr_keys("[keys\n") is None)
-check("herdr-config-path", sb.herdr_config_path({"HERDR_CONFIG_PATH": "/c/h.toml", "XDG_CONFIG_HOME": "/x", "HOME": "/h"})
-      == "/c/h.toml" and sb.herdr_config_path({"XDG_CONFIG_HOME": "/x", "HOME": "/h"}) == "/x/herdr/config.toml"
-      and sb.herdr_config_path({"HOME": "/h"}) == "/h/.config/herdr/config.toml")
+# What the line reader cannot be sure of is None (the keys count as differing): before, a dotted
+# or inline `keys` at the top, a quoted header and a [keys] inside a multi-line string all read
+# as herdr's defaults or as real.
+UNSURE = {
+    "dotted": 'keys.prefix = "ctrl+a"\n',
+    "inline": 'keys = { prefix = "ctrl+a" }\n',
+    "quoted-header": '["keys"]\nprefix = "ctrl+a"\n',
+    # (the string ends in a [[keys.command]] it opens, so read line by line it would pass)
+    "multiline": ('[keys]\ngoto = "prefix+/"\n[[keys.command]]\nkey = "prefix+space"\ncommand = """\n[keys]\n'
+                  'goto = "prefix+g"\n[[keys.command]]\nkey = "x"\n"""\n'),
+    "sub-table": '[keys.extra]\nx = "prefix+g"\n',
+    "array-value": '[keys]\ngoto = ["prefix+g"]\n',
+}
+check("keys-reader-refuses-what-it-cannot-be-sure-of", all(sb._keys_table(t) is None for t in UNSURE.values()),
+      [k for k, t in UNSURE.items() if sb._keys_table(t) is not None])
+saved_tomllib = sb.tomllib
+sb.tomllib = None
+try:
+    check("keys-without-tomllib-unsure-is-none", all(sb.herdr_bindings(t) is None for t in UNSURE.values()),
+          [k for k, t in UNSURE.items() if sb.herdr_bindings(t) is not None])
+finally:
+    sb.tomllib = saved_tomllib
 with tempfile.TemporaryDirectory() as d41:
-    def match41(text, keys):
+    cfg41 = os.path.join(d41, "h.toml")
+    open(cfg41, "w").close()
+    xdg41, home41 = os.path.join(d41, "xdg"), os.path.join(d41, "home")
+    os.makedirs(os.path.join(xdg41, "herdr"))
+    os.mkdir(home41)
+    P = sb.window_config_path
+    check("window-config-path", P({"HERDR_CONFIG_PATH": cfg41, "XDG_CONFIG_HOME": xdg41, "HOME": home41}) == cfg41
+          and P({"XDG_CONFIG_HOME": xdg41, "HOME": home41}) == os.path.join(xdg41, "herdr", "config.toml")
+          and P({"HOME": home41}) == os.path.join(home41, ".config", "herdr", "config.toml"))
+    # As herdr 0.9.5 does, a variable that is set wins even when empty; an empty, relative or
+    # missing one cannot be relied on (and a value with a space comes out of ps cut short).
+    check("window-config-path-unsure-is-none", all(P(e) is None for e in (
+        {"HERDR_CONFIG_PATH": "", "HOME": home41}, {"HERDR_CONFIG_PATH": "h.toml"}, {"HERDR_CONFIG_PATH": cfg41 + "-cut"},
+        {"XDG_CONFIG_HOME": "", "HOME": home41}, {"XDG_CONFIG_HOME": "rel"}, {"XDG_CONFIG_HOME": xdg41 + "-cut"},
+        {"HOME": home41 + "-cut"}, {"HOME": "rel"})))
+    # The window's own environment, not the helper's: a process started with these variables.
+    child41 = subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL,
+                               env={"PATH": os.environ["PATH"], "HERDR_CONFIG_PATH": cfg41, "XDG_CONFIG_HOME": xdg41,
+                                    "HOME": home41, "OTHER": "x"})
+    try:
+        _time.sleep(0.3)
+        env41 = sb.window_env(child41.pid)
+    finally:
+        child41.kill()
+        child41.wait(5)
+    check("window-env-of-the-window", env41 == {"HERDR_CONFIG_PATH": cfg41, "XDG_CONFIG_HOME": xdg41, "HOME": home41},
+          sorted(env41) if env41 else env41)
+    saved41 = sb.run_out
+    sb.run_out = lambda argv, timeout=5: ("/opt/homebrew/bin/herdr TERM=xterm HERDR_CONFIG_PATH=/x/My Configs/h.toml "
+                                          "HOME=/x/home\n" if argv[:2] == ["ps", "-wwE"] else "")
+    try:
+        cut41 = sb.window_env(2 ** 22 + 12345)  # no such process in /proc: the macOS way, through ps -E
+    finally:
+        sb.run_out = saved41
+    check("window-env-from-ps", cut41 == {"HERDR_CONFIG_PATH": "/x/My", "HOME": "/x/home"}
+          and sb.window_config_path(cut41) is None, cut41)
+
+    def match41(text, keys, words=("herdr",), check_ok=True, env=None):
+        """window_keys_match with that config as the window's, `herdr config check` answering check_ok."""
         path = os.path.join(d41, "config.toml")
         with open(path, "wb") as f:
             f.write(text if isinstance(text, bytes) else text.encode())
-        return sb.window_keys_match(keys, path)
+        saved = sb.herdr_config_check
+        sb.herdr_config_check = lambda p: check_ok
+        try:
+            return sb.window_keys_match(keys, (1, "/dev/ttys000", list(words)),
+                                        env_of=lambda pid: {"HERDR_CONFIG_PATH": path} if env is None else env)
+        finally:
+            sb.herdr_config_check = saved
+    nofile = {"HOME": home41}  # no config there: herdr's defaults
     check("window-keys-match", match41('[keys]\ngoto = "prefix+slash"\n', "\\x02//")
           and match41('[keys]\nprefix = "ctrl+a"\n', "\\x01g/") and match41(HERDR_CFG, "\\x02//")
-          and sb.window_keys_match("\\x02g/", os.path.join(d41, "none.toml")))
+          and match41("", "\\x02g/", env=nofile))
     check("window-keys-differ", not match41('[keys]\ngoto = "prefix+/"\n', "\\x02g/")
           and not match41('[keys]\nprefix = "ctrl+a"\n', "\\x02g/")
-          and not match41('[keys]\ngoto = "prefix+shift+g"\n', "\\x02g/")
-          and not sb.window_keys_match("\\x02//", os.path.join(d41, "none.toml")))
+          and not match41('[keys]\ngoto = "prefix+shift+g"\n', "\\x02g/") and not match41("", "\\x02//", env=nofile))
     check("window-keys-unreadable-is-no", not match41(b'[keys]\ngoto = "prefix+\xff"\n', "\\x02g/")
-          and not match41('[keys]\ngoto = 7\n', "\\x02g/"))
+          and not match41('[keys]\ngoto = 7\n', "\\x02g/") and not match41("", "\\x02g/", env={"HOME": "rel"}))
+    # Another binding on goto's key (herdr then disables goto) or on the prefix, in [keys] or in
+    # a [[keys.command]]: before, these matched.
+    check("window-keys-another-binding-on-goto", not match41('[keys]\ngoto = "prefix+g"\nnew_worktree = "prefix+g"\n', "\\x02g/")
+          and not match41('[[keys.command]]\nkey = "prefix+g"\ntype = "plugin_action"\ncommand = "x.y"\n', "\\x02g/")
+          and not match41('[keys]\ngoto = "prefix+/"\nsettings = "prefix+slash"\n', "\\x02//")
+          and not match41('[keys]\nnew_tab = "ctrl+b"\n', "\\x02g/"))
+    # herdr's own check decides too: a type error elsewhere makes herdr use every default, and
+    # the file's `prefix = "ctrl+a"` is then not what the window uses.
+    typo = '[keys]\nprefix = "ctrl+a"\n[ui]\nsidebar_width = "abc"\n'
+    check("window-keys-herdr-check-decides", not match41(typo, "\\x01g/", check_ok=False) and match41(typo, "\\x01g/"))
+    # A window on the server's keys, and a window whose environment cannot be read.
+    check("window-keys-server-keybindings", not match41("", "\\x02g/", words=("herdr", "--remote", "s", "--remote-keybindings", "server"))
+          and not match41("", "\\x02g/", words=("herdr", "--remote-keybindings=server"))
+          and match41("", "\\x02g/", words=("herdr", "--remote", "s", "--remote-keybindings", "local")))
+    with open(os.path.join(xdg41, "herdr", "config.toml"), "w") as f:
+        f.write('[keys]\ngoto = "prefix+/"\n')
+    saved41 = sb.herdr_config_check
+    sb.herdr_config_check = lambda p: True
+    try:
+        win41 = (1, "/dev/ttys000", ["herdr"])
+        from_window = (sb.window_keys_match("\\x02//", win41, env_of=lambda pid: {"XDG_CONFIG_HOME": xdg41}),
+                       sb.window_keys_match("\\x02g/", win41, env_of=lambda pid: {"XDG_CONFIG_HOME": xdg41}),
+                       sb.window_keys_match("\\x02g/", win41, env_of=lambda pid: None))
+    finally:
+        sb.herdr_config_check = saved41
+    check("window-keys-from-the-window-environment", from_window == (True, False, False), from_window)
+    # `herdr config check` on that file, read as herdr 0.9.5 prints it (these are its outputs).
+    with open(os.path.join(d41, "check-out"), "w") as f:
+        f.write("")
+    fake41 = executable(os.path.join(d41, "herdr"), '#!/bin/sh\nprintf "%%s" "$HERDR_CONFIG_PATH" > "%s/seen"\n'
+                        'cat "%s/check-out"\nexit "$(cat "%s/check-rc")"\n' % (d41, d41, d41))
+    CHECKS = {
+        "ok": ("config: ok\n", 0, True),
+        "unrelated": ("config: issues found\nunknown config key ui.bogus; ignoring key\n", 1, True),
+        "conflict": ("config: issues found\nprefix+g: kept keys.new_worktree, disabled keys.goto\n", 1, False),
+        "parse-error": ('config: issues found\nconfig parse error: TOML parse error at line 4, column 17\n  |\n'
+                        '4 | sidebar_width = "abc"\n  |                 ^^^^^\ninvalid type: string "abc", expected u16\n'
+                        '; using defaults\n', 1, False),
+        "read-error": ("config: issues found\nconfig read error: Permission denied (os error 13); using defaults\n", 1, False),
+        "prefix": ("config: issues found\nctrl+b: kept keys.prefix, disabled keys.new_tab\n", 1, False),
+        "other-output": ("something else\n", 0, False),
+        "failed": ("config: ok\n", 2, False),
+    }
+    saved41 = sb.HERDR
+    sb.HERDR = str(fake41)
+    got41 = {}
+    try:
+        for name, (out, rc, _) in CHECKS.items():
+            with open(os.path.join(d41, "check-out"), "w") as f:
+                f.write(out)
+            with open(os.path.join(d41, "check-rc"), "w") as f:
+                f.write(str(rc))
+            got41[name] = (sb.herdr_config_check(cfg41), open(os.path.join(d41, "seen")).read())
+        sb.HERDR = os.path.join(d41, "no-such-herdr")
+        missing41 = sb.herdr_config_check(cfg41)
+        sb.HERDR = str(executable(os.path.join(d41, "slow-herdr"), "#!/bin/sh\nsleep 30\n"))
+        saved_wait = sb.HERDR_CHECK_TIMEOUT
+        sb.HERDR_CHECK_TIMEOUT = 0.5
+        t41 = _time.time()
+        try:
+            slow41 = sb.herdr_config_check(cfg41)
+        finally:
+            sb.HERDR_CHECK_TIMEOUT = saved_wait
+        took41 = _time.time() - t41
+    finally:
+        sb.HERDR = saved41
+    check("herdr-config-check-reads-herdr", all(got41[k][0] == want for k, (_, _, want) in CHECKS.items())
+          and all(seen == cfg41 for _, seen in got41.values()), got41)
+    check("herdr-config-check-no-herdr-or-slow-is-no", missing41 is False and slow41 is False and took41 < 4,
+          (missing41, slow41, took41))
 cfg, problems = sb.merge_config({"jump": {"prefix": "ctrl+a", "goto": 'prefix+" & do shell script "x'}})
 check("jump-keys-bad-config-is-default", cfg["jump"]["prefix"] == "ctrl+a" and cfg["jump"]["goto"] == "prefix+g"
       and any("jump.goto" in p for p in problems), (cfg["jump"], problems))
@@ -3519,41 +3678,53 @@ with tempfile.TemporaryDirectory(dir="/tmp") as d:
         check("jump-good-renames-types-restores", rc == 0 and lines == [
             "--machine box1 pane rename w1:p1 sbjabc", "--machine box1 pane rename w1:p1 logs",
             "--machine box1 agent focus w1:p1"] and osa.script and b"sbjabc" in osa.script, (rc, lines))
-        # Keys this machine's herdr does not bind (its goto is prefix+/ here): nothing renamed
-        # or typed, only the focus. This also covers a helper started by an older popup.
+        # Without a tty (a jump the helper did not check: `--jump`, or a line from an older
+        # popup), jump() finds the window and checks its keys itself. Its herdr's goto is
+        # prefix+/ here: nothing renamed or typed, only the focus. With matching keys, it types.
         cfg44 = os.path.join(d, "herdr-config.toml")
         with open(cfg44, "w") as f:
             f.write('[keys]\ngoto = "prefix+/"\n')
-        os.environ["HERDR_CONFIG_PATH"] = cfg44
+        saved44 = (sb.ghostty_window, sb.window_env, sb.herdr_config_check)
+        sb.ghostty_window = lambda ps_text=None, atime=None: (60526, "/dev/ttys000", ["herdr"])
+        sb.window_env = lambda pid: {"HERDR_CONFIG_PATH": cfg44}
+        sb.herdr_config_check = lambda path: True
+        unchecked = dict(good)
+        del unchecked["tty"]
         try:
             osa = Osa44()
-            rc = sb.jump(osa=osa, **good)
+            rc = sb.jump(osa=osa, **unchecked)
+            lines = took_calls()
+            osa_ok = Osa44()
+            rc_ok = sb.jump(osa=osa_ok, **dict(unchecked, keys="\\x02//"))
+            lines_ok = took_calls()
         finally:
-            del os.environ["HERDR_CONFIG_PATH"]
-        lines = took_calls()
+            sb.ghostty_window, sb.window_env, sb.herdr_config_check = saved44
         check("jump-refuses-keys-the-window-does-not-bind", rc == 2 and lines == ["--machine box1 agent focus w1:p1"]
-              and osa.killed and osa.script is None, (rc, lines))
+              and osa.killed and osa.script is None and rc_ok == 0 and osa_ok.script and b"sbjabc" in osa_ok.script
+              and len(lines_ok) == 3, (rc, lines, rc_ok, lines_ok))
         # Through --jump-server, a line with a refused query.
-        orig44 = (sb.ghostty_tty, sb.subprocess.Popen)
+        orig44 = (sb.ghostty_window, sb.window_keys_match, sb.subprocess.Popen)
         osa = Osa44()
-        sb.ghostty_tty = lambda ps_text=None: "/dev/ttys000"
-        sb.subprocess.Popen = lambda argv, **kw: osa if argv[0] == sb.OSASCRIPT else orig44[1](argv, **kw)
+        sb.ghostty_window = lambda ps_text=None, atime=None: (60526, "/dev/ttys000", ["herdr"])
+        sb.window_keys_match = lambda keys, window, env_of=None: True
+        sb.subprocess.Popen = lambda argv, **kw: osa if argv[0] == sb.OSASCRIPT else orig44[2](argv, **kw)
         try:
             rc = sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", "sbjabc\n", "1", "logs",
-                                                         "\\x02g/"]) + "\n"), _io.StringIO())
+                                                         "\\x02g/"]) + "\n"), _io.StringIO(), keys="\\x02g/")
         finally:
-            sb.ghostty_tty, sb.subprocess.Popen = orig44
+            sb.ghostty_window, sb.window_keys_match, sb.subprocess.Popen = orig44
         lines = took_calls()
         check("jump-server-refused-renames-nothing", rc == 2 and osa.killed and not any("rename" in l for l in lines),
               (rc, lines))
         osa = Osa44()
-        sb.ghostty_tty = lambda ps_text=None: "/dev/ttys000"
-        sb.subprocess.Popen = lambda argv, **kw: osa if argv[0] == sb.OSASCRIPT else orig44[1](argv, **kw)
+        sb.ghostty_window = lambda ps_text=None, atime=None: (60526, "/dev/ttys000", ["herdr"])
+        sb.window_keys_match = lambda keys, window, env_of=None: True
+        sb.subprocess.Popen = lambda argv, **kw: osa if argv[0] == sb.OSASCRIPT else orig44[2](argv, **kw)
         try:
             sb.jump_server(_io.StringIO(json.dumps(["--jump", "box1", "a", "w1:p1", "w1:t1", 5, "1", "logs", "\\x02g/"])
-                                        + "\n"), _io.StringIO())
+                                        + "\n"), _io.StringIO(), keys="\\x02g/")
         finally:
-            sb.ghostty_tty, sb.subprocess.Popen = orig44
+            sb.ghostty_window, sb.window_keys_match, sb.subprocess.Popen = orig44
         check("jump-server-non-text-argument", osa.killed and took_calls() == [])
     finally:
         sb.HERDR = saved_herdr

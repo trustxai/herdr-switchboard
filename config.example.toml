@@ -68,9 +68,11 @@ herdr = 'PATH="/opt/homebrew/bin:/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:$
 # machine through herdr's API and the footer says it is ready there; switch machines to
 # see it. false turns the jump off: the server then never connects back to your Mac for it.
 # If your herdr [keys] prefix or goto are not herdr's defaults, set prefix and goto below
-# to the same values. The helper on the Mac compares them with that Mac's herdr config
-# before typing anything; when they differ, Enter focuses the pane instead and the footer
-# says "no jump: set [jump] prefix and goto to this window's herdr keys".
+# to the same values. Before typing anything, the helper on the Mac checks them against the
+# herdr config of the window it would type into (found from that window's environment) and
+# runs `herdr config check` on it; when they differ, or another binding takes goto's key, or
+# it cannot be sure, Enter focuses the pane instead and the footer says "no jump: set [jump]
+# prefix and goto to this window's herdr keys".
 enabled = true
 # ssh target of the Mac running the herdr window, or "local" when the window runs on this
 # same Mac. Empty means detect it.
