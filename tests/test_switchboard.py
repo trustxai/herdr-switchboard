@@ -3397,9 +3397,18 @@ UNSURE = {
                   'goto = "prefix+g"\n[[keys.command]]\nkey = "x"\n"""\n'),
     "sub-table": '[keys.extra]\nx = "prefix+g"\n',
     "array-value": '[keys]\ngoto = ["prefix+g"]\n',
+    # A value that spans lines: its element `[1]` on a line of its own looked like a header, so
+    # what came after was read in the wrong table (on 3.9 these matched; tomllib says differ).
+    "array-then-dotted": 'x = [\n  [1]\n]\nkeys.goto = "prefix+/"\n',
+    "array-then-inline": 'x = [\n  [1]\n]\nkeys = { goto = "prefix+/" }\n',
+    "array-in-command": '[[keys.command]]\nargs = [\n  [1]\n]\nkey = "prefix+g"\n',
+    "inline-table-spans": '[keys]\nx = { a = 1,\n  b = 2 }\n',
 }
 check("keys-reader-refuses-what-it-cannot-be-sure-of", all(sb._keys_table(t) is None for t in UNSURE.values()),
       [k for k, t in UNSURE.items() if sb._keys_table(t) is not None])
+check("spans-lines", all(sb.spans_lines(l) for l in ("x = [", "x = {", 'x = "abc', "]", "x = [[1], [2]")) and not any(
+    sb.spans_lines(l) for l in ("[keys]", "[[keys.command]]", "x = [1, [2]]", 'x = "a][" # [', 'x = "a\\"b"',
+                                "x = 'a{'", "[1]", "  [1],")))
 saved_tomllib = sb.tomllib
 sb.tomllib = None
 try:
@@ -3422,19 +3431,19 @@ with tempfile.TemporaryDirectory() as d41:
     check("window-config-path-unsure-is-none", all(P(e) is None for e in (
         {"HERDR_CONFIG_PATH": "", "HOME": home41}, {"HERDR_CONFIG_PATH": "h.toml"}, {"HERDR_CONFIG_PATH": cfg41 + "-cut"},
         {"XDG_CONFIG_HOME": "", "HOME": home41}, {"XDG_CONFIG_HOME": "rel"}, {"XDG_CONFIG_HOME": xdg41 + "-cut"},
-        {"HOME": home41 + "-cut"}, {"HOME": "rel"})))
+        {"HOME": home41 + "-cut"}, {"HOME": "rel"}, {}, {"HERDR_REMOTE_KEYBINDINGS": "local"})))
     # The window's own environment, not the helper's: a process started with these variables.
     child41 = subprocess.Popen(["sleep", "30"], stdin=subprocess.DEVNULL,
                                env={"PATH": os.environ["PATH"], "HERDR_CONFIG_PATH": cfg41, "XDG_CONFIG_HOME": xdg41,
-                                    "HOME": home41, "OTHER": "x"})
+                                    "HOME": home41, "HERDR_REMOTE_KEYBINDINGS": "server", "OTHER": "x"})
     try:
         _time.sleep(0.3)
         env41 = sb.window_env(child41.pid)
     finally:
         child41.kill()
         child41.wait(5)
-    check("window-env-of-the-window", env41 == {"HERDR_CONFIG_PATH": cfg41, "XDG_CONFIG_HOME": xdg41, "HOME": home41},
-          sorted(env41) if env41 else env41)
+    check("window-env-of-the-window", env41 == {"HERDR_CONFIG_PATH": cfg41, "XDG_CONFIG_HOME": xdg41, "HOME": home41,
+                                                "HERDR_REMOTE_KEYBINDINGS": "server"}, sorted(env41) if env41 else env41)
     saved41 = sb.run_out
     sb.run_out = lambda argv, timeout=5: ("/opt/homebrew/bin/herdr TERM=xterm HERDR_CONFIG_PATH=/x/My Configs/h.toml "
                                           "HOME=/x/home\n" if argv[:2] == ["ps", "-wwE"] else "")
@@ -3479,7 +3488,46 @@ with tempfile.TemporaryDirectory() as d41:
     # A window on the server's keys, and a window whose environment cannot be read.
     check("window-keys-server-keybindings", not match41("", "\\x02g/", words=("herdr", "--remote", "s", "--remote-keybindings", "server"))
           and not match41("", "\\x02g/", words=("herdr", "--remote-keybindings=server"))
-          and match41("", "\\x02g/", words=("herdr", "--remote", "s", "--remote-keybindings", "local")))
+          and match41("", "\\x02g/", words=("herdr", "--remote", "s", "--remote-keybindings", "local"))
+          and not match41("", "\\x02g/", env={"HOME": home41, "HERDR_REMOTE_KEYBINDINGS": "server"})
+          and match41("", "\\x02g/", env={"HOME": home41, "HERDR_REMOTE_KEYBINDINGS": "local"}))
+    # An upper-case key letter is shift in herdr (`ctrl+B` is ctrl+shift+b), which the jump does
+    # not type: it differs. Modifiers in any case are fine. Before, `ctrl+B` matched \x02.
+    check("window-keys-uppercase-key-is-shift", not match41('[keys]\nprefix = "ctrl+B"\n', "\\x02g/")
+          and not match41('[keys]\nprefix = "CTRL+B"\n', "\\x02g/") and not match41('[keys]\ngoto = "prefix+G"\n', "\\x02g/")
+          and match41('[keys]\nprefix = "Ctrl+b"\n', "\\x02g/") and match41('[keys]\ngoto = "Prefix+Slash"\n', "\\x02//"))
+    check("herdr-keys-text", sb.herdr_keys_text("Ctrl+b", "prefix+g") == "\\x02g/" and sb.herdr_keys_text("ctrl+B", "prefix+g") is None
+          and sb.herdr_keys_text("ctrl+b", "prefix+G") is None and sb.herdr_keys_text("ctrl+b", "PREFIX+slash") == "\\x02//")
+    # `ps -E` can print the command and no environment: no HOME of the window's own, so no
+    # config can be located, rather than the helper's home (before: its defaults, a match).
+    saved41 = sb.run_out
+    sb.run_out = lambda argv, timeout=5: "/opt/homebrew/bin/herdr\n" if argv[:2] == ["ps", "-wwE"] else ""
+    try:
+        bare41 = sb.window_env(2 ** 22 + 12346)
+        saved_check = sb.herdr_config_check
+        sb.herdr_config_check = lambda p: True
+        try:
+            bare_match = sb.window_keys_match("\\x02g/", (2 ** 22 + 12346, "/dev/ttys000", ["herdr"]))
+        finally:
+            sb.herdr_config_check = saved_check
+    finally:
+        sb.run_out = saved41
+    check("window-env-without-home-is-no", bare41 == {} and bare_match is False, (bare41, bare_match))
+    # The owner's own herdr config (goto on prefix+/, settings on prefix+., a command on
+    # prefix+space) with [jump] goto = "prefix+/": it matches, with and without tomllib.
+    OWNER = ('onboarding = false\n\n[keys]\nsettings = "prefix+."\ngoto = "prefix+/"\n\n# a comment\n[[keys.command]]\n'
+             'key = "prefix+space"\ntype = "plugin_action"\ndescription = "agents by priority (switchboard)"\n'
+             'command = "trustxai.switchboard.open"\n\n[theme]\nname = "dracula"\nauto_switch = false\n\n'
+             '[ui.toast]\ndelivery = "system"\n\n[ui]\nshow_agent_labels_on_pane_borders = true\n'
+             'agent_panel_sort = "priority"\n')
+    owner_ok = [match41(OWNER, "\\x02//"), not match41(OWNER, "\\x02g/")]
+    saved_tomllib = sb.tomllib
+    sb.tomllib = None
+    try:
+        owner_ok += [match41(OWNER, "\\x02//"), not match41(OWNER, "\\x02g/")]
+    finally:
+        sb.tomllib = saved_tomllib
+    check("window-keys-owner-like-config-matches", all(owner_ok), owner_ok)
     with open(os.path.join(xdg41, "herdr", "config.toml"), "w") as f:
         f.write('[keys]\ngoto = "prefix+/"\n')
     saved41 = sb.herdr_config_check

@@ -151,17 +151,28 @@ type into. It finds that window's herdr config from the window's own environment
 `~/.config/herdr/config.toml`; no file means herdr's defaults), reads its `[keys]` and
 `[[keys.command]]` bindings, and runs `herdr config check` on it. There is no jump when:
 
-- its `[keys] prefix` and `goto` are not `[jump]`'s;
-- another action, or a `[[keys.command]]`, is bound to goto's key or to the prefix;
+- its `[keys] prefix` and `goto` are not `[jump]`'s (an upper-case key letter, as in `ctrl+B`, is
+  shift in herdr, so it never matches; `Ctrl+b` does);
+- another action, or a `[[keys.command]]` in that config, is bound to goto's key or to the prefix;
 - `herdr config check` reports a parse or read error (herdr then uses every default) or says
   anything about `keys.prefix` or `keys.goto`, or herdr is not there to ask;
-- the window was started with `--remote-keybindings server`, so it uses the server's keys;
-- anything is unsure: an environment it cannot read, a relative or missing path, or, on a Python
-  without `tomllib` (the `/usr/bin/python3` of macOS is 3.9), a config it cannot read line by
-  line for sure (a multi-line string, a quoted table name, `keys` set at the top level).
+- the window uses the server's keys: started with `--remote-keybindings server`, or with
+  `HERDR_REMOTE_KEYBINDINGS=server` in its environment;
+- anything is unsure: an environment it cannot read or that has no `HOME`, a relative or missing
+  path, or, on a Python without `tomllib` (the `/usr/bin/python3` of macOS is 3.9), a config it
+  cannot read line by line for sure (a multi-line string, a value that spans lines, a quoted
+  table name, `keys` set at the top level).
 
 Enter then focuses the pane on its machine, and the footer adds `no jump: set [jump] prefix and
 goto to this window's herdr keys`.
+
+Two things the helper cannot see. In herdr 0.9.5 a window takes its `[[keys.command]]` bindings
+from the server it is showing, not from its own config, and registers them after its own keys
+and before herdr's defaults; so a command on goto's key in that server's config takes a goto you
+left at herdr's default, with no diagnostic. Setting `goto` in the window's own `[keys]`, even to
+the default, avoids that, since the window's own keys come first. And the helper reads the
+config file as it is now: a window that has not reloaded it since it changed
+(`herdr server reload-config`) may still use the old keys.
 
 ```toml
 [jump]

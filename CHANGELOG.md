@@ -33,8 +33,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reads its `[keys]` and `[[keys.command]]` bindings and runs `herdr config check` on it. It
   does not jump when `[jump] prefix` and `goto` differ from that config's, when another binding
   is on goto's key or the prefix, when herdr reports a parse or read error or anything about
-  those keys, when the window uses the server's keys (`--remote-keybindings server`), or when it
-  cannot be sure: Enter focuses the pane and the footer says to set them under `[jump]`.
+  those keys, when the window uses the server's keys (`--remote-keybindings server` or
+  `HERDR_REMOTE_KEYBINDINGS=server`), when a key letter is upper case (shift in herdr), or when
+  it cannot be sure (no `HOME` in the window's environment, or, without `tomllib`, a value that
+  spans lines): Enter focuses the pane and the footer says to set them under `[jump]`.
 - A helper on the Mac that never says it is ready (an older version does not) no longer makes
   every Enter wait: after 8 seconds the popup stops waiting for it, and Enter focuses the pane
   at once.
