@@ -7,6 +7,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The cross-machine jump is on by default (`[jump] enabled = true`): Enter on another machine's
+  row switches a herdr window running in Ghostty on macOS to that pane. When the jump cannot
+  happen (no herdr window in Ghostty on a Mac the server can reach over ssh, herdr keys there
+  that differ from `[jump]`'s, or a helper of an older version on that Mac), Enter works as with
+  the jump off: it focuses the pane on its machine and the footer says so. `enabled = false`
+  turns it off. If your herdr `[keys] prefix` or `goto` are not herdr's defaults, set the same
+  values under `[jump]`.
+- The demo's Enter line says that the demo never jumps between machines.
+
+### Fixed
+
+- With the jump on, Enter on another machine's row no longer holds the popup while the
+  connection to the Mac is set up: it waits for it 2 seconds at most, then focuses the pane
+  instead, and the popup's close never waits for an ssh lookup (before, up to about 12 seconds
+  with a Mac that did not answer).
+- The jump types only into a herdr window whose terminal is Ghostty's, so AppleScript is never
+  pointed at a Ghostty that is not running or not installed. A `herdr` CLI call in a Ghostty tab
+  (`herdr --machine x agent list`) is not taken for a window, `herdr session attach <name>` is,
+  and with several windows the jump types into the one you typed into last.
+- The jump no longer types keys that the window's herdr does not bind. The helper on the Mac
+  finds the herdr config of the window it would type into from that window's own environment,
+  reads its `[keys]` and `[[keys.command]]` bindings and runs `herdr config check` on it. It
+  does not jump when `[jump] prefix` and `goto` differ from that config's, when another binding
+  is on goto's key or the prefix, when herdr reports a parse or read error or anything about
+  those keys, when the window uses the server's keys (`--remote-keybindings server` or
+  `HERDR_REMOTE_KEYBINDINGS=server`), when a key letter is upper case (shift in herdr), or when
+  it cannot be sure (no `HOME` in the window's environment, or, without `tomllib`, a value that
+  spans lines): Enter focuses the pane and the footer says to set them under `[jump]`.
+- A helper on the Mac that never says it is ready (an older version does not) no longer makes
+  every Enter wait: after 8 seconds the popup stops waiting for it, and Enter focuses the pane
+  at once.
+
 ## [0.1.0] - 2026-11-15
 
 First public release.
