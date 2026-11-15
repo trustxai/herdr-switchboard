@@ -104,12 +104,19 @@ still loading, offline, or shown from a saved copy (`server from 40 s ago`).
 
 **When is something `done`?** A server counts as seen whatever finishes in its active tab, even
 while you look at another machine, so Switchboard keeps its own record. Finished work counts as
-seen when you open the popup on its tab, pick it with Enter, reach it another way (herdr turned
-it from `done` to idle, or its machine's focus left the tab it finished in), or it finished
-outside its machine's active tab and is already idle. herdr's own panel counts what each window
-drew on screen, which no API exposes, so the two can still differ: work you watched finish, on a
-machine you then left without changing its tab, stays `done` here until you go back there or
-open the popup on it.
+seen when you open the popup on its tab, pick it with Enter, herdr turned it from `done` to
+idle, its machine's focus moved off the tab it finished in (other than by Enter in the popup), or
+it finished outside its machine's active tab and is already idle. Each machine's popup keeps its
+own record.
+
+herdr's own panel counts what each window drew on screen, which no API exposes, so the two can
+differ in two cases:
+
+- Work that finished in front of you on a machine you then left without changing its tab stays
+  `done` here until that machine's focus moves to another tab or you pick it with Enter.
+- Work that finished in a tab left open on a machine counts as seen here if you later reach
+  another tab of that machine without passing through that one (herdr's navigator from another
+  machine, the jump, a script that focuses a pane), while herdr's panel still shows it `done`.
 
 **Copying.** For a Claude Code session on this machine, `ctrl-y` takes the last reply from the
 session's transcript; otherwise it reads the last reply block from the screen, or copies what
