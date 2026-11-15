@@ -1873,7 +1873,8 @@ with tempfile.TemporaryDirectory() as d:
     check("close-never-waits-for-a-link-being-set-up", jumped24 is False and took24 < 0.2 and slow24.proc is None,
           (jumped24, took24))
     stuck.set()
-    state.unlink()  # a detached link leaves it: the popup removes the whole directory
+    if state.exists():
+        state.unlink()  # a detached link leaves it: the popup removes the whole directory
     spawned24 = []
     saved24 = (sb.subprocess.Popen, sb.resolve_helper)
     sb.subprocess.Popen = lambda argv, **kw: spawned24.append(argv)
