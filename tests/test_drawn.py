@@ -103,6 +103,13 @@ bad = snap("w1:t1", (80, 24), [None, "x", {"pane_id": 5, "tab_id": "w1:t1", "sta
                                {"pane_id": "f", "tab_id": "w1:t1", "state_change_seq": 2, "tokens": {d.TOKEN: 7}}])
 got = [x["pane_id"] for x in d.reports(bad)]
 check("reports-malformed-agents", got == ["e", "f"], got)
+left = {"panes": [{"pane_id": "w1:p7", "tokens": {d.TOKEN: "3 9x9"}}, {"pane_id": "w1:p8", "tokens": {"other": "x"}},
+                  {"pane_id": "w1:p9"}, "junk"],
+        "agents": [{"pane_id": "w1:p6", "tokens": {d.TOKEN: "1 9x9"}}]}
+left["panes"].append({"pane_id": "w1:p6", "tokens": {d.TOKEN: "1 9x9"}})
+# w1:p7's agent has exited: the token stays on the pane, and it must go too.
+check("clears-every-pane-once", [x["pane_id"] for x in d.clears(left)] == ["w1:p7", "w1:p6"]
+      and all(x["tokens"] == {d.TOKEN: None} for x in d.clears(left)), d.clears(left))
 
 
 # 3. The socket, against a server that answers like herdr: one request, then it closes.
@@ -315,7 +322,7 @@ for name, e in [("no-env", {}), ("dead-socket", {"HERDR_SOCKET_PATH": os.path.jo
               (r.returncode, r.stdout, r.stderr))
 time.sleep(0.5)
 new_files = set(os.listdir(state)) - before
-check("program-starts-no-watcher-without-a-server", not any(f.startswith("watch-") for f in new_files), new_files)
+check("program-leaves-nothing-without-a-server", not new_files, new_files)
 fake.close()
 subprocess.run(["rm", "-rf", tmp])
 

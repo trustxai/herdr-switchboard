@@ -180,12 +180,15 @@ def try_lock(fd, wait):
 
 
 def clears(snap):
-    """The pane.report_metadata params that remove this plugin's token from every pane."""
-    out = []
-    for a in snap.get("agents") or []:
-        tokens = a.get("tokens") if isinstance(a, dict) and isinstance(a.get("tokens"), dict) else {}
-        if TOKEN in tokens and isinstance(a.get("pane_id"), str):
-            out.append({"pane_id": a["pane_id"], "source": SOURCE, "tokens": {TOKEN: None}})
+    """The pane.report_metadata params that remove this plugin's token from every pane. A token
+    stays on its pane after the agent there exits, so panes are walked, not only agents."""
+    out, done = [], set()
+    for item in (snap.get("panes") or []) + (snap.get("agents") or []):
+        tokens = item.get("tokens") if isinstance(item, dict) and isinstance(item.get("tokens"), dict) else {}
+        pane = item.get("pane_id") if isinstance(item, dict) else None
+        if TOKEN in tokens and isinstance(pane, str) and pane not in done:
+            done.add(pane)
+            out.append({"pane_id": pane, "source": SOURCE, "tokens": {TOKEN: None}})
     return out
 
 
@@ -212,7 +215,7 @@ def note(path, state_dir, wait, rpc=call, clear=False):
 def event(env, rpc=call):
     """An event hook: note what is drawn now."""
     path, state_dir = env.get("HERDR_SOCKET_PATH"), env.get("HERDR_PLUGIN_STATE_DIR")
-    if path and state_dir:
+    if path and state_dir and os.path.exists(path):
         note(path, state_dir, TIMEOUT, rpc)
 
 

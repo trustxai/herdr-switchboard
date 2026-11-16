@@ -86,7 +86,7 @@ tab, writes one pane token, `switchboard_drawn`, through `pane.report_metadata` 
 agent and the size of the window that drew it (`12 239x63`). It changes no title, label, status
 or focus, and it never reads pane output.
 
-It also starts a watcher, one per machine, that does the same once a second, because herdr sends
+It also starts a watcher, one per herdr server, that does the same once a second, because herdr sends
 no event when a window starts showing a machine. The watcher is that same script with `--watch`:
 detached in its own session, with `/dev/null` for input and output, at a lower priority. It
 talks only to the local herdr socket, and it exits when the socket is gone or has not answered

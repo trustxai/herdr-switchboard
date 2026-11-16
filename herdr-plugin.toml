@@ -38,7 +38,7 @@ command = ["sh", "-c", "command -v python3 >/dev/null 2>&1 || { printf '%s\\n' '
 # keeps only inside each window. bin/drawn notes it in a pane token on this machine, so the
 # popup can read it from any machine: on the events that change what a window shows, and in a
 # watcher that reads the snapshot once a second, because herdr sends no event when a window
-# starts or stops showing a machine. The watcher runs one per machine and exits when the
+# starts or stops showing a machine. The watcher runs one per herdr server and exits when the
 # plugin is disabled, removed or updated, or when herdr's server stops. Without python3 all of
 # this does nothing, and the popup falls back to guessing from each machine's focus.
 [[startup]]
