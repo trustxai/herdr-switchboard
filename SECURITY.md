@@ -334,11 +334,10 @@ itself), and nothing is detected. Otherwise Switchboard looks for it:
   Ghostty among its parent processes; with several, the one whose terminal got input last, and
   none when that cannot be told). Without one it exits at once, starting nothing, so AppleScript
   is never pointed at a Ghostty that is not running or not installed. Then it checks that
-  `<keys>` open that window's navigator. It reads three variables of the window process's own
-  environment (`/proc/<pid>/environ` on Linux, `ps -E` on macOS; `HERDR_CONFIG_PATH`,
-  `XDG_CONFIG_HOME`, `HOME` and `HERDR_REMOTE_KEYBINDINGS`, nothing else is kept) to find the
-  config that window reads, as
-  herdr 0.9.5 picks it; it reads that file's `[keys]` table and the `key` of each
+  `<keys>` open that window's navigator. It reads four variables of the window process's own
+  environment (`/proc/<pid>/environ` on Linux, `ps -E` on macOS; nothing else is kept):
+  `HERDR_CONFIG_PATH`, `XDG_CONFIG_HOME` and `HOME` to find the config that window reads, as
+  herdr 0.9.5 picks it, and `HERDR_REMOTE_KEYBINDINGS` (below); it reads that file's `[keys]` table and the `key` of each
   `[[keys.command]]` (herdr's defaults when there is no file); and it runs `herdr config check`
   with `HERDR_CONFIG_PATH` set to that file. It says the keys differ, and exits starting
   nothing, when the prefix and goto are not `<keys>` (an upper-case key letter is shift in
@@ -346,7 +345,7 @@ itself), and nothing is detected. Otherwise Switchboard looks for it:
   when `herdr config check` reports a parse or read error, says anything about `keys.prefix` or
   `keys.goto`, fails, prints something else or takes more than 5 seconds; when the window uses
   the server's keys (`--remote-keybindings server`, or `HERDR_REMOTE_KEYBINDINGS=server` in its
-  environment, a fourth variable it reads); and when anything is unsure: an environment it
+  environment); and when anything is unsure: an environment it
   cannot read or without `HOME` (it never falls back to its own), a relative or empty path, a
   path that names nothing (a value with a space comes out of `ps -E` cut short), or, without
   `tomllib`, a config it cannot read line by line for sure (a multi-line string, a value that
@@ -354,8 +353,8 @@ itself), and nothing is detected. Otherwise Switchboard looks for it:
   from the server the window shows, after the window's own keys and before herdr's defaults,
   so a server's command on goto's key can take a default goto without a diagnostic (setting
   `goto` in the window's config avoids it); and a window that has not reloaded its config
-  since the file changed may still use the old keys. Otherwise it starts `osascript`, prints
-  that it is ready, and waits
+  since the file changed may still use the old keys. When every check passes, it starts
+  `osascript`, prints that it is ready, and waits
   for one line with the chosen row; a line that is not exactly the nine string arguments it
   expects is dropped. Then
   it uses AppleScript to send keystrokes to the Ghostty terminal on that tty:

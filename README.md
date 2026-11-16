@@ -360,8 +360,10 @@ Switchboard reaches your saved machines through your own ssh (in batch mode) or
 `herdr --machine`, and opens no other connection. It stores each saved machine's last snapshot
 and what you have seen, never pane output or credentials. The jump, on by default, tries ssh from
 the server each time the popup opens, when windows are attached to it from other machines, in
-batch mode: `herdr plugin list --json` and the helper on a Mac that Tailscale names or that
-`[jump] client` sets, or, without Tailscale, `uname -s` to the address of each attached window.
+batch mode: `herdr plugin list --json` and the helper on the Mac of your window, which
+`[jump] client` sets or which it finds among the attached windows (Tailscale names their
+addresses when installed; an address it cannot name gets `uname -s`; with several Macs,
+`ioreg` on each says which one you touched last).
 `[jump] enabled = false` turns it off. [SECURITY.md](SECURITY.md) has the details and how to report a vulnerability.
 
 ## Contributing

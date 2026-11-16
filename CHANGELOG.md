@@ -7,6 +7,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- The time the popup waits for its own focus move to show up on another machine, and the time
+  within which machines count as read until the last popup closed (the order of changes with no
+  time), follow `remote_seconds` and `remote_timeout`. With a slow link or a long interval, the
+  first no longer took the popup's own move for someone leaving the tab, and the second no
+  longer split machines that were all being read.
+- Each remote read applies the rows picked with Enter first, so a read that already shows the
+  tab Enter moved to no longer takes that move for someone leaving the tab.
+- `schedule.py` of the demo video removes the partial footage when ffmpeg fails, so new footage is
+  never paired with an old `schedule.json`.
+
 ## [0.2.0] - 2026-11-16
 
 ### Changed
@@ -44,11 +56,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   opened from count, so a Mac's own screen that nobody looks at marks nothing seen. On a
   machine without the plugin, or with nothing drawn since its herdr server started, the guess
   from the focus still applies, and it now also counts work as seen once that machine's focus
-  moves off the tab it finished in (other than by Enter in the popup). Differences that remain: what a window draws while Ghostty is
-  behind another app counts as seen, a look at a machine shorter than about a second may not be
-  noted, and when two windows show one machine at once, herdr sizes its layout after the one
-  that attached or resized last. Disabling or removing the plugin takes the token off every
-  pane. The install and update previews list the new startup and event commands.
+  moves off the tab it finished in (other than by Enter in the popup). Differences that remain:
+  what a window draws while Ghostty is behind another app counts as seen, a look at a machine
+  shorter than about a second may not be noted, and when two windows show one machine at once,
+  herdr sizes its layout after the one that attached or resized last. Disabling or removing the
+  plugin takes the token off every pane. The install and update previews list the new startup
+  and event commands.
 - With the jump on, Enter on another machine's row no longer holds the popup while the
   connection to the Mac is set up: it waits for it 2 seconds at most, then focuses the pane
   instead, and the popup's close never waits for an ssh lookup (before, up to about 12 seconds

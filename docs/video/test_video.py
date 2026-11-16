@@ -108,7 +108,9 @@ def test_el():
     key = "fake-" + secrets.token_hex(16)  # made here, so no key-like text is in the repository
     with tempfile.TemporaryDirectory() as d:
         el.KEY_FILE = os.path.join(d, "api_key")
-        el.API = "http://127.0.0.1:9"  # nothing may be sent in the first cases
+        # Nothing may be sent in the first cases: a server that records every request.
+        server, seen, thread = serve(lambda h: (200, [], b"{}"))
+        el.API = "http://127.0.0.1:%d" % server.server_port
 
         for name, content in (("two-lines", key + "\n" + key[::-1] + "\n"),
                               ("inner-space", key[:10] + " " + key[10:]), ("tab", key + "\t" + key[::-1])):
@@ -116,9 +118,12 @@ def test_el():
                 f.write(content)
             printed, exit_text, error = run(el.main, ["el.py", "user"])
             shown = printed + (exit_text or "") + (error or "")
-            check("el-refuses-a-key-with-%s" % name, exit_text is not None and error is None,
-                  "(it raised instead)" if error else "")
+            check("el-refuses-a-key-with-%s" % name, exit_text is not None and error is None
+                  and "must hold the key alone on one line" in exit_text,
+                  "(it raised instead)" if error else (exit_text or "")[:80])
             check("el-never-shows-a-key-with-%s" % name, key[:8] not in shown and key[::-1][:8] not in shown)
+        stop(server, thread)
+        check("el-refused-keys-send-nothing", seen == [], len(seen))
 
         with open(el.KEY_FILE, "w") as f:
             f.write(key + "\n")
@@ -201,8 +206,8 @@ def test_schedule():
     check("schedule-checks-what-ffmpeg-wrote", error is None and exit_text not in (None, "0") and runs == 1
           and data is None and not timed, (exit_text, runs, timed))
     exit_text, error, runs, data, timed = run_schedule(schedule, footage=25.16, ffmpeg_rc=1)
-    check("schedule-nothing-written-when-ffmpeg-fails", error is None and exit_text == "1" and data is None,
-          exit_text)
+    check("schedule-nothing-written-when-ffmpeg-fails", error is None and exit_text == "1" and data is None
+          and not timed, (exit_text, timed))
     exit_text, error, runs, data, timed = run_schedule(schedule, footage=25.16)
     check("schedule-writes-after-success", error is None and exit_text == "0" and data is not None and timed,
           exit_text)
