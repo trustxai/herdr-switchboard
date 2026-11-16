@@ -1416,13 +1416,13 @@ check("done-stale-read-keeps-the-move", rd.focus.get("m1") == T2 and st(e)["A"] 
 e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7), ag17("D", "idle", 3, T2))
 rd.observe("m1", e, now=104.0, focus=T2)
 check("done-stale-read-then-the-move", st(e)["A"] == "done" and "m1" not in rd.expect, (st(e), rd.expect))
-# A move that never shows up stops being waited for after FOCUS_SETTLE seconds.
+# A move that never shows up stops being waited for after focus_settle() seconds.
 rd = sb.Recency(persist=False, now=100.0)
 rd.observe("m1", ents17("m1", 1, ag17("A", "working", 5, T1)), focus=T1)
 e = ents17("m1", 1, ag17("A", "idle", 7, T1, 7))
 rd.observe("m1", e, now=101.0, focus=T1)
 rd.ack_tab("m1", T2, e, now=102.0)
-rd.observe("m1", e, now=102.0 + sb.FOCUS_SETTLE + 1, focus=T1)
+rd.observe("m1", e, now=102.0 + sb.focus_settle() + 1, focus=T1)
 check("done-move-not-shown-expires", rd.focus.get("m1") == T1 and "m1" not in rd.expect
       and st(e)["A"] == "done", (rd.focus, rd.expect, st(e)))
 # Across popups: the focus at the last read is kept on disk, so a later popup sees it moved.
@@ -1491,6 +1491,51 @@ with tempfile.TemporaryDirectory() as d:
     sb.STATE_DIR = STATE
 
 check("done-enter-acks", "live.recency.ack_tab(target[\"machine\"], target[\"tab\"], live.entries())" in SOURCE)
+# A remote read applies the acks Enter wrote before it reads, so a read that already shows the
+# tab the popup moved to never takes that move for someone leaving the tab.
+check("acks-before-each-remote-read", "live.consume_acks(acks)\n                live.refresh_remote(i, m, acks)" in SOURCE)
+# ...and the acks Enter writes while a remote read is under way are applied before that read is
+# observed: the read already shows the tab the popup moved to, and A, finished in the tab that
+# was in front there, stays done instead of being taken as left.
+_ackdir = tempfile.mkdtemp(prefix="acks-")
+_acks = os.path.join(_ackdir, "acks")
+_reads = [snap17(T1, ag17("A", "working", 5, T1)), snap17(T1, ag17("A", "idle", 7, T1, 7))]
+
+
+def _fetch_with_enter(machine="", timeout=None, info=None):
+    if _reads:
+        return _reads.pop(0)
+    with open(_acks, "a") as f:  # Enter on a row of T2 while this read runs
+        f.write(json.dumps(["m1", T2]) + "\n")
+    return snap17(T2, ag17("A", "idle", 7, T1, 7))
+
+
+lva = sb.Live([{"id": "m1", "label": "m1"}], [], fetch=_fetch_with_enter, cache=False)
+lva.refresh_remote(0, {"id": "m1", "label": "m1"}, _acks)
+lva.refresh_remote(0, {"id": "m1", "label": "m1"}, _acks)
+check("acks-done-before-enter", st(lva.remote["m1"]) == {"A": "done"}, st(lva.remote["m1"]))
+lva.refresh_remote(0, {"id": "m1", "label": "m1"}, _acks)
+check("acks-written-during-a-read-apply-before-it", st(lva.remote["m1"]) == {"A": "done"} and not os.path.exists(_acks),
+      (st(lva.remote["m1"]), os.path.exists(_acks)))
+shutil.rmtree(_ackdir)
+# The windows that wait for a remote read follow the config: a slow link or a long interval.
+_saved = (sb.REMOTE_EVERY, sb.REMOTE_TIMEOUT)
+sb.REMOTE_EVERY, sb.REMOTE_TIMEOUT = 3.0, 8.0
+# A remote read can take herdr_on_bound(timeout): ssh, then the `herdr --machine` fallback.
+check("settle-and-near-defaults", sb.herdr_on_bound(8.0) == 28.0 and sb.focus_settle() == 61.0 and sb.read_near() == 38.0,
+      (sb.herdr_on_bound(8.0), sb.focus_settle(), sb.read_near()))
+sb.REMOTE_EVERY, sb.REMOTE_TIMEOUT = 20.0, 30.0
+check("settle-and-near-follow-the-config", sb.focus_settle() == 166.0 and sb.read_near() == 99.0,
+      (sb.focus_settle(), sb.read_near()))
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    with open(os.path.join(d, "recency.json"), "w") as f:
+        json.dump({"v": 2, "machines": {}, "read": {"m1": 1000.0, "m2": 978.0, "m3": 500.0}}, f)
+    rn = sb.Recency(now=2000.0)
+    check("near-with-a-long-interval", rn.first_stamp("m2") == rn.floor and rn.first_stamp("m3") == 500.0,
+          (rn.first_stamp("m2"), rn.first_stamp("m3")))
+    sb.STATE_DIR = STATE
+sb.REMOTE_EVERY, sb.REMOTE_TIMEOUT = _saved
 
 # With the hook on that machine (bin/drawn), what a window drew decides, not the focus.
 W, OWN = "239x63", "250x63"   # the window the popup opens from; a Mac's own, unused screen
@@ -3053,7 +3098,7 @@ try:
                       cache=False)
         calls33 = {"remote": 0, "local": 0}
 
-        def broken_remote(i, m):
+        def broken_remote(i, m, acks=None):
             calls33["remote"] += 1
             raise RuntimeError("remote pass")
 
@@ -4334,7 +4379,8 @@ for _name in ("ssh.pid", "ssh-child.pid"):
     except (OSError, ValueError):
         pass
 check("timed-out-ssh-and-its-child-are-gone", not _ssh_left, _ssh_left)
-check("remote-waits-from-one-place", SOURCE.count("herdr_on_bound(REMOTE_TIMEOUT)") == 2
+# Two waits for a remote read, and the two windows built on it (read_near, focus_settle).
+check("remote-waits-from-one-place", SOURCE.count("herdr_on_bound(REMOTE_TIMEOUT)") == 4
       and sb.herdr_on_bound(6) >= 2 * 6, SOURCE.count("herdr_on_bound(REMOTE_TIMEOUT)"))
 # A read still running when the program exits (its thread is abandoned) is killed with its
 # group at exit, instead of running on without the timeout that was meant for it.
@@ -4536,7 +4582,7 @@ _bound_numbers = [n.value for n in ast.walk(_bound_def) if isinstance(n, ast.Con
 check("bound-built-from-the-named-timeouts", {"MACHINE_LIST_TIMEOUT", "KILL_WAIT", "SPAWN_MARGIN", "timeout"} <= _bound_names
       and _bound_numbers == [2], (sorted(_bound_names), _bound_numbers))
 check("bound-timeouts-are-the-ones-used", 'herdr(["machine", "list", "--json"], MACHINE_LIST_TIMEOUT)' in SOURCE
-      and "p.communicate(timeout=KILL_WAIT)" in SOURCE and SOURCE.count("herdr_on_bound(REMOTE_TIMEOUT)") == 2)
+      and "p.communicate(timeout=KILL_WAIT)" in SOURCE and SOURCE.count("herdr_on_bound(REMOTE_TIMEOUT)") == 4)
 check("bound-covers-lookup-two-reads-and-kill-waits",
       sb.herdr_on_bound(8) >= sb.MACHINE_LIST_TIMEOUT + sb.KILL_WAIT + 2 * (8 + sb.KILL_WAIT), sb.herdr_on_bound(8))
 # find_client's wait for its HIDIdleTime probes, from the same constants: one probe's timeout,
@@ -5489,8 +5535,8 @@ check("wait-for-enter-misses-no-signal", rc61e == 128 + 15, rc61e)
 # ...and it acts within one step of its select, WAIT_POLL (0.05 s). The check above only asks for
 # 143 within 5 s, which a step of 3 s also passes. The module's select is watched, and two things
 # are held. The step itself: every timeout the wait passes to select must be WAIT_STEP, with
-# nothing timed, so a longer step fails, one that grows after the first selects too, and so does
-# a step of 0, which would spin. And that a signal there acts within that step: the same blind
+# nothing timed, so a longer step fails, one that grows within the first three selects too (a
+# step that grows only later is not seen), and so does a step of 0, which would spin. And that a signal there acts within that step: the same blind
 # spot is set up, and the signal is sent just as the third select of the wait begins, the worst
 # case, where the handler runs only when that select ends. The program notes the moment of the
 # signal and the test the moment of the exit from its wait, both with time.time(): the wall

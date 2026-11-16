@@ -1286,9 +1286,22 @@ def fmt_age(seconds):
 # then, reads still showing the old tab are taken as from before the move (Recency.observe).
 FOCUS_SETTLE = 10.0
 READ_SAVE_EVERY = 5.0  # seconds between saves of the machines' read times alone (Recency)
-# A machine whose kept read time is this close to the latest one was being read when the last
-# popup closed: the save cadence, the remote refresh interval and some slack.
-READ_NEAR = READ_SAVE_EVERY + 10.0
+
+
+def read_near():
+    """Seconds within which a machine's kept read time counts as read until the last popup
+    closed: the save cadence, the remote refresh interval and the longest a remote read may
+    take (herdr_on_bound: ssh, then the `herdr --machine` fallback), plus slack. From the
+    config, so a slow link or a long interval does not split the machines that were all being
+    read."""
+    return READ_SAVE_EVERY + REMOTE_EVERY + herdr_on_bound(REMOTE_TIMEOUT) + 2.0
+
+
+def focus_settle():
+    """Seconds a focus the popup moved has to show up in that machine's reads: FOCUS_SETTLE, or
+    longer when the move and the read after it can take longer: the --focus worker's move and a
+    remote read each up to herdr_on_bound, plus the refresh interval."""
+    return max(FOCUS_SETTLE, REMOTE_EVERY + 2 * herdr_on_bound(REMOTE_TIMEOUT) + 2.0)
 
 
 class Recency:
@@ -1341,7 +1354,9 @@ class Recency:
       chosen, so that work you watched finish does not stay done.
 
     Otherwise it stays done: that is what finished in the tab left open on one machine while
-    you were on another, until you go back there. The first time a machine is seen
+    you were on another, until one of the above happens (on another machine's record, opening
+    the popup there is not enough: its focus has to leave that tab, or you pick the row). The
+    first time a machine is seen
     everything counts as seen.
     """
 
@@ -1524,7 +1539,7 @@ class Recency:
             moved = machine in self.focus and self.focus[machine] != tab
             if moved:
                 self.focus[machine] = tab
-                self.expect[machine] = (tab, (now or time.time()) + FOCUS_SETTLE)
+                self.expect[machine] = (tab, (now or time.time()) + focus_settle())
             if dirty or moved:
                 self._save()
         return dirty
@@ -1535,7 +1550,7 @@ class Recency:
         r = self.read_at_open.get(machine)
         if r is None:
             return self.opened
-        if r >= self.latest_read - READ_NEAR:
+        if r >= self.latest_read - read_near():
             return self.floor
         return min(r, self.opened)
 
@@ -1652,7 +1667,7 @@ class Live:
         with self.lock:
             self.local = entries
 
-    def refresh_remote(self, i, m):
+    def refresh_remote(self, i, m, acks=None):
         try:
             snap = self.fetch(m["id"], REMOTE_TIMEOUT, m)
             if not isinstance(snap, dict):
@@ -1662,6 +1677,10 @@ class Live:
             snap = entries = None
         if snap is not None and self.cache:
             save_cache(m["id"], snap)
+        # Acks written while this read was under way are applied before it is observed: the
+        # read may already show the tab Enter moved to (see remote_loop in watch()).
+        if acks and entries is not None:
+            self.consume_acks(acks)
         if entries is not None:
             self.recency.observe(m["id"], entries, focus=focused_tab(snap))
         with self.lock:
@@ -1823,7 +1842,11 @@ def watch(live, sock, rows_file, stop, acks=None, writes=None):
     def remote_loop(i, m):
         while not stop.is_set():
             try:
-                live.refresh_remote(i, m)
+                # Acks first: a read that already shows the tab Enter moved this machine's focus
+                # to must find that move recorded, or it takes it for someone leaving the tab.
+                if acks:
+                    live.consume_acks(acks)
+                live.refresh_remote(i, m, acks)
             except Exception:
                 pass
             kick.set()
@@ -3295,9 +3318,11 @@ def herdr_keys(text):
 
 
 def herdr_keys_text(prefix, goto):
-    """The Ghostty text for herdr's own [keys] prefix and goto, read as herdr 0.9.5 reads them:
-    the modifiers (ctrl, prefix) in any case, but an upper-case key letter means shift
-    (parse_key_combo), so `ctrl+B` is ctrl+shift+b. The jump types plain control characters
+    """The Ghostty text for herdr's own [keys] prefix and goto. herdr 0.9.5 reads `ctrl` in any
+    case but `prefix+` only in lower case (`Prefix+/` disables goto, which `herdr config check`
+    reports, see same_key); this lowers both, so the text is what the binding would type if
+    herdr took it. An upper-case key letter means shift (parse_key_combo), so `ctrl+B` is
+    ctrl+shift+b. The jump types plain control characters
     and lower-case keys, so such a key gives None, as does anything goto_keys refuses."""
     def modifiers_lowered(combo):
         parts = combo.split("+")
@@ -3307,7 +3332,9 @@ def herdr_keys_text(prefix, goto):
 
 def same_key(a, b):
     """True when two herdr key strings may name the same key: equal ignoring case, or the
-    same character after prefix+, written as itself or by herdr's name for it."""
+    same character after prefix+, written as itself or by herdr's name for it. herdr itself
+    reads `prefix+` case-sensitively (`Prefix+Slash` disables goto there); `herdr config check`
+    reports that, so the guard still says the keys differ."""
     if a.lower() == b.lower():
         return True
     ca = goto_char(a)

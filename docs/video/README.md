@@ -137,6 +137,9 @@ brackets are those of a render of these files with the launch narration.
 - **What is said:** edit the text of a line in `voice/spec.json` (and its caption in
   `CAPTION_TEXT`, if they should match), then run steps 2 to 6 again. Each beat stretches to fit
   its line, so the timing needs no change.
+- **The tests:** `test_video.py` checks the tape's length, the keys it types and the moments the
+  list updates live, with those values written into the test. A change to `demo.tape` or to the
+  `BEATS` needs the same change there.
 
 ## Licences
 

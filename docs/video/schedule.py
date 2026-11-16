@@ -137,8 +137,11 @@ def main(argv):
     os.makedirs(os.path.dirname(TIMED), exist_ok=True)
     rc = subprocess.run(cmd, stdin=subprocess.DEVNULL, timeout=600).returncode
     if rc != 0:
-        print("schedule.py: ffmpeg failed (exit status %d); %s was not written" % (rc, rel(SCHEDULE)),
-              file=sys.stderr)
+        # A partial file next to the old schedule.json would pair new footage with old timings.
+        if os.path.exists(TIMED):
+            os.remove(TIMED)
+        print("schedule.py: ffmpeg failed (exit status %d); %s was removed and %s was not written"
+              % (rc, rel(TIMED), rel(SCHEDULE)), file=sys.stderr)
         return rc
     got = seconds(TIMED)
     if abs(got - schedule["terminal"]) > TOLERANCE:
