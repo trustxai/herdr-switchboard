@@ -24,8 +24,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   agent that changed last on top. The hook also notes when its machine saw each change (pane
   token `switchboard_changed`), and the popup orders by that time. Before, what changed while
   the popup was closed came in interleaved machine by machine, because herdr gives no time for
-  a change and two machines' counters cannot be compared; that still happens on a machine
-  without the plugin, and for changes from before its watcher started.
+  a change and two machines' counters cannot be compared. A change with no time (a machine
+  without the plugin, or a change from before its watcher started) is placed at the last time a
+  popup read that machine instead of the opening time, so it no longer jumps above every timed
+  change.
 - `done` follows what a window drew, as in herdr's own panel, instead of a guess from each
   machine's focus. On each machine the plugin notes which agents a window drew, in a pane token
   (`switchboard_drawn`): `bin/drawn` runs at herdr's start and on the events that change what a

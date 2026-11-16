@@ -1151,12 +1151,17 @@ WINDOWS_KEPT = 4  # sizes of the windows the popup was opened from, kept in rece
 CHANGED_TOKEN = "switchboard_changed"
 
 
+def _digits(text):
+    """ASCII digits only: str.isdigit() also takes characters such as "²", which int() refuses."""
+    return text.isascii() and text.isdigit()
+
+
 def _size(value):
     """'<cols>x<rows>' when value is one, else None."""
     if not isinstance(value, str):
         return None
     cols, x, rows = value.partition("x")
-    if x and cols.isdigit() and rows.isdigit() and 0 < int(cols) < 100000 and 0 < int(rows) < 100000:
+    if x and _digits(cols) and _digits(rows) and 0 < int(cols) < 100000 and 0 < int(rows) < 100000:
         return "%dx%d" % (int(cols), int(rows))
     return None
 
@@ -1170,7 +1175,7 @@ def parse_drawn(value):
     for part in value[:200].split(","):
         bits = part.strip().split(" ")
         size = _size(bits[1]) if len(bits) == 2 else None
-        if size and bits[0].isdigit():
+        if size and _digits(bits[0]):
             out[size] = max(out.get(size, -1), int(bits[0]))
     return out
 
@@ -1179,7 +1184,7 @@ def changed_at(value, seq):
     """The time in a switchboard_changed token ("<seq> <unix time>") when it is about this seq
     and known (not 0); else None. Untrusted input: anything malformed is None."""
     bits = value.split(" ") if isinstance(value, str) and len(value) <= 80 else []
-    if len(bits) != 2 or not bits[0].isdigit() or int(bits[0]) != seq:
+    if len(bits) != 2 or not _digits(bits[0]) or int(bits[0]) != seq:
         return None
     try:
         t = float(bits[1])
@@ -1280,6 +1285,7 @@ def fmt_age(seconds):
 # Seconds a focus the popup moved (ack_tab) has to show up in that machine's snapshots; until
 # then, reads still showing the old tab are taken as from before the move (Recency.observe).
 FOCUS_SETTLE = 10.0
+READ_SAVE_EVERY = 30.0  # seconds between saves of the machines' read times alone (Recency)
 
 
 class Recency:
@@ -1344,6 +1350,8 @@ class Recency:
         self.fresh = set()   # machines already read since this popup opened
         self.expect = {}     # machine -> (tab the popup moved its focus to, until when)
         self.windows = {}    # size of a window the popup was opened from -> when, last
+        self.read = {}       # machine -> when a popup last read it (kept on disk)
+        self.read_saved = 0.0
         self.lock = threading.Lock()
         if self.path:
             try:
@@ -1364,6 +1372,10 @@ class Recency:
                 self.windows = {s: float(t) for s, t in (d.get("windows") or {}).items() if _size(s) == s}
             except (ValueError, TypeError, AttributeError):
                 self.windows = {}
+            try:
+                self.read = {str(m): float(t) for m, t in (d.get("read") or {}).items()}
+            except (ValueError, TypeError, AttributeError):
+                self.read = {}
 
     def saw_window(self, size, now=None):
         """The popup was opened from a window of that size: what such a window drew counts as
@@ -1398,7 +1410,8 @@ class Recency:
                 if e.get("changed"):
                     # When its machine saw the change, noted by the hook there: the real order
                     # across machines, as in herdr's panel, also for what changed while closed.
-                    e["stamp"], e["rank"] = e["changed"], 0
+                    # Never later than now: a clock running ahead would pin its rows on top.
+                    e["stamp"], e["rank"] = min(e["changed"], time.time()), 0
                 raw = e.get("server_status", e["status"])
                 unseen = bool(known) and known[0] == e["seq"] and max(known[3], self.drawn(e)) < e["seq"]
                 e["status"] = "done" if raw == "idle" and unseen and self.completed(e) else raw
@@ -1411,8 +1424,13 @@ class Recency:
         focus: the focused tab of that snapshot. here: it is the machine the popup runs on,
         so that tab is the one in front of you."""
         with self.lock:
-            # The first read of each machine brings everything that happened while closed.
-            stamp = (now or time.time()) if machine in self.fresh else self.opened
+            # The first read of each machine brings everything that happened while closed. With
+            # no time from its hook, such a change gets the last time a popup read that machine:
+            # it happened after that, and putting it later would rank it above changes on other
+            # machines whose hook says they came after it. Never read before: the opening time.
+            t = now or time.time()
+            stamp = t if machine in self.fresh else min(self.read.get(machine, self.opened), self.opened)
+            self.read[machine] = t
             self.fresh.add(machine)
             baseline = machine not in self.seen
             known = self.seen.setdefault(machine, {})
@@ -1468,7 +1486,9 @@ class Recency:
                 self.focus[machine] = focus
             self.apply(entries)
             dirty = before != json.dumps([known, self.focus.get(machine)], sort_keys=True)
-            if dirty:
+            # The read times change on every read: they are kept on disk with any other change,
+            # or every READ_SAVE_EVERY seconds, and never count as a change of the rows.
+            if dirty or t - self.read_saved > READ_SAVE_EVERY:
                 self._save()
         return dirty
 
@@ -1495,6 +1515,7 @@ class Recency:
         return dirty
 
     def _save(self):
+        self.read_saved = time.time()
         if not self.path:
             return
 
@@ -1503,7 +1524,7 @@ class Recency:
                 os.makedirs(os.path.dirname(self.path), exist_ok=True)
                 with open(self.path + ".tmp", "w") as f:
                     json.dump({"v": 2, "machines": self.seen, "focus": self.focus,
-                               "windows": self.windows}, f)
+                               "windows": self.windows, "read": self.read}, f)
                 os.replace(self.path + ".tmp", self.path)
             except OSError:
                 pass

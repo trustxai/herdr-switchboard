@@ -1576,7 +1576,11 @@ check("drawn-popup-passes-the-window", "window=focused_size(snap)" in SOURCE)
 check("changed-at", sb.changed_at("7 1794803477.1", 7) == 1794803477.1)
 check("changed-at-other-seq-or-unknown", sb.changed_at("6 1794803477.1", 7) is None and sb.changed_at("7 0", 7) is None)
 check("changed-at-garbage", all(sb.changed_at(v, 7) is None for v in
-                                (None, 7, "", "7", "x 1", "7 x", "7 -3", "7 1e12", "7 1 2", "7 " + "1" * 90)))
+                                (None, 7, "", "7", "x 1", "7 x", "7 -3", "7 1e12", "7 1 2", "7 " + "1" * 90, "\u00b2 1.0")))
+check("drawn-parse-ascii-digits", sb.parse_drawn("\u00b2 4x4,5 \u00b2x3,6 4x4") == {"4x4": 6})
+odd = snap17(T1, ag17("A", "idle", 7, T1, 7))
+odd["agents"][0]["tokens"] = {sb.CHANGED_TOKEN: "\u00b2 1.0", sb.DRAWN_TOKEN: "\u00b2 4x4"}
+check("odd-token-does-not-hide-the-machine", len(sb.entries_from(odd, "m1", "m1", 1)) == 1)
 
 
 def changed17(pid, status, seq, tab=T1, compl=None, at=None):
@@ -1596,13 +1600,37 @@ rd.observe("", here, focus=T2, here=True)
 rd.observe("m1", there, focus=T2)
 got = [e["pane"] for e in sorted(here + there, key=sb.sort_key)]
 check("changed-orders-across-machines", got == ["R1", "L1", "R2", "L2"], got)
-here = ents17("", 0, changed17("L1", "idle", 3), changed17("L2", "idle", 2))
-there = ents17("m1", 1, changed17("R1", "idle", 9, at=1200.0), changed17("R2", "idle", 8))
-rd2 = sb.Recency(persist=False, now=1000.0)
-rd2.observe("", here, focus=T2, here=True)
-rd2.observe("m1", there, focus=T2)
+# A machine without the hook, last read by a popup at 900; this popup opens at 1000. Its change
+# happened after 900, so it ranks by 900, below a change at 950 that another machine's hook
+# timed, instead of by the opening time above everything.
+rd1 = sb.Recency(persist=False, now=900.0)  # the previous popup, closed after reading at 900
+rd1.observe("", ents17("", 0, changed17("A", "working", 3, at=800.0)), now=900.0, focus=T2, here=True)
+rd1.observe("m1", ents17("m1", 1, changed17("R", "working", 8)), now=900.0, focus=T2)
+rd2 = sb.Recency(persist=False, now=1000.0)  # this one, opened at 1000, with what was kept
+rd2.seen, rd2.read = rd1.seen, dict(rd1.read)
+here = ents17("", 0, changed17("A", "idle", 4, at=950.0))
+there = ents17("m1", 1, changed17("R", "idle", 9))
+rd2.observe("", here, now=1000.0, focus=T2, here=True)
+rd2.observe("m1", there, now=1000.0, focus=T2)
 got = [e["pane"] for e in sorted(here + there, key=sb.sort_key)]
-check("changed-mixed-known-first-then-interleaved", got[0] == "R1" and set(got[1:]) == {"L1", "L2", "R2"}, got)
+check("changed-untimed-ranks-by-the-last-read", got == ["A", "R"], (got, [(e["pane"], e["stamp"]) for e in here + there]))
+check("changed-read-time-recorded", rd2.read.get("m1") == 1000.0, rd2.read)
+rd3 = sb.Recency(persist=False, now=1000.0)
+rd3.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=1000.0, focus=T2)
+check("changed-never-read-ranks-by-the-opening", rd3.seen["m1"]["R"][1] == 1000.0, rd3.seen)
+fut = rd3.apply(ents17("m1", 1, changed17("F", "idle", 2, at=_time.time() + 1e6)))
+check("changed-never-in-the-future", fut[0]["stamp"] <= _time.time(), fut[0]["stamp"])
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    r1 = sb.Recency(now=100.0)
+    r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=100.0, focus=T2)
+    check("changed-read-times-persisted", sb.Recency(now=200.0).read.get("m1") == 100.0)
+    check("changed-read-time-alone-is-no-change", r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=101.0, focus=T2)
+          is False)
+    r1.read_saved = 0.0  # the last save long ago: a read alone is saved now
+    r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=140.0, focus=T2)
+    check("changed-read-time-saved-now-and-then", sb.Recency(now=200.0).read.get("m1") == 140.0, sb.Recency(now=200.0).read)
+    sb.STATE_DIR = STATE
 
 # 18. Config.
 block('18. Config')
