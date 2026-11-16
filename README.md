@@ -92,9 +92,16 @@ keybind = cmd+k=text:\x02\x20
 
 **The order** is the one herdr's own agent panel uses with `agent_panel_sort = "priority"` (as
 of herdr 0.9.5): blocked (red `●`), done (cyan `●`), working (yellow `●`), idle (`○`), unknown
-(`·`), and plain terminals (`›`) at the end, in tab-bar order. Inside a status, the agent whose
-change Switchboard saw last goes on top, whatever its machine. With a query, matches that score
-the same keep this order.
+(`·`), and plain terminals (`›`) at the end, in tab-bar order. Inside a status, the agent that
+changed last goes on top, whatever its machine. Where the plugin is installed, its hook notes
+when that machine saw each change, so this matches herdr's panel even for what changed while the
+popup was closed; the times come from each machine's clock, so they assume the clocks agree, as
+NTP keeps them. A change with no such time (a machine without the plugin, or a change from before
+the plugin's watcher started there) is placed at the last moment a popup was reading that
+machine, the earliest it can have happened; the machines read until a popup closed share that
+moment, so they interleave machine by machine, because herdr gives no time for a
+change and the counters of two machines cannot be compared. It can show below a timed change
+that came before it. With a query, matches that score the same keep this order.
 
 **The columns** are machine, workspace, tab and pane, as in herdr's navigator, then the agent's
 kind (when it is not `claude`) and the directory, dimmed. A pane shows its name, or else the

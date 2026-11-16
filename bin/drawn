@@ -18,6 +18,12 @@ the snapshot it already takes, from any machine, and counts only the sizes of th
 was opened from: a window nobody uses (a Mac's own screen with the lid closed) draws too, but
 never opens the popup.
 
+It also notes, for every agent, when this machine saw its state change ("<seq> <unix time>"
+in `switchboard_changed`, 0 when that happened before anything here was watching). herdr's
+panel puts the most recent change on top whatever machine it happened on, because the window
+sees every change as it happens; a popup that lives a few seconds cannot, and the counters of
+two machines cannot be compared. With these times it orders the rows the same way.
+
 Two things call it. The event hooks run on what changes what a window shows on this
 machine: an agent changing state and the focus moving. herdr sends no event when a window
 starts or stops showing a machine (its layout takes the window's size without one), so a
@@ -40,6 +46,7 @@ import sys
 import time
 
 TOKEN = "switchboard_drawn"
+CHANGED = "switchboard_changed"  # "<seq> <unix time>": when this machine saw that seq appear
 SOURCE = "plugin:trustxai.switchboard"
 PLUGIN_ID = "trustxai.switchboard"
 KEEP = 4             # sizes kept per pane; 4 entries stay under herdr's 80-character limit
@@ -51,9 +58,14 @@ CHECK_EVERY = 30.0   # seconds between the watcher's checks that it is still the
 GONE_AFTER = 60.0    # seconds without herdr's socket before the watcher exits
 
 
+def digits(text):
+    """ASCII digits only: str.isdigit() also takes characters such as "²", which int() refuses."""
+    return text.isascii() and text.isdigit()
+
+
 def valid_size(size):
     cols, x, rows = size.partition("x")
-    return bool(x) and cols.isdigit() and rows.isdigit() and 0 < int(cols) < 100000 and 0 < int(rows) < 100000
+    return bool(x) and digits(cols) and digits(rows) and 0 < int(cols) < 100000 and 0 < int(rows) < 100000
 
 
 def parse(value):
@@ -66,7 +78,7 @@ def parse(value):
         if len(bits) != 2:
             continue
         seq, size = bits
-        if not seq.isdigit() or not valid_size(size):
+        if not digits(seq) or not valid_size(size):
             continue
         out[size] = max(out.get(size, -1), int(seq))
     return out
@@ -128,6 +140,78 @@ def reports(snap):
     return out
 
 
+def parse_changed(value):
+    """(seq, time) from a switchboard_changed value, or None when malformed. Time 0 means the
+    change came before anything here was watching, so when it happened is not known."""
+    bits = value.split(" ") if isinstance(value, str) else []
+    if len(bits) != 2 or not digits(bits[0]):
+        return None
+    try:
+        t = float(bits[1])
+    except ValueError:
+        return None
+    return (int(bits[0]), t) if 0 <= t < 1e11 else None
+
+
+def changes(snap, now, fresh=(), primed=False, only=None):
+    """{pane: switchboard_changed value} for the agents whose change is not noted yet.
+
+    - fresh: the panes whose change is the event being handled; they get `now`, even over a
+      token that holds their seq with time 0.
+    - A token with an older seq: the watcher reads once a second, so the change is at most
+      that old; it gets `now`.
+    - No token: with `primed` (the watcher has made a pass since it started, so it would have
+      seen this agent before) the agent is new and gets `now`; otherwise the change may be
+      hours old, from before anything here was watching, and it gets 0, unknown.
+    - only: when given, just those panes (an event hook leaves the rest to the watcher, so a
+      burst of new agents does not mark each other unknown)."""
+    out = {}
+    for a in snap.get("agents") or []:
+        if not isinstance(a, dict) or not isinstance(a.get("pane_id"), str):
+            continue
+        pane = a["pane_id"]
+        if only is not None and pane not in only:
+            continue
+        seq = a.get("state_change_seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+            continue
+        tokens = a.get("tokens") if isinstance(a.get("tokens"), dict) else {}
+        old = parse_changed(tokens.get(CHANGED))
+        if old is not None and old[0] == seq and not (pane in fresh and old[1] == 0):
+            continue
+        known = pane in fresh or old is not None or primed
+        out[pane] = "%d %s" % (seq, ("%.1f" % now) if known else "0")
+    return out
+
+
+def writes(snap, now, fresh=(), primed=False, only=None):
+    """Every pane.report_metadata this snapshot calls for, one per pane, both tokens in it."""
+    tokens = {}
+    for params in reports(snap):
+        tokens.setdefault(params["pane_id"], {}).update(params["tokens"])
+    for pane, value in changes(snap, now, fresh, primed, only).items():
+        tokens.setdefault(pane, {})[CHANGED] = value
+    return [{"pane_id": pane, "source": SOURCE, "tokens": t} for pane, t in tokens.items()]
+
+
+STATUS_EVENTS = ("pane_agent_status_changed", "pane.agent_status_changed")
+
+
+def event_panes(env):
+    """The pane whose agent changed state, from HERDR_PLUGIN_EVENT_JSON, as a set: empty for
+    any other event (a focus says nothing about when an agent changed)."""
+    try:
+        ev = json.loads(env.get("HERDR_PLUGIN_EVENT_JSON") or "null")
+    except ValueError:
+        return set()
+    if not isinstance(ev, dict) or ev.get("event", env.get("HERDR_PLUGIN_EVENT")) not in STATUS_EVENTS:
+        return set()
+    for d in (ev.get("data"), ev):
+        if isinstance(d, dict) and isinstance(d.get("pane_id"), str):
+            return {d["pane_id"]}
+    return set()
+
+
 def call(path, method, params, timeout=TIMEOUT):
     """One request to herdr's socket and its result. herdr answers a request and closes the
     connection, so each request opens its own."""
@@ -180,19 +264,20 @@ def try_lock(fd, wait):
 
 
 def clears(snap):
-    """The pane.report_metadata params that remove this plugin's token from every pane. A token
-    stays on its pane after the agent there exits, so panes are walked, not only agents."""
+    """The pane.report_metadata params that remove this plugin's tokens from every pane. A
+    token stays on its pane after the agent there exits, so panes are walked, not only agents."""
     out, done = [], set()
-    for item in (snap.get("panes") or []) + (snap.get("agents") or []):
+    panes, agents = snap.get("panes"), snap.get("agents")
+    for item in (panes if isinstance(panes, list) else []) + (agents if isinstance(agents, list) else []):
         tokens = item.get("tokens") if isinstance(item, dict) and isinstance(item.get("tokens"), dict) else {}
         pane = item.get("pane_id") if isinstance(item, dict) else None
-        if TOKEN in tokens and isinstance(pane, str) and pane not in done:
+        if (TOKEN in tokens or CHANGED in tokens) and isinstance(pane, str) and pane not in done:
             done.add(pane)
-            out.append({"pane_id": pane, "source": SOURCE, "tokens": {TOKEN: None}})
+            out.append({"pane_id": pane, "source": SOURCE, "tokens": {TOKEN: None, CHANGED: None}})
     return out
 
 
-def note(path, state_dir, wait, rpc=call, clear=False):
+def note(path, state_dir, wait, rpc=call, clear=False, fresh=(), clock=time.time, primed=False, only=None):
     """One pass: read the snapshot and write the tokens it calls for. The write lock keeps
     the event hooks and the watcher from rewriting one token from the same old value; when it
     cannot be had in time, this pass is skipped, and the next one notes the same thing. With
@@ -206,17 +291,19 @@ def note(path, state_dir, wait, rpc=call, clear=False):
         result = rpc(path, "session.snapshot", {})
         snap = result.get("snapshot") if isinstance(result, dict) else None
         if isinstance(snap, dict):
-            for params in (clears(snap) if clear else reports(snap)):
+            for params in (clears(snap) if clear else writes(snap, clock(), fresh, primed, only)):
                 rpc(path, "pane.report_metadata", params)
+            return True
     finally:
         os.close(fd)
 
 
 def event(env, rpc=call):
-    """An event hook: note what is drawn now."""
+    """An event hook: note what is drawn now, and when the agent the event is about changed."""
     path, state_dir = env.get("HERDR_SOCKET_PATH"), env.get("HERDR_PLUGIN_STATE_DIR")
     if path and state_dir and os.path.exists(path):
-        note(path, state_dir, TIMEOUT, rpc)
+        fresh = event_panes(env)
+        note(path, state_dir, TIMEOUT, rpc, fresh=fresh, only=fresh)
 
 
 def start_watcher(env, popen=subprocess.Popen):
@@ -288,7 +375,7 @@ def watch(env, sleep=time.sleep, clock=time.time, rpc=call, me=None):
             pass
         me = me or os.path.abspath(__file__)
         root = env.get("HERDR_PLUGIN_ROOT")
-        last_ok, next_check = clock(), 0.0
+        last_ok, next_check, primed = clock(), 0.0, False
         while True:
             # A check that fails is no reason to stop noting: only a clear answer stops it.
             if clock() >= next_check:
@@ -307,7 +394,8 @@ def watch(env, sleep=time.sleep, clock=time.time, rpc=call, me=None):
                     return
                 next_check = clock() + CHECK_EVERY
             try:
-                note(path, state_dir, INTERVAL, rpc)
+                if note(path, state_dir, INTERVAL, rpc, clock=clock, primed=primed):
+                    primed = True  # from now on an agent without a token is a new one
                 last_ok = clock()
             except Exception as exc:
                 last_error(state_dir, path, "note", exc)

@@ -73,7 +73,7 @@ machines saved in it (`herdr machine list --json`; disabled ones are skipped), a
 output of a pane (`herdr pane read`) for the preview, `ctrl-y` and `ctrl-o`. The one change the
 popup makes is focusing the pane you choose (`herdr agent focus`, or `herdr tab focus` for a
 plain terminal). It does not create or close anything, and it renames nothing except, for a
-moment, through the jump below. The hook in the next section writes one pane token.
+moment, through the jump below. The hook in the next section writes two pane tokens.
 
 ### The hook and its watcher (`bin/drawn`)
 
@@ -83,8 +83,11 @@ and `workspace.focused`). The install and update previews list these commands. E
 the local snapshot over herdr's socket (`HERDR_SOCKET_PATH`) and, for the agents in the focused
 tab, writes one pane token, `switchboard_drawn`, through `pane.report_metadata` with the source
 `plugin:trustxai.switchboard`. The token holds numbers only: herdr's change counter for that
-agent and the size of the window that drew it (`12 239x63`). It changes no title, label, status
-or focus, and it never reads pane output.
+agent and the size of the window that drew it (`12 239x63`). For every agent it also writes
+`switchboard_changed`: that counter and the time this machine saw it change (`12
+1794803477.1`, or `0` when unknown). An event hook writes this one only for the agent the event
+is about; the watcher writes it for the rest. It changes no title, label, status or focus, and it never
+reads pane output.
 
 It also starts a watcher, one per herdr server, that does the same once a second, because herdr sends
 no event when a window starts showing a machine. The watcher is that same script with `--watch`:
@@ -92,7 +95,7 @@ detached in its own session, with `/dev/null` for input and output, at a lower p
 talks only to the local herdr socket, and it exits when the socket is gone or has not answered
 for a minute, when the plugin is disabled, removed or updated to another directory (it asks
 `plugin.list` every 30 seconds), or when its own file is gone. When the plugin is disabled or
-removed, it first takes `switchboard_drawn` off every pane. One watcher runs per herdr server:
+removed, it first takes both tokens off every pane. One watcher runs per herdr server:
 named sessions on one machine each get their own.
 
 ### What comes back from herdr is untrusted
@@ -271,7 +274,8 @@ It keeps these files in the plugin's state directory: `$HERDR_PLUGIN_STATE_DIR`,
 - **`recency.json`**: per machine and agent pane, the last change counter seen, when it was seen,
   its rank among the changes seen together, up to which counter finished work counts as seen,
   and the counter at which herdr last reported it done; per machine, the tab that was focused at
-  the last read; and the sizes of the last windows the popup was opened from.
+  the last read; the sizes of the last windows the popup was opened from; and when a popup last
+  read each machine.
 - **`drawn-<id>.lock` and `watch-<id>.lock`**, the locks of the hook above, one pair per herdr
   server (`<id>` is a hash of its socket path); `watch-<id>.lock` holds the watcher's process
   id. **`drawn-<id>.err`**: that watcher's last error, one line (time, where, the error's type
