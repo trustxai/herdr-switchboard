@@ -97,8 +97,9 @@ changed last goes on top, whatever its machine. Where the plugin is installed, i
 when that machine saw each change, so this matches herdr's panel even for what changed while the
 popup was closed; the times come from each machine's clock, so they assume the clocks agree, as
 NTP keeps them. A change with no such time (a machine without the plugin, or a change from before
-the plugin's watcher started there) is placed at the last moment a popup was reading, the
-earliest it can have happened, interleaved machine by machine, because herdr gives no time for a
+the plugin's watcher started there) is placed at the last moment a popup was reading that
+machine, the earliest it can have happened; the machines read until a popup closed share that
+moment, so they interleave machine by machine, because herdr gives no time for a
 change and the counters of two machines cannot be compared. It can show below a timed change
 that came before it. With a query, matches that score the same keep this order.
 

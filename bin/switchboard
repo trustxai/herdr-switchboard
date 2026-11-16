@@ -1286,6 +1286,9 @@ def fmt_age(seconds):
 # then, reads still showing the old tab are taken as from before the move (Recency.observe).
 FOCUS_SETTLE = 10.0
 READ_SAVE_EVERY = 5.0  # seconds between saves of the machines' read times alone (Recency)
+# A machine whose kept read time is this close to the latest one was being read when the last
+# popup closed: the save cadence, the remote refresh interval and some slack.
+READ_NEAR = READ_SAVE_EVERY + 10.0
 
 
 class Recency:
@@ -1378,9 +1381,15 @@ class Recency:
             except (ValueError, TypeError, AttributeError):
                 self.read = {}
         # What changed while closed, with no time from a hook, happened after the last moment a
-        # popup was reading (every machine is read every few seconds while one is open). One
-        # stamp for all machines, so they still interleave; never later than this opening.
-        self.floor = min(max(self.read.values()), self.opened) if self.read else self.opened
+        # popup was reading that machine (every machine is read every few seconds while one is
+        # open). The machines read until the end share one stamp, just after the latest read, so
+        # they still interleave and rise above what was seen before; a machine that popup did not
+        # read (offline, or added since) keeps its own, older read time. Never later than this
+        # opening; a machine never read gets the opening.
+        self.read_at_open = dict(self.read)
+        latest = max(self.read.values()) if self.read else None
+        self.latest_read = latest
+        self.floor = min(latest + 0.001, self.opened) if latest is not None else self.opened
 
     def saw_window(self, size, now=None):
         """The popup was opened from a window of that size: what such a window drew counts as
@@ -1434,7 +1443,7 @@ class Recency:
             # reading: it happened after that, so it rises above what was seen before, and it does
             # not jump above changes that a hook timed after that moment.
             t = now or time.time()
-            stamp = t if machine in self.fresh else self.floor
+            stamp = t if machine in self.fresh else self.first_stamp(machine)
             self.read[machine] = t
             self.fresh.add(machine)
             baseline = machine not in self.seen
@@ -1494,6 +1503,7 @@ class Recency:
             # The read times change on every read: they are kept on disk with any other change,
             # or every READ_SAVE_EVERY seconds, and never count as a change of the rows.
             if dirty or t - self.read_saved > READ_SAVE_EVERY:
+                self.read_saved = t
                 self._save()
         return dirty
 
@@ -1519,8 +1529,17 @@ class Recency:
                 self._save()
         return dirty
 
+    def first_stamp(self, machine):
+        """The stamp of a change first seen on this popup's first read of that machine (see
+        floor in __init__)."""
+        r = self.read_at_open.get(machine)
+        if r is None:
+            return self.opened
+        if r >= self.latest_read - READ_NEAR:
+            return self.floor
+        return min(r, self.opened)
+
     def _save(self):
-        self.read_saved = time.time()
         if not self.path:
             return
 

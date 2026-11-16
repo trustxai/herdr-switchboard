@@ -1616,20 +1616,51 @@ with tempfile.TemporaryDirectory() as d:
     got = [e["pane"] for e in sorted(here + there, key=sb.sort_key)]
     check("changed-untimed-ranks-by-the-last-read", got == ["A", "R"], (got, [(e["pane"], e["stamp"]) for e in here + there]))
     check("changed-read-time-recorded", rd2.read.get("m1") == 1000.0, rd2.read)
-    # Two machines without the hook, last read a moment apart: they still interleave.
+    sb.STATE_DIR = STATE
+# The floor, from what the last popup kept: m1 and m2 were read until it closed (1900, 1902.5),
+# m3 was not (offline then: last read 500), m4 never. A new popup opens at 2000.
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    old = {p: [1, 1.0, 0, 1, -1] for p in ("a1", "a2", "b1", "b2", "c1")}
+    with open(os.path.join(d, "recency.json"), "w") as f:
+        json.dump({"v": 2, "machines": {"m1": {"a1": old["a1"], "a2": old["a2"]},
+                                        "m2": {"b1": old["b1"], "b2": old["b2"]}, "m3": {"c1": old["c1"]}},
+                   "read": {"m1": 1900.0, "m2": 1902.5, "m3": 500.0}}, f)
     rd3 = sb.Recency(now=2000.0)
-    rd3.read = {"m1": 1900.0, "m2": 1902.5}
-    rd3.floor = 1902.5
-    rd3.seen = {"m1": {"a1": [1, 1.0, 0, 1, -1], "a2": [1, 1.0, 0, 1, -1]},
-                "m2": {"b1": [1, 1.0, 0, 1, -1], "b2": [1, 1.0, 0, 1, -1]}}
+    check("changed-floor-just-after-the-latest-read", abs(rd3.floor - 1902.501) < 1e-9, rd3.floor)
+    check("changed-first-stamps", (rd3.first_stamp("m1"), rd3.first_stamp("m2"), rd3.first_stamp("m3"), rd3.first_stamp("m4"))
+          == (rd3.floor, rd3.floor, 500.0, 2000.0), (rd3.first_stamp("m1"), rd3.first_stamp("m3"), rd3.first_stamp("m4")))
     m1 = ents17("m1", 1, changed17("a1", "idle", 9), changed17("a2", "idle", 8))
     m2 = ents17("m2", 2, changed17("b1", "idle", 7), changed17("b2", "idle", 6))
-    rd3.observe("m1", m1, now=2000.0, focus=T2)
-    rd3.observe("m2", m2, now=2000.0, focus=T2)
-    got = [e["pane"] for e in sorted(m1 + m2, key=sb.sort_key)]
-    check("changed-untimed-machines-interleave", got == ["a1", "b1", "a2", "b2"], got)
-    check("changed-floor-is-the-last-read", sb.Recency(now=3000.0).floor == max(sb.Recency(now=3000.0).read.values()),
-          sb.Recency(now=3000.0).floor)
+    m3 = ents17("m3", 3, changed17("c1", "idle", 5))
+    loc = ents17("", 0, changed17("L", "idle", 4, at=700.0))  # timed: after m3's last read
+    for m, e in (("m1", m1), ("m2", m2), ("m3", m3)):
+        rd3.observe(m, e, now=2000.0, focus=T2)
+    rd3.apply(loc)
+    got = [e["pane"] for e in sorted(m1 + m2 + m3 + loc, key=sb.sort_key)]
+    check("changed-untimed-machines-interleave", got[:4] == ["a1", "b1", "a2", "b2"], got)
+    check("changed-unread-machine-keeps-its-own-read", got[4:] == ["L", "c1"], got)
+    with open(os.path.join(d, "recency.json"), "w") as f:
+        json.dump({"v": 2, "machines": {}, "read": {"m1": 5000.0}}, f)
+    check("changed-floor-never-after-the-opening", sb.Recency(now=2000.0).floor == 2000.0, sb.Recency(now=2000.0).floor)
+    sb.STATE_DIR = STATE
+# A row seen live in the last popup's last save, and a change on another machine after it closed:
+# the new change rises above it, never ties with it.
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    r1 = sb.Recency(now=1000.0)
+    r1.observe("", ents17("", 0, changed17("X", "working", 1)), now=1000.0, focus=T2, here=True)
+    r1.observe("m1", ents17("m1", 1, changed17("Y", "working", 1)), now=1000.0, focus=T2)
+    loc = ents17("", 0, changed17("X", "idle", 2))
+    r1.observe("", loc, now=1005.0, focus=T2, here=True)
+    r1.observe("m1", ents17("m1", 1, changed17("Y", "working", 1)), now=1005.0, focus=T2)
+    r2 = sb.Recency(now=2000.0)
+    loc = ents17("", 0, changed17("X", "idle", 2))
+    rem = ents17("m1", 1, changed17("Y", "idle", 3))
+    r2.observe("", loc, now=2000.0, focus=T2, here=True)
+    r2.observe("m1", rem, now=2000.0, focus=T2)
+    got = [e["pane"] for e in sorted(loc + rem, key=sb.sort_key)]
+    check("changed-after-the-close-rises-above-the-last-seen", got == ["Y", "X"], (got, [(e["pane"], e["stamp"]) for e in loc + rem]))
     sb.STATE_DIR = STATE
 rd3 = sb.Recency(persist=False, now=1000.0)
 rd3.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=1000.0, focus=T2)
@@ -1641,9 +1672,10 @@ with tempfile.TemporaryDirectory() as d:
     check("changed-read-times-persisted", sb.Recency(now=200.0).read.get("m1") == 100.0)
     check("changed-read-time-alone-is-no-change", r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=101.0, focus=T2)
           is False)
-    r1.read_saved = 0.0  # the last save long ago: a read alone is saved now
-    r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=140.0, focus=T2)
-    check("changed-read-time-saved-now-and-then", sb.Recency(now=200.0).read.get("m1") == 140.0, sb.Recency(now=200.0).read)
+    r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=104.0, focus=T2)
+    check("changed-read-time-not-saved-at-once", sb.Recency(now=200.0).read.get("m1") == 100.0, sb.Recency(now=200.0).read)
+    r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=106.0, focus=T2)
+    check("changed-read-time-saved-every-5-s", sb.Recency(now=200.0).read.get("m1") == 106.0, sb.Recency(now=200.0).read)
     sb.STATE_DIR = STATE
 
 # 18. Config.
