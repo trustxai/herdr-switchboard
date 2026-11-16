@@ -7,7 +7,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.2.0] - 2026-11-15
+## [0.2.0] - 2026-11-16
 
 ### Changed
 
@@ -43,7 +43,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sends no event when a window starts showing another machine. Only the windows the popup was
   opened from count, so a Mac's own screen that nobody looks at marks nothing seen. On a
   machine without the plugin, or with nothing drawn since its herdr server started, the guess
-  from the focus still applies. Differences that remain: what a window draws while Ghostty is
+  from the focus still applies, and it now also counts work as seen once that machine's focus
+  moves off the tab it finished in (other than by Enter in the popup). Differences that remain: what a window draws while Ghostty is
   behind another app counts as seen, a look at a machine shorter than about a second may not be
   noted, and when two windows show one machine at once, herdr sizes its layout after the one
   that attached or resized last. Disabling or removing the plugin takes the token off every
@@ -68,13 +69,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A helper on the Mac that never says it is ready (an older version does not) no longer makes
   every Enter wait: after 8 seconds the popup stops waiting for it, and Enter focuses the pane
   at once.
-- Work that finished in the tab in front on a machine no longer stays `done` after you left that
-  tab there: once that machine's focus moves to another tab (other than by Enter in the popup),
-  the work counts as seen. Before, it stayed `done` until you opened the popup on that tab or
-  picked it with Enter, also when herdr's own panel already showed it as seen. The trade-off,
-  described in the README: reaching another tab of that machine without passing through that
-  one (herdr's navigator from another machine, the jump, a script) also counts as seen, while
-  herdr's panel still shows the work `done`.
 
 ## [0.1.0] - 2026-11-15
 
