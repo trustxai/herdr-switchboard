@@ -28,6 +28,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Inside a status, rows from different machines are in the order herdr's panel shows: the
+  agent that changed last on top. The hook also notes when its machine saw each change (pane
+  token `switchboard_changed`), and the popup orders by that time. Before, what changed while
+  the popup was closed came in interleaved machine by machine, because herdr gives no time for
+  a change and two machines' counters cannot be compared. A change with no time (a machine
+  without the plugin, or a change from before its watcher started) is placed at the last moment
+  a popup was reading, still interleaved machine by machine, so it no longer jumps above every
+  timed change; when no popup has read anything yet, at the opening time as before.
+- `done` follows what a window drew, as in herdr's own panel, instead of a guess from each
+  machine's focus. On each machine the plugin notes which agents a window drew, in a pane token
+  (`switchboard_drawn`): `bin/drawn` runs at herdr's start and on the events that change what a
+  window shows, and keeps a watcher that reads the local state once a second, because herdr
+  sends no event when a window starts showing another machine. Only the windows the popup was
+  opened from count, so a Mac's own screen that nobody looks at marks nothing seen. On a
+  machine without the plugin, or with nothing drawn since its herdr server started, the guess
+  from the focus still applies. Differences that remain: what a window draws while Ghostty is
+  behind another app counts as seen, a look at a machine shorter than about a second may not be
+  noted, and when two windows show one machine at once, herdr sizes its layout after the one
+  that attached or resized last. Disabling or removing the plugin takes the token off every
+  pane. The install and update previews list the new startup and event commands.
 - With the jump on, Enter on another machine's row no longer holds the popup while the
   connection to the Mac is set up: it waits for it 2 seconds at most, then focuses the pane
   instead, and the popup's close never waits for an ssh lookup (before, up to about 12 seconds

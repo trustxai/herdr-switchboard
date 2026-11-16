@@ -820,6 +820,7 @@ def entries_from(snap, machine=LOCAL, machine_label="", machine_index=0):
         siblings = by_tab.get(p["tab_id"], [])
         tab_label = clean(t.get("label"))
         completion = (a or {}).get("completion_seq")
+        tokens = (a or {}).get("tokens")
         out.append({
             "machine": machine,
             "machine_label": machine_label,
@@ -832,6 +833,11 @@ def entries_from(snap, machine=LOCAL, machine_label="", machine_index=0):
             "seq": _int((a or {}).get("state_change_seq")),
             # The seq at which a piece of work finished, whether anyone saw it or not.
             "completion": completion if _int(completion, None) is not None else None,
+            # {window size: seq} the plugin's hook noted as drawn on that machine (bin/drawn).
+            "drawn": parse_drawn(tokens.get(DRAWN_TOKEN) if isinstance(tokens, dict) else None),
+            # When that machine saw this seq appear (bin/drawn), or None when not known.
+            "changed": changed_at(tokens.get(CHANGED_TOKEN) if isinstance(tokens, dict) else None,
+                                  _int((a or {}).get("state_change_seq"))),
             "ws_label": clean(w.get("label")) or clean(p.get("workspace_id")),
             "ws_number": _int(w.get("number")),
             # An unnamed tab is called "1", "2": that is its number, not a name.
@@ -1135,6 +1141,71 @@ def focused_tab(snap):
     return tab if isinstance(tab, str) else None
 
 
+# The pane token the plugin's event hook and watcher (bin/drawn) keep on each machine: for
+# each window size that showed the pane, the agent's state_change_seq at the time.
+DRAWN_TOKEN = "switchboard_drawn"
+# herdr's default headless size: what a machine's layout falls back to with no window on it.
+HEADLESS_SIZE = "120x40"
+WINDOWS_KEPT = 4  # sizes of the windows the popup was opened from, kept in recency.json
+# The pane token where the same hook notes when its machine saw each agent's seq appear.
+CHANGED_TOKEN = "switchboard_changed"
+
+
+def _digits(text):
+    """ASCII digits only: str.isdigit() also takes characters such as "²", which int() refuses."""
+    return text.isascii() and text.isdigit()
+
+
+def _size(value):
+    """'<cols>x<rows>' when value is one, else None."""
+    if not isinstance(value, str):
+        return None
+    cols, x, rows = value.partition("x")
+    if x and _digits(cols) and _digits(rows) and 0 < int(cols) < 100000 and 0 < int(rows) < 100000:
+        return "%dx%d" % (int(cols), int(rows))
+    return None
+
+
+def parse_drawn(value):
+    """{size: seq} from a switchboard_drawn token ("<seq> <cols>x<rows>", comma-separated).
+    A token is untrusted input like the rest of a snapshot: whatever is malformed is skipped."""
+    out = {}
+    if not isinstance(value, str):
+        return out
+    for part in value[:200].split(","):
+        bits = part.strip().split(" ")
+        size = _size(bits[1]) if len(bits) == 2 else None
+        if size and _digits(bits[0]):
+            out[size] = max(out.get(size, -1), int(bits[0]))
+    return out
+
+
+def changed_at(value, seq):
+    """The time in a switchboard_changed token ("<seq> <unix time>") when it is about this seq
+    and known (not 0); else None. Untrusted input: anything malformed is None."""
+    bits = value.split(" ") if isinstance(value, str) and len(value) <= 80 else []
+    if len(bits) != 2 or not _digits(bits[0]) or int(bits[0]) != seq:
+        return None
+    try:
+        t = float(bits[1])
+    except ValueError:
+        return None
+    return t if 0 < t < 1e11 else None
+
+
+def focused_size(snap):
+    """'<cols>x<rows>' of the focused tab's layout: the size of the window showing that
+    machine, or the headless size when none does. None when the snapshot does not say."""
+    tab = focused_tab(snap)
+    layouts = snap.get("layouts") if isinstance(snap, dict) else None
+    for lay in layouts if isinstance(layouts, list) else []:
+        if isinstance(lay, dict) and lay.get("tab_id") == tab and isinstance(lay.get("area"), dict):
+            cols, rows = _int(lay["area"].get("width"), None), _int(lay["area"].get("height"), None)
+            if cols and rows:
+                return _size("%dx%d" % (cols, rows))
+    return None
+
+
 MACHINE_LIST_TIMEOUT = 3  # seconds for `herdr machine list` (saved_machines)
 
 
@@ -1214,6 +1285,10 @@ def fmt_age(seconds):
 # Seconds a focus the popup moved (ack_tab) has to show up in that machine's snapshots; until
 # then, reads still showing the old tab are taken as from before the move (Recency.observe).
 FOCUS_SETTLE = 10.0
+READ_SAVE_EVERY = 5.0  # seconds between saves of the machines' read times alone (Recency)
+# A machine whose kept read time is this close to the latest one was being read when the last
+# popup closed: the save cadence, the remote refresh interval and some slack.
+READ_NEAR = READ_SAVE_EVERY + 10.0
 
 
 class Recency:
@@ -1227,10 +1302,12 @@ class Recency:
     - It is kept on disk (recency.json in the state directory), with the time each change
       was seen.
     - Everything that changed while the popup was closed is seen at once on open, and the
-      API gives no timestamps to tell which happened first on which machine. Those changes
-      get the opening time and, at equal time, interleave: the most recent of each machine,
-      then the second of each. While the popup is open the order is the real one, within
-      the refresh interval.
+      API gives no timestamps to tell which happened first on which machine. Where the
+      plugin's hook runs (bin/drawn), each agent carries the time its machine saw the change
+      (`changed`), and that time decides. Otherwise those changes get the last moment a
+      popup was reading (the opening time if none ever did) and, at equal time, interleave:
+      the most recent of each machine, then the second of each.
+      While the popup is open the order is the real one, within the refresh interval.
 
     It also decides what is `done`, meaning finished and not seen yet. The server's own
     status is not enough: it marks as seen whatever finishes in its active tab while a
@@ -1241,6 +1318,15 @@ class Recency:
 
     - the popup opens on its tab (the focused tab of the popup's machine);
     - you pick it with Enter (ack_tab);
+    - a window the popup was opened from drew it after it finished: the plugin's hook on
+      that machine (bin/drawn) noted its seq under that window's size (`drawn`). The sizes
+      of those windows are kept in `windows`. A window nobody opens the popup from (a Mac's
+      own screen with the lid closed) draws too, and does not count.
+
+    On a machine whose agents carry no such note (the hook is not there yet, or nothing
+    was drawn since its server started), the popup guesses from that machine's focus
+    instead, and a finished piece of work also counts as seen when:
+
     - the server had it done and turned it idle: you went there some other way;
     - it finished outside the active tab of its machine and is already idle: the same,
       except the popup never saw it done;
@@ -1267,6 +1353,9 @@ class Recency:
         self.focus = {}      # machine -> its focused tab at the last read
         self.fresh = set()   # machines already read since this popup opened
         self.expect = {}     # machine -> (tab the popup moved its focus to, until when)
+        self.windows = {}    # size of a window the popup was opened from -> when, last
+        self.read = {}       # machine -> when a popup last read it (kept on disk)
+        self.read_saved = 0.0
         self.lock = threading.Lock()
         if self.path:
             try:
@@ -1281,7 +1370,43 @@ class Recency:
                              for m, panes in d["machines"].items()}
                 self.focus = {str(m): str(tab) for m, tab in (d.get("focus") or {}).items()}
             except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError):
-                self.seen, self.focus = {}, {}
+                self.seen, self.focus, d = {}, {}, {}
+            # Read on its own: a bad windows entry must not reset the done marks above.
+            try:
+                self.windows = {s: float(t) for s, t in (d.get("windows") or {}).items() if _size(s) == s}
+            except (ValueError, TypeError, AttributeError):
+                self.windows = {}
+            try:
+                self.read = {str(m): float(t) for m, t in (d.get("read") or {}).items()}
+            except (ValueError, TypeError, AttributeError):
+                self.read = {}
+        # What changed while closed, with no time from a hook, happened after the last moment a
+        # popup was reading that machine (every machine is read every few seconds while one is
+        # open). The machines read until the end share one stamp, just after the latest read, so
+        # they still interleave and rise above what was seen before; a machine that popup did not
+        # read (offline, or added since) keeps its own, older read time. Never later than this
+        # opening; a machine never read gets the opening.
+        self.read_at_open = dict(self.read)
+        latest = max(self.read.values()) if self.read else None
+        self.latest_read = latest
+        self.floor = min(latest + 0.001, self.opened) if latest is not None else self.opened
+
+    def saw_window(self, size, now=None):
+        """The popup was opened from a window of that size: what such a window drew counts as
+        seen. The last WINDOWS_KEPT sizes are kept, so a resized window still counts what it
+        drew before. The headless size is never a window."""
+        if not size or _size(size) != size or size == HEADLESS_SIZE:
+            return
+        with self.lock:
+            self.windows[size] = now or time.time()
+            for old in sorted(self.windows, key=self.windows.get)[:-WINDOWS_KEPT]:
+                del self.windows[old]
+            self._save()
+
+    def drawn(self, e):
+        """The highest seq a window the popup was opened from drew of that agent; -1 if none."""
+        d = e.get("drawn") or {}
+        return max([d[s] for s in self.windows if s in d] or [-1])
 
     @staticmethod
     def completed(e):
@@ -1296,8 +1421,13 @@ class Recency:
             if e["kind"] == "a":
                 known = self.seen.get(e["machine"], {}).get(e["pane"])
                 e["stamp"], e["rank"] = (known[1], known[2]) if known else (0.0, 0)
+                if e.get("changed"):
+                    # When its machine saw the change, noted by the hook there: the real order
+                    # across machines, as in herdr's panel, also for what changed while closed.
+                    # It assumes the machines' clocks agree, as NTP keeps them.
+                    e["stamp"], e["rank"] = e["changed"], 0
                 raw = e.get("server_status", e["status"])
-                unseen = bool(known) and known[0] == e["seq"] and known[3] < e["seq"]
+                unseen = bool(known) and known[0] == e["seq"] and max(known[3], self.drawn(e)) < e["seq"]
                 e["status"] = "done" if raw == "idle" and unseen and self.completed(e) else raw
         return entries
 
@@ -1308,8 +1438,13 @@ class Recency:
         focus: the focused tab of that snapshot. here: it is the machine the popup runs on,
         so that tab is the one in front of you."""
         with self.lock:
-            # The first read of each machine brings everything that happened while closed.
-            stamp = (now or time.time()) if machine in self.fresh else self.opened
+            # The first read of each machine brings everything that happened while closed. With
+            # no time from its hook, such a change gets `floor`, the last moment a popup was
+            # reading: it happened after that, so it rises above what was seen before, and it does
+            # not jump above changes that a hook timed after that moment.
+            t = now or time.time()
+            stamp = t if machine in self.fresh else self.first_stamp(machine)
+            self.read[machine] = t
             self.fresh.add(machine)
             baseline = machine not in self.seen
             known = self.seen.setdefault(machine, {})
@@ -1325,6 +1460,8 @@ class Recency:
                 else:
                     stale = True
             agents = [e for e in entries if e["kind"] == "a"]
+            # The hook runs on that machine: what its windows drew decides, not a guess.
+            hooked = any(e.get("drawn") for e in agents)
             changed = []
             for e in agents:
                 k = known.get(e["pane"])
@@ -1336,6 +1473,9 @@ class Recency:
                     sdone = seq
                 if here and focus and e["tab"] == focus:
                     ack = seq  # it is in front of you
+                elif hooked:
+                    if self.drawn(e) >= seq:
+                        ack = seq  # a window you open the popup from drew it after it finished
                 elif raw == "idle" and ack < seq and self.completed(e):
                     if sdone == seq:
                         ack = seq  # the server had it done and turned it idle: you went there
@@ -1360,7 +1500,10 @@ class Recency:
                 self.focus[machine] = focus
             self.apply(entries)
             dirty = before != json.dumps([known, self.focus.get(machine)], sort_keys=True)
-            if dirty:
+            # The read times change on every read: they are kept on disk with any other change,
+            # or every READ_SAVE_EVERY seconds, and never count as a change of the rows.
+            if dirty or t - self.read_saved > READ_SAVE_EVERY:
+                self.read_saved = t
                 self._save()
         return dirty
 
@@ -1386,6 +1529,16 @@ class Recency:
                 self._save()
         return dirty
 
+    def first_stamp(self, machine):
+        """The stamp of a change first seen on this popup's first read of that machine (see
+        floor in __init__)."""
+        r = self.read_at_open.get(machine)
+        if r is None:
+            return self.opened
+        if r >= self.latest_read - READ_NEAR:
+            return self.floor
+        return min(r, self.opened)
+
     def _save(self):
         if not self.path:
             return
@@ -1394,7 +1547,8 @@ class Recency:
             try:
                 os.makedirs(os.path.dirname(self.path), exist_ok=True)
                 with open(self.path + ".tmp", "w") as f:
-                    json.dump({"v": 2, "machines": self.seen, "focus": self.focus}, f)
+                    json.dump({"v": 2, "machines": self.seen, "focus": self.focus,
+                               "windows": self.windows, "read": self.read}, f)
                 os.replace(self.path + ".tmp", self.path)
             except OSError:
                 pass
@@ -1456,9 +1610,13 @@ class Live:
     short-lived, and a row that disappears and comes back is worse than an old one.
     """
 
-    def __init__(self, machines, local_entries, fetch=None, cache=True, recency=None, focus=None):
+    def __init__(self, machines, local_entries, fetch=None, cache=True, recency=None, focus=None,
+                 window=None):
         self.machines = machines
         self.recency = recency or Recency(persist=cache)
+        # window: the size of this machine's focused tab when the popup opened, which is the
+        # size of the window it was opened from.
+        self.recency.saw_window(window)
         # focus: this machine's focused tab when the popup opened, the one in front of you.
         self.recency.observe(LOCAL, local_entries, focus=focus, here=True)
         self.local = local_entries
@@ -3741,7 +3899,7 @@ def popup(self_cmd, demo=False):
         except (EOFError, KeyboardInterrupt):
             pass
         return 1
-    live = Live(machines, entries, focus=focused_tab(snap))
+    live = Live(machines, entries, focus=focused_tab(snap), window=focused_size(snap))
     first = live.changed()
     open_link, remote_enter = enter_mode(machines, demo)
     # SWITCHBOARD_NO_JUMP: no link, so Enter on a remote row takes the focus path. The tests set

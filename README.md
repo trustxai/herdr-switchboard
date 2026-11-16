@@ -56,7 +56,8 @@ or fzf is missing or too old, the popup says what to install.
 
 **Install it on each machine you open it from.** The key runs on the herdr server of the machine
 your window is showing. Machines you just want to *see* in the list need nothing: Switchboard
-runs the herdr already there.
+runs the herdr already there. With the plugin on them too, their `done` marks follow what your
+window drew there (see [Use it](#use-it)).
 
 ## Bind a key
 
@@ -91,9 +92,16 @@ keybind = cmd+k=text:\x02\x20
 
 **The order** is the one herdr's own agent panel uses with `agent_panel_sort = "priority"` (as
 of herdr 0.9.5): blocked (red `●`), done (cyan `●`), working (yellow `●`), idle (`○`), unknown
-(`·`), and plain terminals (`›`) at the end, in tab-bar order. Inside a status, the agent whose
-change Switchboard saw last goes on top, whatever its machine. With a query, matches that score
-the same keep this order.
+(`·`), and plain terminals (`›`) at the end, in tab-bar order. Inside a status, the agent that
+changed last goes on top, whatever its machine. Where the plugin is installed, its hook notes
+when that machine saw each change, so this matches herdr's panel even for what changed while the
+popup was closed; the times come from each machine's clock, so they assume the clocks agree, as
+NTP keeps them. A change with no such time (a machine without the plugin, or a change from before
+the plugin's watcher started there) is placed at the last moment a popup was reading that
+machine, the earliest it can have happened; the machines read until a popup closed share that
+moment, so they interleave machine by machine, because herdr gives no time for a
+change and the counters of two machines cannot be compared. It can show below a timed change
+that came before it. With a query, matches that score the same keep this order.
 
 **The columns** are machine, workspace, tab and pane, as in herdr's navigator, then the agent's
 kind (when it is not `claude`) and the directory, dimmed. A pane shows its name, or else the
@@ -102,21 +110,33 @@ title its agent set; in a split tab its position goes in front (`2 · npm run de
 **The header** counts the agents and those blocked, done and working, and names the machines
 still loading, offline, or shown from a saved copy (`server from 40 s ago`).
 
-**When is something `done`?** A server counts as seen whatever finishes in its active tab, even
-while you look at another machine, so Switchboard keeps its own record. Finished work counts as
-seen when you open the popup on its tab, pick it with Enter, herdr turned it from `done` to
-idle, its machine's focus moved off the tab it finished in (other than by Enter in the popup), or
-it finished outside its machine's active tab and is already idle. Each machine's popup keeps its
-own record.
+**When is something `done`?** herdr's own panel counts finished work as seen once the window
+has drawn it, and keeps that count inside each window, where no API reaches. A server's own
+status is no substitute: it counts as seen whatever finishes in its active tab, even while you
+look at another machine. So on each machine the plugin notes which agents a window drew, in a
+pane token (`switchboard_drawn`), and the popup reads it with the rest of that machine's state.
+The notes come from `bin/drawn`, which herdr runs on the events that change what a window shows
+and which keeps a small watcher reading the local state once a second: herdr sends no event
+when a window starts showing another machine. Only the windows you have opened the popup from
+count, so a Mac's own screen that nobody looks at does not mark anything seen.
 
-herdr's own panel counts what each window drew on screen, which no API exposes, so the two can
-differ in two cases:
+Finished work counts as seen when one of those windows drew it after it finished, when you open
+the popup on its tab, or when you pick it with Enter. Each machine's popup keeps its own record.
+It can still differ from herdr's panel:
 
-- Work that finished in front of you on a machine you then left without changing its tab stays
-  `done` here until that machine's focus moves to another tab or you pick it with Enter.
-- Work that finished in a tab left open on a machine counts as seen here if you later reach
-  another tab of that machine without passing through that one (herdr's navigator from another
-  machine, the jump, a script that focuses a pane), while herdr's panel still shows it `done`.
+- herdr counts a window only while its terminal is in front. Switchboard cannot tell, so what
+  a window draws while Ghostty is behind another app counts as seen here.
+- A look at another machine shorter than about a second may not be noted.
+- When two windows show the same machine at once (a Mac's own screen and the window you use),
+  herdr gives its layout the size of the one that attached or resized last. What the other one
+  draws is then noted under that size: work you watched there can stay `done`, and if you open
+  the popup there, that size starts to count.
+- On a machine without the plugin, or where nothing was drawn since its herdr server started,
+  there are no notes, and Switchboard guesses from that machine's focus instead: finished work
+  counts as seen when herdr turned it from `done` to idle, when that machine's focus moved off
+  the tab it finished in (other than by Enter in the popup), or when it finished outside that
+  machine's active tab and is already idle. Install the plugin on every machine you save in
+  herdr to get the notes.
 
 **Copying.** For a Claude Code session on this machine, `ctrl-y` takes the last reply from the
 session's transcript; otherwise it reads the last reply block from the screen, or copies what
@@ -317,7 +337,10 @@ cover parts of this. Compared on 2026-11-13 from each project's README (and herd
   its config from somewhere else on that Mac). Copy them from your herdr config into `[jump]`, or
   set `[jump] enabled = false`.
 - **The order or the `done` marks look wrong.** They live in `recency.json` in the plugin's
-  state directory; deleting it starts them over.
+  state directory; deleting it starts them over. If work you saw on another machine stays
+  `done`, check that the plugin is installed there and that its watcher runs: in that
+  machine's plugin state directory, `watch-<id>.lock` holds its process id and `drawn-<id>.err`
+  its last error (one pair per herdr server).
 
 ## Demo mode and screenshots
 

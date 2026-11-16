@@ -11,7 +11,7 @@
 #
 # The key runs on the server of the machine the window is showing, so install the plugin on
 # every machine you open it from. Listing the agents of other saved machines needs nothing
-# installed on them.
+# installed on them; with the plugin there too, their `done` marks follow what the window drew.
 
 id = "trustxai.switchboard"
 name = "Switchboard"
@@ -33,6 +33,32 @@ placement = "popup"
 width = "96%"
 height = "85%"
 command = ["sh", "-c", "command -v python3 >/dev/null 2>&1 || { printf '%s\\n' 'switchboard needs Python 3.9 or newer, run as python3, and there is no python3 on the PATH the herdr server runs with.' 'Install it, or add its directory to that PATH, then restart the herdr server.'; printf 'Press Enter to close. '; read -r _; exit 127; }; exec python3 \"${HERDR_PLUGIN_ROOT:-.}/bin/switchboard\""]
+
+# What is `done` (finished and not seen yet) depends on what a window has drawn, which herdr
+# keeps only inside each window. bin/drawn notes it in a pane token on this machine, so the
+# popup can read it from any machine: on the events that change what a window shows, and in a
+# watcher that reads the snapshot once a second, because herdr sends no event when a window
+# starts or stops showing a machine. The watcher runs one per herdr server and exits when the
+# plugin is disabled, removed or updated, or when herdr's server stops. Without python3 all of
+# this does nothing, and the popup falls back to guessing from each machine's focus.
+[[startup]]
+command = ["sh", "-c", "command -v python3 >/dev/null 2>&1 || exit 0; exec python3 \"${HERDR_PLUGIN_ROOT:-.}/bin/drawn\" --start"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["sh", "-c", "command -v python3 >/dev/null 2>&1 || exit 0; exec python3 \"${HERDR_PLUGIN_ROOT:-.}/bin/drawn\""]
+
+[[events]]
+on = "tab.focused"
+command = ["sh", "-c", "command -v python3 >/dev/null 2>&1 || exit 0; exec python3 \"${HERDR_PLUGIN_ROOT:-.}/bin/drawn\""]
+
+[[events]]
+on = "pane.focused"
+command = ["sh", "-c", "command -v python3 >/dev/null 2>&1 || exit 0; exec python3 \"${HERDR_PLUGIN_ROOT:-.}/bin/drawn\""]
+
+[[events]]
+on = "workspace.focused"
+command = ["sh", "-c", "command -v python3 >/dev/null 2>&1 || exit 0; exec python3 \"${HERDR_PLUGIN_ROOT:-.}/bin/drawn\""]
 
 [[actions]]
 id = "open"

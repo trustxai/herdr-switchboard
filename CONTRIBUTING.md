@@ -1,7 +1,7 @@
 # Contributing
 
-Thanks for helping. Switchboard is deliberately small: one Python script, standard library
-only, no build step. Most of the rules below exist to keep it that way.
+Thanks for helping. Switchboard is deliberately small: two Python scripts (the popup and its
+hook), standard library only, no build step. Most of the rules below exist to keep it that way.
 
 ## Setup
 

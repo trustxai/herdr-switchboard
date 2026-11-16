@@ -32,8 +32,9 @@ the changelog unless you prefer otherwise.
 
 ## What the plugin touches
 
-Switchboard is one Python script that uses only the standard library and drives
-[fzf](https://github.com/junegunn/fzf). It has no dependencies to install, no build step and no
+Switchboard is two Python scripts that use only the standard library: the popup,
+`bin/switchboard`, which drives [fzf](https://github.com/junegunn/fzf), and the hook,
+`bin/drawn`. It has no dependencies to install, no build step and no
 telemetry, and it opens no network connection of its own: it reaches other machines through
 `ssh` and through herdr. The cross-machine jump, which is on by default, adds what its own
 section describes; with it off (`[jump] enabled = false`), the sections below up to the state
@@ -70,10 +71,33 @@ holds no run directory.
 
 It reads the workspaces, tabs, panes and agents of the local herdr (`herdr api snapshot`), the
 machines saved in it (`herdr machine list --json`; disabled ones are skipped), and the recent
-output of a pane (`herdr pane read`) for the preview, `ctrl-y` and `ctrl-o`. The one change it
-makes is focusing the pane you choose (`herdr agent focus`, or `herdr tab focus` for a plain
-terminal). It does not create or close anything, and it renames nothing except, for a moment,
-through the jump below.
+output of a pane (`herdr pane read`) for the preview, `ctrl-y` and `ctrl-o`. The one change the
+popup makes is focusing the pane you choose (`herdr agent focus`, or `herdr tab focus` for a
+plain terminal). It does not create or close anything, and it renames nothing except, for a
+moment, through the jump below. The hook in the next section writes two pane tokens.
+
+### The hook and its watcher (`bin/drawn`)
+
+The plugin's manifest has herdr run `bin/drawn` without being asked: at server start
+(`[[startup]]`) and on four events (`pane.agent_status_changed`, `tab.focused`, `pane.focused`
+and `workspace.focused`). The install and update previews list these commands. Each run reads
+the local snapshot over herdr's socket (`HERDR_SOCKET_PATH`) and, for the agents in the focused
+tab, writes one pane token, `switchboard_drawn`, through `pane.report_metadata` with the source
+`plugin:trustxai.switchboard`. The token holds numbers only: herdr's change counter for that
+agent and the size of the window that drew it (`12 239x63`). For every agent it also writes
+`switchboard_changed`: that counter and the time this machine saw it change (`12
+1794803477.1`, or `0` when unknown). An event hook writes this one only for the agent the event
+is about; the watcher writes it for the rest. It changes no title, label, status or focus, and it never
+reads pane output.
+
+It also starts a watcher, one per herdr server, that does the same once a second, because herdr sends
+no event when a window starts showing a machine. The watcher is that same script with `--watch`:
+detached in its own session, with `/dev/null` for input and output, at a lower priority. It
+talks only to the local herdr socket, and it exits when the socket is gone or has not answered
+for a minute, when the plugin is disabled, removed or updated to another directory (it asks
+`plugin.list` every 30 seconds), or when its own file is gone. When the plugin is disabled or
+removed, it first takes both tokens off every pane. One watcher runs per herdr server:
+named sessions on one machine each get their own.
 
 ### What comes back from herdr is untrusted
 
@@ -239,7 +263,7 @@ timeout: twice the remote timeout plus twelve seconds) and shows it in the foote
 
 ### The state directory
 
-It keeps two things in the plugin's state directory: `$HERDR_PLUGIN_STATE_DIR`, or
+It keeps these files in the plugin's state directory: `$HERDR_PLUGIN_STATE_DIR`, or
 `${XDG_STATE_HOME:-~/.local/state}/herdr-switchboard` when it runs outside herdr.
 
 - **`snapshots/<machine>.json`, the last snapshot of each saved machine** (not of the local
@@ -250,8 +274,13 @@ It keeps two things in the plugin's state directory: `$HERDR_PLUGIN_STATE_DIR`, 
   with `cache_max_age = 0`, which only stops it from being shown.
 - **`recency.json`**: per machine and agent pane, the last change counter seen, when it was seen,
   its rank among the changes seen together, up to which counter finished work counts as seen,
-  and the counter at which herdr last reported it done; and per machine, the tab that was
-  focused at the last read.
+  and the counter at which herdr last reported it done; per machine, the tab that was focused at
+  the last read; the sizes of the last windows the popup was opened from; and when a popup last
+  read each machine.
+- **`drawn-<id>.lock` and `watch-<id>.lock`**, the locks of the hook above, one pair per herdr
+  server (`<id>` is a hash of its socket path); `watch-<id>.lock` holds the watcher's process
+  id. **`drawn-<id>.err`**: that watcher's last error, one line (time, where, the error's type
+  and message).
 
 Switchboard writes no pane output and no credentials there. Deleting the directory is safe: the
 order inside each status and the `done` marks start over.

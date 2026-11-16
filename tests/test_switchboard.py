@@ -59,12 +59,16 @@ What it has to get right, and how it fails otherwise:
    survives between openings; what changed while closed rises on open, interleaved across
    machines. The cache is not a read, and an agent that left is removed only from its own
    machine (pane ids repeat across machines).
+   With the hook's change times (bin/drawn), the time each machine saw the change decides.
 17. `done` is "finished and not seen", and the tool keeps that count itself. Stays done:
    what finished in the active tab of another machine, or in the tab you were on and left.
    Counts as seen: what is in front of you when the popup opens, what you pick with Enter,
    what the server turned from done to idle, and what finished outside the active tab and
    is already idle. An idle that closed no work never becomes done. The first time a
    machine is seen everything counts as seen, and so does a file from before the count.
+   With the hook's tokens on a machine (bin/drawn), only what a window the popup was opened
+   from drew after it finished counts, not the focus, and not a window it was never opened
+   from; the popup records its window's size, never the headless one, the last 4, on disk.
 18. Config: the file location, the built-in TOML subset parser against tomllib, defaults
    for a missing file, defaults plus one warning for a broken one, per-key type checks,
    and config.example.toml documenting every option.
@@ -1487,6 +1491,192 @@ with tempfile.TemporaryDirectory() as d:
     sb.STATE_DIR = STATE
 
 check("done-enter-acks", "live.recency.ack_tab(target[\"machine\"], target[\"tab\"], live.entries())" in SOURCE)
+
+# With the hook on that machine (bin/drawn), what a window drew decides, not the focus.
+W, OWN = "239x63", "250x63"   # the window the popup opens from; a Mac's own, unused screen
+
+
+def drawn17(pid, status, seq, tab=T1, compl=None, token=None):
+    a = ag17(pid, status, seq, tab, compl)
+    if token is not None:
+        a["tokens"] = {sb.DRAWN_TOKEN: token}
+    return a
+
+
+check("drawn-parse", sb.parse_drawn("12 239x63,9 250x63") == {W: 12, OWN: 9})
+check("drawn-parse-untrusted", sb.parse_drawn("x 1x1,5 0x3,6 3x,7 4x4 z,8 4x4,9 99999999x1") == {"4x4": 8},
+      sb.parse_drawn("x 1x1,5 0x3,6 3x,7 4x4 z,8 4x4,9 99999999x1"))
+check("drawn-parse-not-a-string", sb.parse_drawn(None) == {} and sb.parse_drawn(["1 2x2"]) == {})
+s17 = snap17(T1, drawn17("A", "idle", 7, T1, 7, "7 239x63"))
+s17["layouts"] = [{"tab_id": T1, "area": {"width": 239, "height": 63}}, {"tab_id": T2, "area": {"width": 9, "height": 9}}]
+check("drawn-focused-size", sb.focused_size(s17) == W, sb.focused_size(s17))
+check("drawn-focused-size-missing", sb.focused_size({"focused_tab_id": T1}) is None
+      and sb.focused_size({"focused_tab_id": T1, "layouts": [{"tab_id": T1, "area": {"width": "9", "height": 9}}]}) is None)
+check("drawn-in-the-entries", sb.entries_from(s17, "m1", "m1", 1)[0]["drawn"] == {W: 7})
+rd = sb.Recency(persist=False, now=100.0)
+rd.saw_window(W, now=100.0)
+rd.observe("m1", ents17("m1", 1, drawn17("A", "working", 5, T1, None, "5 239x63"),
+                        drawn17("B", "working", 6, T2), drawn17("C", "working", 4, T2)), focus=T1)
+# A finished while that window showed its tab; B finished unseen and the focus then left its
+# tab (the old guess would call it seen); C finished and only the Mac's own screen drew it.
+e = ents17("m1", 1, drawn17("A", "idle", 7, T1, 7, "7 239x63"), drawn17("B", "idle", 8, T2, 8),
+           drawn17("C", "idle", 9, T2, 9, "9 250x63,4 239x63"))
+rd.observe("m1", e, now=101.0, focus=T1)
+check("drawn-window-saw-it", st(e)["A"] == "idle", st(e))
+check("drawn-no-guess-from-the-focus", st(e)["B"] == "done", st(e))
+check("drawn-other-screen-does-not-count", st(e)["C"] == "done", st(e))
+e = ents17("m1", 1, drawn17("A", "idle", 7, T1, 7, "7 239x63"), drawn17("B", "idle", 8, T2, 8),
+           drawn17("C", "idle", 9, T2, 9, "9 239x63,9 250x63"))
+rd.observe("m1", e, now=102.0, focus=T2)
+check("drawn-window-back-on-it", st(e) == {"A": "idle", "B": "done", "C": "idle"}, st(e))
+e = ents17("m1", 1, drawn17("A", "working", 11, T1, None, "11 239x63"), drawn17("B", "idle", 8, T2, 8),
+           drawn17("C", "idle", 9, T2, 9, "9 239x63,9 250x63"))
+rd.observe("m1", e, now=103.0, focus=T2)
+e = ents17("m1", 1, drawn17("A", "idle", 12, T1, 12, "11 239x63"), drawn17("B", "idle", 8, T2, 8),
+           drawn17("C", "idle", 9, T2, 9, "9 239x63,9 250x63"))
+rd.observe("m1", e, now=104.0, focus=T2)
+check("drawn-drawn-before-it-finished", st(e)["A"] == "done", st(e))
+# Without any token on that machine the guess from the focus still applies (block above).
+rd = sb.Recency(persist=False, now=100.0)
+rd.saw_window(W)
+rd.observe("m1", ents17("m1", 1, drawn17("B", "working", 6, T1)), focus=T1)
+e = ents17("m1", 1, drawn17("B", "idle", 8, T1, 8))
+rd.observe("m1", e, now=101.0, focus=T2)
+check("drawn-no-hook-falls-back", st(e)["B"] == "idle", st(e))
+# The windows the popup was opened from: never the headless size, the last few kept, on disk.
+rd = sb.Recency(persist=False, now=100.0)
+for i, size in enumerate(["120x40", "0x5", "x", None, "10x10", "11x11", "12x12", "13x13", "14x14"]):
+    rd.saw_window(size, now=100.0 + i)
+check("drawn-windows-kept", set(rd.windows) == {"11x11", "12x12", "13x13", "14x14"}, rd.windows)
+rd = sb.Recency(persist=False, now=100.0)
+rd.saw_window(sb.HEADLESS_SIZE)
+check("drawn-headless-is-never-a-window", rd.windows == {}, rd.windows)
+# Rows from the cache are only applied, never observed: the token counts there too.
+rd = sb.Recency(persist=False, now=100.0)
+rd.saw_window(W)
+rd.seen = {"m1": {"A": [7, 100.0, 0, 5, -1], "B": [8, 100.0, 0, 5, -1]}}
+e = rd.apply(ents17("m1", 1, drawn17("A", "idle", 7, T1, 7, "7 239x63"), drawn17("B", "idle", 8, T1, 8, "8 250x63")))
+check("drawn-counts-in-cached-rows", st(e) == {"A": "idle", "B": "done"}, st(e))
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    sb.Recency(now=100.0).saw_window(W, now=100.0)
+    check("drawn-windows-persisted", W in sb.Recency(now=200.0).windows)
+    with open(os.path.join(d, "recency.json"), "w") as f:
+        json.dump({"v": 2, "machines": {"m1": {"A": [7, 100.0, 0, 5, -1]}}, "windows": {"bad": 1, "5x5": "x"}}, f)
+    r17 = sb.Recency(now=300.0)
+    check("drawn-windows-bad-file", r17.windows == {} and r17.seen == {"m1": {"A": [7, 100.0, 0, 5, -1]}},
+          (r17.windows, r17.seen))
+    sb.STATE_DIR = STATE
+# The popup records the size of the window it opened in.
+lv = sb.Live([], ents17("", 0, drawn17("L", "idle", 1)), cache=False, focus=T1, window=W)
+check("drawn-live-records-the-window", W in lv.recency.windows, lv.recency.windows)
+check("drawn-popup-passes-the-window", "window=focused_size(snap)" in SOURCE)
+
+# The order across machines: when each machine saw the change (bin/drawn), as in herdr's panel.
+check("changed-at", sb.changed_at("7 1794803477.1", 7) == 1794803477.1)
+check("changed-at-other-seq-or-unknown", sb.changed_at("6 1794803477.1", 7) is None and sb.changed_at("7 0", 7) is None)
+check("changed-at-garbage", all(sb.changed_at(v, 7) is None for v in
+                                (None, 7, "", "7", "x 1", "7 x", "7 -3", "7 1e12", "7 1 2", "7 " + "1" * 90, "\u00b2 1.0")))
+check("drawn-parse-ascii-digits", sb.parse_drawn("\u00b2 4x4,5 \u00b2x3,6 4x4") == {"4x4": 6})
+odd = snap17(T1, ag17("A", "idle", 7, T1, 7))
+odd["agents"][0]["tokens"] = {sb.CHANGED_TOKEN: "\u00b2 1.0", sb.DRAWN_TOKEN: "\u00b2 4x4"}
+check("odd-token-does-not-hide-the-machine", len(sb.entries_from(odd, "m1", "m1", 1)) == 1)
+
+
+def changed17(pid, status, seq, tab=T1, compl=None, at=None):
+    a = ag17(pid, status, seq, tab, compl)
+    if at is not None:
+        a["tokens"] = {sb.CHANGED_TOKEN: "%d %s" % (seq, at)}
+    return a
+
+
+check("changed-in-the-entries", ents17("m1", 1, changed17("A", "idle", 7, at=1500.5))[0]["changed"] == 1500.5)
+rd = sb.Recency(persist=False, now=1000.0)
+# Both machines read for the first time at the same moment: without times they interleave by
+# machine (this one first); with the times each machine noted, the later change goes on top.
+here = ents17("", 0, changed17("L1", "idle", 3, at=1100.0), changed17("L2", "idle", 2, at=1050.0))
+there = ents17("m1", 1, changed17("R1", "idle", 9, at=1200.0), changed17("R2", "idle", 8, at=1075.0))
+rd.observe("", here, focus=T2, here=True)
+rd.observe("m1", there, focus=T2)
+got = [e["pane"] for e in sorted(here + there, key=sb.sort_key)]
+check("changed-orders-across-machines", got == ["R1", "L1", "R2", "L2"], got)
+# A machine without the hook, last read by a popup at 900; this popup opens at 1000. Its change
+# happened after 900, so it ranks by 900, below a change at 950 that another machine's hook
+# timed, instead of by the opening time above everything.
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    rd1 = sb.Recency(now=900.0)  # the previous popup, closed after reading at 900
+    rd1.observe("", ents17("", 0, changed17("A", "working", 3, at=800.0)), now=900.0, focus=T2, here=True)
+    rd1.observe("m1", ents17("m1", 1, changed17("R", "working", 8)), now=900.0, focus=T2)
+    rd2 = sb.Recency(now=1000.0)  # this one, opened at 1000, with what was kept
+    here = ents17("", 0, changed17("A", "idle", 4, at=950.0))
+    there = ents17("m1", 1, changed17("R", "idle", 9))
+    rd2.observe("", here, now=1000.0, focus=T2, here=True)
+    rd2.observe("m1", there, now=1000.0, focus=T2)
+    got = [e["pane"] for e in sorted(here + there, key=sb.sort_key)]
+    check("changed-untimed-ranks-by-the-last-read", got == ["A", "R"], (got, [(e["pane"], e["stamp"]) for e in here + there]))
+    check("changed-read-time-recorded", rd2.read.get("m1") == 1000.0, rd2.read)
+    sb.STATE_DIR = STATE
+# The floor, from what the last popup kept: m1 and m2 were read until it closed (1900, 1902.5),
+# m3 was not (offline then: last read 500), m4 never. A new popup opens at 2000.
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    old = {p: [1, 1.0, 0, 1, -1] for p in ("a1", "a2", "b1", "b2", "c1")}
+    with open(os.path.join(d, "recency.json"), "w") as f:
+        json.dump({"v": 2, "machines": {"m1": {"a1": old["a1"], "a2": old["a2"]},
+                                        "m2": {"b1": old["b1"], "b2": old["b2"]}, "m3": {"c1": old["c1"]}},
+                   "read": {"m1": 1900.0, "m2": 1902.5, "m3": 500.0}}, f)
+    rd3 = sb.Recency(now=2000.0)
+    check("changed-floor-just-after-the-latest-read", abs(rd3.floor - 1902.501) < 1e-9, rd3.floor)
+    check("changed-first-stamps", (rd3.first_stamp("m1"), rd3.first_stamp("m2"), rd3.first_stamp("m3"), rd3.first_stamp("m4"))
+          == (rd3.floor, rd3.floor, 500.0, 2000.0), (rd3.first_stamp("m1"), rd3.first_stamp("m3"), rd3.first_stamp("m4")))
+    m1 = ents17("m1", 1, changed17("a1", "idle", 9), changed17("a2", "idle", 8))
+    m2 = ents17("m2", 2, changed17("b1", "idle", 7), changed17("b2", "idle", 6))
+    m3 = ents17("m3", 3, changed17("c1", "idle", 5))
+    loc = ents17("", 0, changed17("L", "idle", 4, at=700.0))  # timed: after m3's last read
+    for m, e in (("m1", m1), ("m2", m2), ("m3", m3)):
+        rd3.observe(m, e, now=2000.0, focus=T2)
+    rd3.apply(loc)
+    got = [e["pane"] for e in sorted(m1 + m2 + m3 + loc, key=sb.sort_key)]
+    check("changed-untimed-machines-interleave", got[:4] == ["a1", "b1", "a2", "b2"], got)
+    check("changed-unread-machine-keeps-its-own-read", got[4:] == ["L", "c1"], got)
+    with open(os.path.join(d, "recency.json"), "w") as f:
+        json.dump({"v": 2, "machines": {}, "read": {"m1": 5000.0}}, f)
+    check("changed-floor-never-after-the-opening", sb.Recency(now=2000.0).floor == 2000.0, sb.Recency(now=2000.0).floor)
+    sb.STATE_DIR = STATE
+# A row seen live in the last popup's last save, and a change on another machine after it closed:
+# the new change rises above it, never ties with it.
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    r1 = sb.Recency(now=1000.0)
+    r1.observe("", ents17("", 0, changed17("X", "working", 1)), now=1000.0, focus=T2, here=True)
+    r1.observe("m1", ents17("m1", 1, changed17("Y", "working", 1)), now=1000.0, focus=T2)
+    loc = ents17("", 0, changed17("X", "idle", 2))
+    r1.observe("", loc, now=1005.0, focus=T2, here=True)
+    r1.observe("m1", ents17("m1", 1, changed17("Y", "working", 1)), now=1005.0, focus=T2)
+    r2 = sb.Recency(now=2000.0)
+    loc = ents17("", 0, changed17("X", "idle", 2))
+    rem = ents17("m1", 1, changed17("Y", "idle", 3))
+    r2.observe("", loc, now=2000.0, focus=T2, here=True)
+    r2.observe("m1", rem, now=2000.0, focus=T2)
+    got = [e["pane"] for e in sorted(loc + rem, key=sb.sort_key)]
+    check("changed-after-the-close-rises-above-the-last-seen", got == ["Y", "X"], (got, [(e["pane"], e["stamp"]) for e in loc + rem]))
+    sb.STATE_DIR = STATE
+rd3 = sb.Recency(persist=False, now=1000.0)
+rd3.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=1000.0, focus=T2)
+check("changed-never-read-ranks-by-the-opening", rd3.seen["m1"]["R"][1] == 1000.0, rd3.seen)
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    r1 = sb.Recency(now=100.0)
+    r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=100.0, focus=T2)
+    check("changed-read-times-persisted", sb.Recency(now=200.0).read.get("m1") == 100.0)
+    check("changed-read-time-alone-is-no-change", r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=101.0, focus=T2)
+          is False)
+    r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=104.0, focus=T2)
+    check("changed-read-time-not-saved-at-once", sb.Recency(now=200.0).read.get("m1") == 100.0, sb.Recency(now=200.0).read)
+    r1.observe("m1", ents17("m1", 1, changed17("R", "idle", 9)), now=106.0, focus=T2)
+    check("changed-read-time-saved-every-5-s", sb.Recency(now=200.0).read.get("m1") == 106.0, sb.Recency(now=200.0).read)
+    sb.STATE_DIR = STATE
 
 # 18. Config.
 block('18. Config')
