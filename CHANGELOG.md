@@ -7,15 +7,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-16
+
 ### Changed
 
 - The cross-machine jump is on by default (`[jump] enabled = true`): Enter on another machine's
   row switches a herdr window running in Ghostty on macOS to that pane. When the jump cannot
   happen (no herdr window in Ghostty on a Mac the server can reach over ssh, herdr keys there
   that differ from `[jump]`'s, or a helper of an older version on that Mac), Enter works as with
-  the jump off: it focuses the pane on its machine and the footer says so. `enabled = false`
-  turns it off. If your herdr `[keys] prefix` or `goto` are not herdr's defaults, set the same
-  values under `[jump]`.
+  the jump off: it focuses the pane on its machine and the footer says so. If your herdr
+  `[keys] prefix` or `goto` are not herdr's defaults, set the same values under `[jump]`.
+  **This changes what the plugin does after an update:** each time the popup opens with at least
+  one machine saved in herdr, the herdr server looks for the Mac of your window and, when that
+  Mac is another machine, connects to it over ssh, in batch mode with the keys it already has, to
+  start the helper that types into Ghostty there (finding that Mac can also mean an ssh to an
+  address it cannot identify otherwise). See
+  [SECURITY.md](SECURITY.md#the-cross-machine-jump-on-by-default) for everything it runs.
+  `[jump] enabled = false` turns all of that off.
 - The demo's Enter line says that the demo never jumps between machines.
 
 ### Fixed
@@ -35,7 +43,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sends no event when a window starts showing another machine. Only the windows the popup was
   opened from count, so a Mac's own screen that nobody looks at marks nothing seen. On a
   machine without the plugin, or with nothing drawn since its herdr server started, the guess
-  from the focus still applies. Differences that remain: what a window draws while Ghostty is
+  from the focus still applies, and it now also counts work as seen once that machine's focus
+  moves off the tab it finished in (other than by Enter in the popup). Differences that remain: what a window draws while Ghostty is
   behind another app counts as seen, a look at a machine shorter than about a second may not be
   noted, and when two windows show one machine at once, herdr sizes its layout after the one
   that attached or resized last. Disabling or removing the plugin takes the token off every
@@ -60,13 +69,6 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A helper on the Mac that never says it is ready (an older version does not) no longer makes
   every Enter wait: after 8 seconds the popup stops waiting for it, and Enter focuses the pane
   at once.
-- Work that finished in the tab in front on a machine no longer stays `done` after you left that
-  tab there: once that machine's focus moves to another tab (other than by Enter in the popup),
-  the work counts as seen. Before, it stayed `done` until you opened the popup on that tab or
-  picked it with Enter, also when herdr's own panel already showed it as seen. The trade-off,
-  described in the README: reaching another tab of that machine without passing through that
-  one (herdr's navigator from another machine, the jump, a script) also counts as seen, while
-  herdr's panel still shows the work `done`.
 
 ## [0.1.0] - 2026-11-15
 
@@ -106,5 +108,6 @@ First public release.
 - README images made from `--demo`, and `docs/render.sh`, which regenerates them.
 - Apache License 2.0, security policy, contributing guide and CI on Linux and macOS.
 
-[Unreleased]: https://github.com/trustxai/herdr-switchboard/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/trustxai/herdr-switchboard/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/trustxai/herdr-switchboard/releases/tag/v0.2.0
 [0.1.0]: https://github.com/trustxai/herdr-switchboard/releases/tag/v0.1.0

@@ -99,8 +99,7 @@ what the popup draws, run `docs/render.sh` and commit the new `docs/assets/` fil
   `docs:`, `test:`, `ci:`, `chore:`, `refactor:`. Say in the body why the change is needed.
 - Keep pull requests small and focused, and fill in the template.
 - `make check` must pass before you ask for a review.
-- A change users will notice gets a line in `CHANGELOG.md`: under `## [Unreleased]`, except
-  before the first tag (see [Releases](#releases)).
+- A change users will notice gets a line in `CHANGELOG.md`, under `## [Unreleased]`.
 
 ## Releases
 
@@ -108,7 +107,10 @@ Versioning is manual and nothing runs on a tag: no workflow builds or publishes 
 release of version `X.Y.Z` is these steps, in this order:
 
 1. Open a pull request against `main` that:
-   - sets `version = "X.Y.Z"` in `herdr-plugin.toml`;
+   - sets `version = "X.Y.Z"` in `herdr-plugin.toml` and `VERSION = "X.Y.Z"` in
+     `bin/switchboard` (the tests check that they match);
+   - in `SECURITY.md`, makes the new `X.Y.x` row the only supported one when the minor or
+     major version changes;
    - in `CHANGELOG.md`, renames `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, dated the day
      you will tag, and adds a new, empty `## [Unreleased]` above it;
    - updates the links at the bottom of `CHANGELOG.md`: `[Unreleased]` compares
@@ -125,13 +127,8 @@ release of version `X.Y.Z` is these steps, in this order:
 4. Create the GitHub release from the tag (`gh release create vX.Y.Z --verify-tag --title vX.Y.Z`)
    and paste that version's `CHANGELOG.md` section as its notes.
 
-The first release is the exception. `herdr-plugin.toml` already says `0.1.0` and
-`## [0.1.0]` in `CHANGELOG.md` is written, so until the `v0.1.0` tag exists that section is the
-unreleased one: **a change merged before the first tag gets its line under `## [0.1.0]`**, and
-`## [Unreleased]` stays empty. The release pull request then changes the date of `## [0.1.0]`
-to the day of the tag, after checking that `## [Unreleased]` is still empty (anything found
-there moves into `## [0.1.0]`, or it would be left out of the release). From the tag on, every
-change goes under `## [Unreleased]` as above.
+Every change goes under `## [Unreleased]` when it is merged, so the release pull request only
+renames that section.
 
 The tools CI downloads are pinned by hand: fzf and gitleaks in
 `.github/scripts/install-pinned.sh` (version and SHA-256 of each archive), uv in
