@@ -1291,15 +1291,17 @@ READ_SAVE_EVERY = 5.0  # seconds between saves of the machines' read times alone
 def read_near():
     """Seconds within which a machine's kept read time counts as read until the last popup
     closed: the save cadence, the remote refresh interval and the longest a remote read may
-    take, plus slack. From the config, so a slow link or a long interval does not split the
-    machines that were all being read."""
-    return READ_SAVE_EVERY + REMOTE_EVERY + REMOTE_TIMEOUT + 2.0
+    take (herdr_on_bound: ssh, then the `herdr --machine` fallback), plus slack. From the
+    config, so a slow link or a long interval does not split the machines that were all being
+    read."""
+    return READ_SAVE_EVERY + REMOTE_EVERY + herdr_on_bound(REMOTE_TIMEOUT) + 2.0
 
 
 def focus_settle():
     """Seconds a focus the popup moved has to show up in that machine's reads: FOCUS_SETTLE, or
-    longer when a remote read can take longer (the configured interval and timeout)."""
-    return max(FOCUS_SETTLE, REMOTE_EVERY + REMOTE_TIMEOUT + 2.0)
+    longer when the move and the read after it can take longer: the --focus worker's move and a
+    remote read each up to herdr_on_bound, plus the refresh interval."""
+    return max(FOCUS_SETTLE, REMOTE_EVERY + 2 * herdr_on_bound(REMOTE_TIMEOUT) + 2.0)
 
 
 class Recency:
@@ -1665,7 +1667,7 @@ class Live:
         with self.lock:
             self.local = entries
 
-    def refresh_remote(self, i, m):
+    def refresh_remote(self, i, m, acks=None):
         try:
             snap = self.fetch(m["id"], REMOTE_TIMEOUT, m)
             if not isinstance(snap, dict):
@@ -1675,6 +1677,10 @@ class Live:
             snap = entries = None
         if snap is not None and self.cache:
             save_cache(m["id"], snap)
+        # Acks written while this read was under way are applied before it is observed: the
+        # read may already show the tab Enter moved to (see remote_loop in watch()).
+        if acks and entries is not None:
+            self.consume_acks(acks)
         if entries is not None:
             self.recency.observe(m["id"], entries, focus=focused_tab(snap))
         with self.lock:
@@ -1840,7 +1846,7 @@ def watch(live, sock, rows_file, stop, acks=None, writes=None):
                 # to must find that move recorded, or it takes it for someone leaving the tab.
                 if acks:
                     live.consume_acks(acks)
-                live.refresh_remote(i, m)
+                live.refresh_remote(i, m, acks)
             except Exception:
                 pass
             kick.set()
@@ -3312,9 +3318,11 @@ def herdr_keys(text):
 
 
 def herdr_keys_text(prefix, goto):
-    """The Ghostty text for herdr's own [keys] prefix and goto, read as herdr 0.9.5 reads them:
-    the modifiers (ctrl, prefix) in any case, but an upper-case key letter means shift
-    (parse_key_combo), so `ctrl+B` is ctrl+shift+b. The jump types plain control characters
+    """The Ghostty text for herdr's own [keys] prefix and goto. herdr 0.9.5 reads `ctrl` in any
+    case but `prefix+` only in lower case (`Prefix+/` disables goto, which `herdr config check`
+    reports, see same_key); this lowers both, so the text is what the binding would type if
+    herdr took it. An upper-case key letter means shift (parse_key_combo), so `ctrl+B` is
+    ctrl+shift+b. The jump types plain control characters
     and lower-case keys, so such a key gives None, as does anything goto_keys refuses."""
     def modifiers_lowered(combo):
         parts = combo.split("+")

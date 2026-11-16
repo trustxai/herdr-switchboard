@@ -11,11 +11,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The time the popup waits for its own focus move to show up on another machine, and the time
   within which machines count as read until the last popup closed (the order of changes with no
-  time), follow `remote_seconds` and `remote_timeout`. With a slow link or a long interval, the
+  time), follow `remote_seconds` and `remote_timeout`, counting the slowest read (ssh, then the
+  `herdr --machine` fallback). With a slow link or a long interval, the
   first no longer took the popup's own move for someone leaving the tab, and the second no
   longer split machines that were all being read.
-- Each remote read applies the rows picked with Enter first, so a read that already shows the
-  tab Enter moved to no longer takes that move for someone leaving the tab.
+- Each remote read applies the rows picked with Enter before it reads and again before it is
+  used, so a read that already shows the tab Enter moved to, even one that was under way when
+  you pressed Enter, no longer takes that move for someone leaving the tab.
 - `schedule.py` of the demo video removes the partial footage when ffmpeg fails, so new footage is
   never paired with an old `schedule.json`.
 
