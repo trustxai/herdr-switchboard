@@ -65,6 +65,9 @@ What it has to get right, and how it fails otherwise:
    what the server turned from done to idle, and what finished outside the active tab and
    is already idle. An idle that closed no work never becomes done. The first time a
    machine is seen everything counts as seen, and so does a file from before the count.
+   With the hook's tokens on a machine (bin/drawn), only what a window the popup was opened
+   from drew after it finished counts, not the focus, and not a window it was never opened
+   from; the popup records its window's size, never the headless one, the last 4, on disk.
 18. Config: the file location, the built-in TOML subset parser against tomllib, defaults
    for a missing file, defaults plus one warning for a broken one, per-key type checks,
    and config.example.toml documenting every option.
@@ -1487,6 +1490,86 @@ with tempfile.TemporaryDirectory() as d:
     sb.STATE_DIR = STATE
 
 check("done-enter-acks", "live.recency.ack_tab(target[\"machine\"], target[\"tab\"], live.entries())" in SOURCE)
+
+# With the hook on that machine (bin/drawn), what a window drew decides, not the focus.
+W, OWN = "239x63", "250x63"   # the window the popup opens from; a Mac's own, unused screen
+
+
+def drawn17(pid, status, seq, tab=T1, compl=None, token=None):
+    a = ag17(pid, status, seq, tab, compl)
+    if token is not None:
+        a["tokens"] = {sb.DRAWN_TOKEN: token}
+    return a
+
+
+check("drawn-parse", sb.parse_drawn("12 239x63,9 250x63") == {W: 12, OWN: 9})
+check("drawn-parse-untrusted", sb.parse_drawn("x 1x1,5 0x3,6 3x,7 4x4 z,8 4x4,9 99999999x1") == {"4x4": 8},
+      sb.parse_drawn("x 1x1,5 0x3,6 3x,7 4x4 z,8 4x4,9 99999999x1"))
+check("drawn-parse-not-a-string", sb.parse_drawn(None) == {} and sb.parse_drawn(["1 2x2"]) == {})
+s17 = snap17(T1, drawn17("A", "idle", 7, T1, 7, "7 239x63"))
+s17["layouts"] = [{"tab_id": T1, "area": {"width": 239, "height": 63}}, {"tab_id": T2, "area": {"width": 9, "height": 9}}]
+check("drawn-focused-size", sb.focused_size(s17) == W, sb.focused_size(s17))
+check("drawn-focused-size-missing", sb.focused_size({"focused_tab_id": T1}) is None
+      and sb.focused_size({"focused_tab_id": T1, "layouts": [{"tab_id": T1, "area": {"width": "9", "height": 9}}]}) is None)
+check("drawn-in-the-entries", sb.entries_from(s17, "m1", "m1", 1)[0]["drawn"] == {W: 7})
+rd = sb.Recency(persist=False, now=100.0)
+rd.saw_window(W, now=100.0)
+rd.observe("m1", ents17("m1", 1, drawn17("A", "working", 5, T1, None, "5 239x63"),
+                        drawn17("B", "working", 6, T2), drawn17("C", "working", 4, T2)), focus=T1)
+# A finished while that window showed its tab; B finished unseen and the focus then left its
+# tab (the old guess would call it seen); C finished and only the Mac's own screen drew it.
+e = ents17("m1", 1, drawn17("A", "idle", 7, T1, 7, "7 239x63"), drawn17("B", "idle", 8, T2, 8),
+           drawn17("C", "idle", 9, T2, 9, "9 250x63,4 239x63"))
+rd.observe("m1", e, now=101.0, focus=T1)
+check("drawn-window-saw-it", st(e)["A"] == "idle", st(e))
+check("drawn-no-guess-from-the-focus", st(e)["B"] == "done", st(e))
+check("drawn-other-screen-does-not-count", st(e)["C"] == "done", st(e))
+e = ents17("m1", 1, drawn17("A", "idle", 7, T1, 7, "7 239x63"), drawn17("B", "idle", 8, T2, 8),
+           drawn17("C", "idle", 9, T2, 9, "9 239x63,9 250x63"))
+rd.observe("m1", e, now=102.0, focus=T2)
+check("drawn-window-back-on-it", st(e) == {"A": "idle", "B": "done", "C": "idle"}, st(e))
+e = ents17("m1", 1, drawn17("A", "working", 11, T1, None, "11 239x63"), drawn17("B", "idle", 8, T2, 8),
+           drawn17("C", "idle", 9, T2, 9, "9 239x63,9 250x63"))
+rd.observe("m1", e, now=103.0, focus=T2)
+e = ents17("m1", 1, drawn17("A", "idle", 12, T1, 12, "11 239x63"), drawn17("B", "idle", 8, T2, 8),
+           drawn17("C", "idle", 9, T2, 9, "9 239x63,9 250x63"))
+rd.observe("m1", e, now=104.0, focus=T2)
+check("drawn-drawn-before-it-finished", st(e)["A"] == "done", st(e))
+# Without any token on that machine the guess from the focus still applies (block above).
+rd = sb.Recency(persist=False, now=100.0)
+rd.saw_window(W)
+rd.observe("m1", ents17("m1", 1, drawn17("B", "working", 6, T1)), focus=T1)
+e = ents17("m1", 1, drawn17("B", "idle", 8, T1, 8))
+rd.observe("m1", e, now=101.0, focus=T2)
+check("drawn-no-hook-falls-back", st(e)["B"] == "idle", st(e))
+# The windows the popup was opened from: never the headless size, the last few kept, on disk.
+rd = sb.Recency(persist=False, now=100.0)
+for i, size in enumerate(["120x40", "0x5", "x", None, "10x10", "11x11", "12x12", "13x13", "14x14"]):
+    rd.saw_window(size, now=100.0 + i)
+check("drawn-windows-kept", set(rd.windows) == {"11x11", "12x12", "13x13", "14x14"}, rd.windows)
+rd = sb.Recency(persist=False, now=100.0)
+rd.saw_window(sb.HEADLESS_SIZE)
+check("drawn-headless-is-never-a-window", rd.windows == {}, rd.windows)
+# Rows from the cache are only applied, never observed: the token counts there too.
+rd = sb.Recency(persist=False, now=100.0)
+rd.saw_window(W)
+rd.seen = {"m1": {"A": [7, 100.0, 0, 5, -1], "B": [8, 100.0, 0, 5, -1]}}
+e = rd.apply(ents17("m1", 1, drawn17("A", "idle", 7, T1, 7, "7 239x63"), drawn17("B", "idle", 8, T1, 8, "8 250x63")))
+check("drawn-counts-in-cached-rows", st(e) == {"A": "idle", "B": "done"}, st(e))
+with tempfile.TemporaryDirectory() as d:
+    sb.STATE_DIR = d
+    sb.Recency(now=100.0).saw_window(W, now=100.0)
+    check("drawn-windows-persisted", W in sb.Recency(now=200.0).windows)
+    with open(os.path.join(d, "recency.json"), "w") as f:
+        json.dump({"v": 2, "machines": {"m1": {"A": [7, 100.0, 0, 5, -1]}}, "windows": {"bad": 1, "5x5": "x"}}, f)
+    r17 = sb.Recency(now=300.0)
+    check("drawn-windows-bad-file", r17.windows == {} and r17.seen == {"m1": {"A": [7, 100.0, 0, 5, -1]}},
+          (r17.windows, r17.seen))
+    sb.STATE_DIR = STATE
+# The popup records the size of the window it opened in.
+lv = sb.Live([], ents17("", 0, drawn17("L", "idle", 1)), cache=False, focus=T1, window=W)
+check("drawn-live-records-the-window", W in lv.recency.windows, lv.recency.windows)
+check("drawn-popup-passes-the-window", "window=focused_size(snap)" in SOURCE)
 
 # 18. Config.
 block('18. Config')
