@@ -79,6 +79,10 @@ check("merge-new-size", d.merge("5 10x10", "20x20", 7) == "7 20x20,5 10x10")
 check("merge-higher-seq", d.merge("5 10x10", "10x10", 6) == "6 10x10")
 check("merge-same-or-lower-is-none", d.merge("5 10x10", "10x10", 5) is None and d.merge("5 10x10", "10x10", 4) is None)
 check("merge-from-nothing", d.merge(None, "10x10", 0) == "0 10x10")
+full = "12 200x50,12 210x55,12 220x60,12 230x62"
+new = d.merge(full, "239x63", 12)
+check("merge-the-size-just-noted-survives", new and new.startswith("12 239x63,") and len(new.split(",")) == d.KEEP, new)
+check("merge-then-nothing-to-do", d.merge(new, "239x63", 12) is None, new)
 
 # 2. What is noted.
 s = snap("w1:t1", (239, 63), [ag("w1:p1", "w1:t1", 10), ag("w1:p2", "w1:t1", 4, "4 239x63"),
@@ -168,8 +172,10 @@ try:
 except ValueError:
     pass
 
-# 4. The locks.
-fd = d.open_lock(state, "drawn.lock")
+# 4. The locks: one set per herdr server (named sessions share the state directory).
+check("locks-per-server", d.server_file("watch", "/a/herdr.sock", "lock") != d.server_file("watch", "/b/herdr.sock", "lock")
+      and d.server_file("watch", "/a/herdr.sock", "lock").startswith("watch-"))
+fd = d.open_lock(state, d.server_file("drawn", sockpath, "lock"))
 fcntl.flock(fd, fcntl.LOCK_EX)
 tokens.clear()
 n = len(fake.requests)
@@ -189,13 +195,19 @@ argv, kw = started[0]
 check("start-watcher-detached", argv[-1] == "--watch" and argv[1] == os.path.abspath(str(TOOL))
       and kw.get("start_new_session") is True and kw.get("stdin") == subprocess.DEVNULL
       and kw.get("stdout") == subprocess.DEVNULL and kw.get("stderr") == subprocess.DEVNULL, (argv, kw))
-fd = d.open_lock(state, "watch.lock")
+other = dict(env, HERDR_SOCKET_PATH=os.path.join(tmp, "other.sock"))
+open(other["HERDR_SOCKET_PATH"], "w").close()
+fd = d.open_lock(state, d.server_file("watch", sockpath, "lock"))
 fcntl.flock(fd, fcntl.LOCK_EX)
+started.clear()
+check("start-watcher-other-server", d.start_watcher(other, popen) is True and started, started)
 started.clear()
 check("start-watcher-not-twice", d.start_watcher(env, popen) is False and not started, started)
 check("watch-exits-when-one-runs", d.watch(dict(env), sleep=lambda s: None) is None)
 os.close(fd)
 check("start-watcher-needs-the-env", d.start_watcher({}, popen) is False)
+check("start-watcher-needs-a-server", d.start_watcher(dict(env, HERDR_SOCKET_PATH=os.path.join(tmp, "none.sock")), popen)
+      is False and not started, started)
 
 
 # 5. The watcher, with a fake herdr, clock and sleep.
@@ -207,7 +219,7 @@ class Clock:
         return self.t
 
 
-def run_watch(rpc, env, max_loops=50):
+def run_watch(rpc, env, max_loops=50, me=None):
     clock, loops = Clock(), [0]
 
     def sleep(s):
@@ -217,16 +229,18 @@ def run_watch(rpc, env, max_loops=50):
             raise KeyboardInterrupt
 
     try:
-        d.watch(env, sleep=sleep, clock=clock, rpc=rpc)
+        d.watch(env, sleep=sleep, clock=clock, rpc=rpc, me=me)
         return "returned", loops[0]
     except KeyboardInterrupt:
         return "kept going", loops[0]
 
 
-def rpc_with(plugins, snapshot_ok=True, list_ok=True, calls=None):
+def rpc_with(plugins, snapshot_ok=True, list_ok=True, calls=None, writes=None):
     def rpc(path, method, params, timeout=3.0):
         if calls is not None:
             calls.append(method)
+        if writes is not None and method == "pane.report_metadata":
+            writes.append(params)
         if method == "plugin.list":
             if not list_ok:
                 raise OSError("refused")
@@ -234,7 +248,7 @@ def rpc_with(plugins, snapshot_ok=True, list_ok=True, calls=None):
         if method == "session.snapshot":
             if not snapshot_ok:
                 raise OSError("no socket")
-            return {"snapshot": snap("w1:t1", (100, 30), [ag("w1:p1", "w1:t1", 3)])}
+            return {"snapshot": snap("w1:t1", (100, 30), [ag("w1:p1", "w1:t1", 3), ag("w1:p2", "w1:t2", 5, "5 9x9")])}
         return {"type": "ok"}
     return rpc
 
@@ -248,21 +262,29 @@ how, loops = run_watch(rpc_with(ours, calls=calls), wenv, max_loops=40)
 check("watch-keeps-going", how == "kept going", (how, loops))
 check("watch-notes-every-second", calls.count("session.snapshot") == 40, calls.count("session.snapshot"))
 check("watch-checks-every-30-s", 1 < calls.count("plugin.list") <= 3, calls.count("plugin.list"))
-check("watch-exits-when-removed", run_watch(rpc_with([]), wenv)[0] == "returned")
-check("watch-exits-when-disabled", run_watch(rpc_with([dict(ours[0], enabled=False)]), wenv)[0] == "returned")
-check("watch-exits-when-updated", run_watch(rpc_with([dict(ours[0], plugin_root=tmp)]), wenv)[0] == "returned")
-check("watch-exits-when-its-root-is-gone",
-      run_watch(rpc_with(ours), dict(wenv, HERDR_PLUGIN_ROOT=os.path.join(tmp, "gone")))[0] == "returned")
+for why, plugins in [("removed", []), ("disabled", [dict(ours[0], enabled=False)])]:
+    writes = []
+    how, loops = run_watch(rpc_with(plugins, writes=writes), wenv)
+    check("watch-exits-when-%s" % why, how == "returned", (how, loops))
+    check("watch-clears-its-token-when-%s" % why, writes == [{"pane_id": "w1:p2", "source": d.SOURCE,
+                                                               "tokens": {d.TOKEN: None}}], writes)
+writes = []
+check("watch-exits-when-updated", run_watch(rpc_with([dict(ours[0], plugin_root=tmp)], writes=writes), wenv)[0]
+      == "returned" and writes == [], writes)
+gone = os.path.join(tmp, "gone")
+check("watch-exits-when-its-root-is-gone", run_watch(rpc_with([dict(ours[0], plugin_root=gone)]),
+                                                     dict(wenv, HERDR_PLUGIN_ROOT=gone))[0] == "returned")
+check("watch-exits-when-its-file-is-gone", run_watch(rpc_with(ours), wenv, me=os.path.join(tmp, "no-drawn"))[0] == "returned")
 calls = []
 how, loops = run_watch(rpc_with(ours, list_ok=False, calls=calls), wenv, max_loops=10)
 check("watch-a-failed-check-does-not-stop-it", how == "kept going" and calls.count("session.snapshot") == 10, calls)
-check("watch-keeps-the-last-error", os.path.exists(os.path.join(state, "drawn.err"))
-      and "plugin.list" in open(os.path.join(state, "drawn.err")).read())
+err = os.path.join(state, d.server_file("drawn", sockpath, "err"))
+check("watch-keeps-the-last-error", os.path.exists(err) and "plugin.list" in open(err).read())
 how, loops = run_watch(rpc_with(ours, snapshot_ok=False), wenv, max_loops=500)
 check("watch-exits-when-herdr-is-gone", how == "returned" and abs(loops - d.GONE_AFTER / d.INTERVAL) <= 2, (how, loops))
 how, loops = run_watch(rpc_with(ours, snapshot_ok=False), dict(wenv, HERDR_SOCKET_PATH=os.path.join(tmp, "gone.sock")))
 check("watch-exits-at-once-when-the-socket-is-gone", how == "returned" and loops <= 1, (how, loops))
-check("watch-unknown-answer-is-no-reason-to-stop", d.still_ours("x", wenv, lambda *a, **k: {"weird": 1}) is True)
+check("watch-unknown-answer-is-no-reason-to-stop", d.plugin_state("x", wenv, lambda *a, **k: {"weird": 1}) == "ours")
 
 # 6. The manifest.
 try:
@@ -283,6 +305,7 @@ if tomllib:
 check("manifest-pane-updated-absent", '"pane.updated"' not in manifest)
 
 # 7. The program as herdr runs it.
+before = set(os.listdir(state))
 for name, e in [("no-env", {}), ("dead-socket", {"HERDR_SOCKET_PATH": os.path.join(tmp, "none.sock"),
                                                  "HERDR_PLUGIN_STATE_DIR": state})]:
     for args in ([], ["--start"]):
@@ -290,8 +313,10 @@ for name, e in [("no-env", {}), ("dead-socket", {"HERDR_SOCKET_PATH": os.path.jo
                            timeout=20, env=dict(e, PATH=os.environ.get("PATH", "/usr/bin:/bin")))
         check("program-%s-%s-silent" % (name, args), r.returncode == 0 and r.stdout == b"" and r.stderr == b"",
               (r.returncode, r.stdout, r.stderr))
+time.sleep(0.5)
+new_files = set(os.listdir(state)) - before
+check("program-starts-no-watcher-without-a-server", not any(f.startswith("watch-") for f in new_files), new_files)
 fake.close()
-# Any watcher a --start above detached exits on its own (no socket); the files can go now.
 subprocess.run(["rm", "-rf", tmp])
 
 if FAILS:

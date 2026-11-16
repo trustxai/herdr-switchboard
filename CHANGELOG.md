@@ -27,9 +27,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sends no event when a window starts showing another machine. Only the windows the popup was
   opened from count, so a Mac's own screen that nobody looks at marks nothing seen. On a
   machine without the plugin, or with nothing drawn since its herdr server started, the guess
-  from the focus still applies. Two differences remain: what a window draws while Ghostty is
-  behind another app counts as seen, and a look at a machine shorter than about a second may
-  not be noted. The install and update previews list the new startup and event commands.
+  from the focus still applies. Differences that remain: what a window draws while Ghostty is
+  behind another app counts as seen, a look at a machine shorter than about a second may not be
+  noted, and when two windows show one machine at once, herdr sizes its layout after the one
+  that attached or resized last. Disabling or removing the plugin takes the token off every
+  pane. The install and update previews list the new startup and event commands.
 - With the jump on, Enter on another machine's row no longer holds the popup while the
   connection to the Mac is set up: it waits for it 2 seconds at most, then focuses the pane
   instead, and the popup's close never waits for an ssh lookup (before, up to about 12 seconds

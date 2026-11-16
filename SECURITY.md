@@ -91,7 +91,9 @@ no event when a window starts showing a machine. The watcher is that same script
 detached in its own session, with `/dev/null` for input and output, at a lower priority. It
 talks only to the local herdr socket, and it exits when the socket is gone or has not answered
 for a minute, when the plugin is disabled, removed or updated to another directory (it asks
-`plugin.list` every 30 seconds), or when its own file is gone.
+`plugin.list` every 30 seconds), or when its own file is gone. When the plugin is disabled or
+removed, it first takes `switchboard_drawn` off every pane. One watcher runs per herdr server:
+named sessions on one machine each get their own.
 
 ### What comes back from herdr is untrusted
 
@@ -270,9 +272,10 @@ It keeps these files in the plugin's state directory: `$HERDR_PLUGIN_STATE_DIR`,
   its rank among the changes seen together, up to which counter finished work counts as seen,
   and the counter at which herdr last reported it done; per machine, the tab that was focused at
   the last read; and the sizes of the last windows the popup was opened from.
-- **`drawn.lock` and `watch.lock`**, the locks of the hook above; `watch.lock` holds the
-  watcher's process id. **`drawn.err`**: the watcher's last error, one line (time, where, the
-  error's type and message).
+- **`drawn-<id>.lock` and `watch-<id>.lock`**, the locks of the hook above, one pair per herdr
+  server (`<id>` is a hash of its socket path); `watch-<id>.lock` holds the watcher's process
+  id. **`drawn-<id>.err`**: that watcher's last error, one line (time, where, the error's type
+  and message).
 
 Switchboard writes no pane output and no credentials there. Deleting the directory is safe: the
 order inside each status and the `done` marks start over.

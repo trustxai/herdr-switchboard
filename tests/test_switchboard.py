@@ -1547,13 +1547,24 @@ rd = sb.Recency(persist=False, now=100.0)
 for i, size in enumerate(["120x40", "0x5", "x", None, "10x10", "11x11", "12x12", "13x13", "14x14"]):
     rd.saw_window(size, now=100.0 + i)
 check("drawn-windows-kept", set(rd.windows) == {"11x11", "12x12", "13x13", "14x14"}, rd.windows)
+rd = sb.Recency(persist=False, now=100.0)
+rd.saw_window(sb.HEADLESS_SIZE)
+check("drawn-headless-is-never-a-window", rd.windows == {}, rd.windows)
+# Rows from the cache are only applied, never observed: the token counts there too.
+rd = sb.Recency(persist=False, now=100.0)
+rd.saw_window(W)
+rd.seen = {"m1": {"A": [7, 100.0, 0, 5, -1], "B": [8, 100.0, 0, 5, -1]}}
+e = rd.apply(ents17("m1", 1, drawn17("A", "idle", 7, T1, 7, "7 239x63"), drawn17("B", "idle", 8, T1, 8, "8 250x63")))
+check("drawn-counts-in-cached-rows", st(e) == {"A": "idle", "B": "done"}, st(e))
 with tempfile.TemporaryDirectory() as d:
     sb.STATE_DIR = d
     sb.Recency(now=100.0).saw_window(W, now=100.0)
     check("drawn-windows-persisted", W in sb.Recency(now=200.0).windows)
     with open(os.path.join(d, "recency.json"), "w") as f:
-        json.dump({"v": 2, "machines": {}, "windows": {"bad": 1, "5x5": "x"}}, f)
-    check("drawn-windows-bad-file", sb.Recency(now=300.0).windows == {}, sb.Recency(now=300.0).windows)
+        json.dump({"v": 2, "machines": {"m1": {"A": [7, 100.0, 0, 5, -1]}}, "windows": {"bad": 1, "5x5": "x"}}, f)
+    r17 = sb.Recency(now=300.0)
+    check("drawn-windows-bad-file", r17.windows == {} and r17.seen == {"m1": {"A": [7, 100.0, 0, 5, -1]}},
+          (r17.windows, r17.seen))
     sb.STATE_DIR = STATE
 # The popup records the size of the window it opened in.
 lv = sb.Live([], ents17("", 0, drawn17("L", "idle", 1)), cache=False, focus=T1, window=W)

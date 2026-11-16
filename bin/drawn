@@ -21,16 +21,17 @@ never opens the popup.
 Two things call it. The event hooks run on what changes what a window shows on this
 machine: an agent changing state and the focus moving. herdr sends no event when a window
 starts or stops showing a machine (its layout takes the window's size without one), so a
-watcher reads the snapshot once a second as well. It runs one per machine (a lock in the
+watcher reads the snapshot once a second as well. It runs one per herdr server (a lock in the
 plugin's state directory), and exits when herdr's socket is gone, when the plugin is
-disabled or removed, or when an update moved the plugin's root: the next event or startup
-starts the new one.
+disabled or removed (taking its token off every pane first), or when an update moved the
+plugin's root: the next event or startup starts the new one.
 
 Standard library only. It prints nothing, never waits on herdr for more than a few seconds,
 and always exits 0: a hook that fails must not get in the way of herdr.
 """
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import socket
@@ -71,9 +72,12 @@ def parse(value):
     return out
 
 
-def serialize(drawn):
-    """The token value: highest seq first, at most KEEP sizes and MAX_LEN characters."""
-    items = sorted(drawn.items(), key=lambda kv: (-kv[1], kv[0]))[:KEEP]
+def serialize(drawn, first=None):
+    """The token value: `first` (the size just noted) first, so it is never the one dropped,
+    then the rest highest seq first; at most KEEP sizes and MAX_LEN characters."""
+    rest = sorted(((s, q) for s, q in drawn.items() if s != first), key=lambda kv: (-kv[1], kv[0]))
+    items = ([(first, drawn[first])] if first in drawn else []) + rest
+    items = items[:KEEP]
     while items:
         value = ",".join("%d %s" % (seq, size) for size, seq in items)
         if len(value) <= MAX_LEN:
@@ -88,7 +92,7 @@ def merge(value, size, seq):
     if drawn.get(size, -1) >= seq:
         return None
     drawn[size] = seq
-    new = serialize(drawn)
+    new = serialize(drawn, first=size)
     return new if new and new != value else None
 
 
@@ -156,6 +160,12 @@ def open_lock(state_dir, name):
         return None
 
 
+def server_file(name, path, ext):
+    """A state file of this herdr server: named herdr sessions on one machine share the plugin's
+    state directory, so each server's locks and error file carry its socket path's hash."""
+    return "%s-%s.%s" % (name, hashlib.sha1(path.encode("utf-8", "replace")).hexdigest()[:12], ext)
+
+
 def try_lock(fd, wait):
     """True once fd holds an exclusive lock; False when it cannot within `wait` seconds."""
     deadline = time.time() + wait
@@ -169,11 +179,22 @@ def try_lock(fd, wait):
             time.sleep(0.02)
 
 
-def note(path, state_dir, wait, rpc=call):
+def clears(snap):
+    """The pane.report_metadata params that remove this plugin's token from every pane."""
+    out = []
+    for a in snap.get("agents") or []:
+        tokens = a.get("tokens") if isinstance(a, dict) and isinstance(a.get("tokens"), dict) else {}
+        if TOKEN in tokens and isinstance(a.get("pane_id"), str):
+            out.append({"pane_id": a["pane_id"], "source": SOURCE, "tokens": {TOKEN: None}})
+    return out
+
+
+def note(path, state_dir, wait, rpc=call, clear=False):
     """One pass: read the snapshot and write the tokens it calls for. The write lock keeps
     the event hooks and the watcher from rewriting one token from the same old value; when it
-    cannot be had in time, this pass is skipped, and the next one notes the same thing."""
-    fd = open_lock(state_dir, "drawn.lock")
+    cannot be had in time, this pass is skipped, and the next one notes the same thing. With
+    clear, it removes the token from every pane instead (the plugin was disabled or removed)."""
+    fd = open_lock(state_dir, server_file("drawn", path, "lock"))
     if fd is None:
         return
     try:
@@ -182,7 +203,7 @@ def note(path, state_dir, wait, rpc=call):
         result = rpc(path, "session.snapshot", {})
         snap = result.get("snapshot") if isinstance(result, dict) else None
         if isinstance(snap, dict):
-            for params in reports(snap):
+            for params in (clears(snap) if clear else reports(snap)):
                 rpc(path, "pane.report_metadata", params)
     finally:
         os.close(fd)
@@ -197,10 +218,10 @@ def event(env, rpc=call):
 
 def start_watcher(env, popen=subprocess.Popen):
     """Start the watcher, detached, unless one already holds its lock. True when started."""
-    state_dir = env.get("HERDR_PLUGIN_STATE_DIR")
-    if not state_dir or not env.get("HERDR_SOCKET_PATH"):
-        return False
-    fd = open_lock(state_dir, "watch.lock")
+    state_dir, path = env.get("HERDR_PLUGIN_STATE_DIR"), env.get("HERDR_SOCKET_PATH")
+    if not state_dir or not path or not os.path.exists(path):
+        return False  # no herdr server to watch
+    fd = open_lock(state_dir, server_file("watch", path, "lock"))
     if fd is None:
         return False
     try:
@@ -214,40 +235,44 @@ def start_watcher(env, popen=subprocess.Popen):
     return True
 
 
-def last_error(state_dir, where, exc):
-    """Keep the watcher's last error, one line, in drawn.err: it prints nowhere else."""
+def last_error(state_dir, path, where, exc):
+    """Keep the watcher's last error, one line, in drawn-<server>.err: it prints nowhere else."""
     try:
-        with open(os.path.join(state_dir, "drawn.err"), "w") as f:
+        with open(os.path.join(state_dir, server_file("drawn", path, "err")), "w") as f:
             f.write("%s %s: %s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), where,
                                         type(exc).__name__, str(exc)[:200]))
     except OSError:
         pass
 
 
-def still_ours(path, env, rpc=call):
-    """False when the plugin is disabled, removed, or now runs from another root (an update):
-    this watcher's code is then not the plugin's any more."""
+def plugin_state(path, env, rpc=call):
+    """"ours" while the plugin is enabled and runs from this watcher's root; "moved" when it
+    runs from another root (an update: the new code starts its own watcher); "gone" when it is
+    disabled or removed."""
     result = rpc(path, "plugin.list", {})
     plugins = result.get("plugins") if isinstance(result, dict) else None
     if not isinstance(plugins, list):
-        return True  # an answer it does not understand is no reason to stop
+        return "ours"  # an answer it does not understand is no reason to stop
     plugin_id = env.get("HERDR_PLUGIN_ID") or PLUGIN_ID
     root = env.get("HERDR_PLUGIN_ROOT")
     for p in plugins:
         if isinstance(p, dict) and p.get("plugin_id") == plugin_id:
             if not p.get("enabled", True):
-                return False
-            return not root or not p.get("plugin_root") or \
+                return "gone"
+            same = not root or not p.get("plugin_root") or \
                 os.path.realpath(p["plugin_root"]) == os.path.realpath(root)
-    return False
+            return "ours" if same else "moved"
+    return "gone"
 
 
-def watch(env, sleep=time.sleep, clock=time.time, rpc=call):
-    """The watcher: note what is drawn once a second, until it is not wanted any more."""
+def watch(env, sleep=time.sleep, clock=time.time, rpc=call, me=None):
+    """The watcher: note what is drawn once a second, until it is not wanted any more. When the
+    plugin is disabled or removed, it takes its token off every pane on the way out, so popups
+    on other machines go back to guessing from this machine's focus."""
     path, state_dir = env.get("HERDR_SOCKET_PATH"), env.get("HERDR_PLUGIN_STATE_DIR")
     if not path or not state_dir:
         return
-    fd = open_lock(state_dir, "watch.lock")
+    fd = open_lock(state_dir, server_file("watch", path, "lock"))
     if fd is None:
         return
     try:
@@ -258,25 +283,31 @@ def watch(env, sleep=time.sleep, clock=time.time, rpc=call):
             os.write(fd, ("%d\n" % os.getpid()).encode())
         except OSError:
             pass
-        me = os.path.abspath(__file__)
+        me = me or os.path.abspath(__file__)
         root = env.get("HERDR_PLUGIN_ROOT")
         last_ok, next_check = clock(), 0.0
         while True:
             # A check that fails is no reason to stop noting: only a clear answer stops it.
             if clock() >= next_check:
                 try:
-                    ours = still_ours(path, env, rpc)
+                    state = plugin_state(path, env, rpc)
                 except Exception as exc:
-                    ours = True
-                    last_error(state_dir, "plugin.list", exc)
-                if not ours or not os.path.exists(me) or (root and not os.path.isdir(root)):
+                    state = "ours"
+                    last_error(state_dir, path, "plugin.list", exc)
+                if state == "gone":
+                    try:
+                        note(path, state_dir, TIMEOUT, rpc, clear=True)
+                    except Exception as exc:
+                        last_error(state_dir, path, "clear", exc)
+                    return
+                if state != "ours" or not os.path.exists(me) or (root and not os.path.isdir(root)):
                     return
                 next_check = clock() + CHECK_EVERY
             try:
                 note(path, state_dir, INTERVAL, rpc)
                 last_ok = clock()
             except Exception as exc:
-                last_error(state_dir, "note", exc)
+                last_error(state_dir, path, "note", exc)
                 # herdr's server is gone (its socket with it, or no answer for a minute); its
                 # next start runs the startup hook, which starts a new watcher.
                 if not os.path.exists(path) or clock() - last_ok > GONE_AFTER:

@@ -1338,9 +1338,13 @@ class Recency:
                                       for p, v in panes.items()}
                              for m, panes in d["machines"].items()}
                 self.focus = {str(m): str(tab) for m, tab in (d.get("focus") or {}).items()}
-                self.windows = {s: float(t) for s, t in (d.get("windows") or {}).items() if _size(s) == s}
             except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError):
-                self.seen, self.focus, self.windows = {}, {}, {}
+                self.seen, self.focus, d = {}, {}, {}
+            # Read on its own: a bad windows entry must not reset the done marks above.
+            try:
+                self.windows = {s: float(t) for s, t in (d.get("windows") or {}).items() if _size(s) == s}
+            except (ValueError, TypeError, AttributeError):
+                self.windows = {}
 
     def saw_window(self, size, now=None):
         """The popup was opened from a window of that size: what such a window drew counts as

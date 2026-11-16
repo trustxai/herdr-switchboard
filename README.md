@@ -120,6 +120,10 @@ It can still differ from herdr's panel:
 - herdr counts a window only while its terminal is in front. Switchboard cannot tell, so what
   a window draws while Ghostty is behind another app counts as seen here.
 - A look at another machine shorter than about a second may not be noted.
+- When two windows show the same machine at once (a Mac's own screen and the window you use),
+  herdr gives its layout the size of the one that attached or resized last. What the other one
+  draws is then noted under that size: work you watched there can stay `done`, and if you open
+  the popup there, that size starts to count.
 - On a machine without the plugin, or where nothing was drawn since its herdr server started,
   there are no notes, and Switchboard guesses from that machine's focus instead: finished work
   counts as seen when herdr turned it from `done` to idle, when that machine's focus moved off
@@ -327,8 +331,9 @@ cover parts of this. Compared on 2026-11-13 from each project's README (and herd
   set `[jump] enabled = false`.
 - **The order or the `done` marks look wrong.** They live in `recency.json` in the plugin's
   state directory; deleting it starts them over. If work you saw on another machine stays
-  `done`, check that the plugin is installed there and that its watcher runs: `watch.lock` in
-  that machine's plugin state directory holds its process id, and `drawn.err` its last error.
+  `done`, check that the plugin is installed there and that its watcher runs: in that
+  machine's plugin state directory, `watch-<id>.lock` holds its process id and `drawn-<id>.err`
+  its last error (one pair per herdr server).
 
 ## Demo mode and screenshots
 
