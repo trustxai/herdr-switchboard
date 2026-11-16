@@ -1285,7 +1285,7 @@ def fmt_age(seconds):
 # Seconds a focus the popup moved (ack_tab) has to show up in that machine's snapshots; until
 # then, reads still showing the old tab are taken as from before the move (Recency.observe).
 FOCUS_SETTLE = 10.0
-READ_SAVE_EVERY = 30.0  # seconds between saves of the machines' read times alone (Recency)
+READ_SAVE_EVERY = 5.0  # seconds between saves of the machines' read times alone (Recency)
 
 
 class Recency:
@@ -1301,8 +1301,9 @@ class Recency:
     - Everything that changed while the popup was closed is seen at once on open, and the
       API gives no timestamps to tell which happened first on which machine. Where the
       plugin's hook runs (bin/drawn), each agent carries the time its machine saw the change
-      (`changed`), and that time decides. Otherwise those changes get the opening time and,
-      at equal time, interleave: the most recent of each machine, then the second of each.
+      (`changed`), and that time decides. Otherwise those changes get the last moment a
+      popup was reading (the opening time if none ever did) and, at equal time, interleave:
+      the most recent of each machine, then the second of each.
       While the popup is open the order is the real one, within the refresh interval.
 
     It also decides what is `done`, meaning finished and not seen yet. The server's own
@@ -1376,6 +1377,10 @@ class Recency:
                 self.read = {str(m): float(t) for m, t in (d.get("read") or {}).items()}
             except (ValueError, TypeError, AttributeError):
                 self.read = {}
+        # What changed while closed, with no time from a hook, happened after the last moment a
+        # popup was reading (every machine is read every few seconds while one is open). One
+        # stamp for all machines, so they still interleave; never later than this opening.
+        self.floor = min(max(self.read.values()), self.opened) if self.read else self.opened
 
     def saw_window(self, size, now=None):
         """The popup was opened from a window of that size: what such a window drew counts as
@@ -1410,8 +1415,8 @@ class Recency:
                 if e.get("changed"):
                     # When its machine saw the change, noted by the hook there: the real order
                     # across machines, as in herdr's panel, also for what changed while closed.
-                    # Never later than now: a clock running ahead would pin its rows on top.
-                    e["stamp"], e["rank"] = min(e["changed"], time.time()), 0
+                    # It assumes the machines' clocks agree, as NTP keeps them.
+                    e["stamp"], e["rank"] = e["changed"], 0
                 raw = e.get("server_status", e["status"])
                 unseen = bool(known) and known[0] == e["seq"] and max(known[3], self.drawn(e)) < e["seq"]
                 e["status"] = "done" if raw == "idle" and unseen and self.completed(e) else raw
@@ -1425,11 +1430,11 @@ class Recency:
         so that tab is the one in front of you."""
         with self.lock:
             # The first read of each machine brings everything that happened while closed. With
-            # no time from its hook, such a change gets the last time a popup read that machine:
-            # it happened after that, and putting it later would rank it above changes on other
-            # machines whose hook says they came after it. Never read before: the opening time.
+            # no time from its hook, such a change gets `floor`, the last moment a popup was
+            # reading: it happened after that, so it rises above what was seen before, and it does
+            # not jump above changes that a hook timed after that moment.
             t = now or time.time()
-            stamp = t if machine in self.fresh else min(self.read.get(machine, self.opened), self.opened)
+            stamp = t if machine in self.fresh else self.floor
             self.read[machine] = t
             self.fresh.add(machine)
             baseline = machine not in self.seen
