@@ -109,7 +109,31 @@ left = {"panes": [{"pane_id": "w1:p7", "tokens": {d.TOKEN: "3 9x9"}}, {"pane_id"
 left["panes"].append({"pane_id": "w1:p6", "tokens": {d.TOKEN: "1 9x9"}})
 # w1:p7's agent has exited: the token stays on the pane, and it must go too.
 check("clears-every-pane-once", [x["pane_id"] for x in d.clears(left)] == ["w1:p7", "w1:p6"]
-      and all(x["tokens"] == {d.TOKEN: None} for x in d.clears(left)), d.clears(left))
+      and all(x["tokens"] == {d.TOKEN: None, d.CHANGED: None} for x in d.clears(left)), d.clears(left))
+check("clears-the-change-token-too", [x["pane_id"] for x in d.clears({"panes": [{"pane_id": "a", "tokens": {d.CHANGED: "1 0"}}]})]
+      == ["a"])
+check("clears-malformed-lists", d.clears({"panes": {"x": 1}, "agents": "y"}) == [])
+
+# The change times.
+check("changed-parse", d.parse_changed("12 1794803477.1") == (12, 1794803477.1) and d.parse_changed("12 0") == (12, 0.0))
+check("changed-parse-garbage", all(d.parse_changed(v) is None for v in
+                                   (None, 5, "", "12", "x 1.0", "12 x", "12 -1", "12 1e12", "1 2 3")))
+cs = {"focused_tab_id": "w1:t1", "agents": [
+    {"pane_id": "a", "tab_id": "w1:t1", "state_change_seq": 5, "tokens": {d.CHANGED: "5 100.0"}},
+    {"pane_id": "b", "tab_id": "w1:t2", "state_change_seq": 7, "tokens": {d.CHANGED: "6 100.0"}},
+    {"pane_id": "c", "tab_id": "w1:t2", "state_change_seq": 3},
+    {"pane_id": "e", "tab_id": "w1:t2", "state_change_seq": 4},
+    {"pane_id": 9, "state_change_seq": 1}, {"pane_id": "f", "state_change_seq": False}]}
+check("changes", d.changes(cs, 200.0, fresh={"e"}) == {"b": "7 200.0", "c": "3 0", "e": "4 200.0"},
+      d.changes(cs, 200.0, fresh={"e"}))
+cs["layouts"] = [{"tab_id": "w1:t1", "area": {"width": 80, "height": 24}}]
+w = {x["pane_id"]: x["tokens"] for x in d.writes(cs, 200.0)}
+check("writes-one-per-pane", w == {"a": {d.TOKEN: "5 80x24"}, "b": {d.CHANGED: "7 200.0"}, "c": {d.CHANGED: "3 0"},
+                                   "e": {d.CHANGED: "4 0"}}, w)
+check("event-panes", d.event_panes({"HERDR_PLUGIN_EVENT_JSON": '{"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p3"}}'})
+      == {"w1:p3"} and d.event_panes({"HERDR_PLUGIN_EVENT_JSON": '{"pane_id": "w2:p1"}'}) == {"w2:p1"}
+      and d.event_panes({}) == set() and d.event_panes({"HERDR_PLUGIN_EVENT_JSON": "{nope"}) == set()
+      and d.event_panes({"HERDR_PLUGIN_EVENT_JSON": '["x"]'}) == set())
 
 
 # 3. The socket, against a server that answers like herdr: one request, then it closes.
@@ -151,12 +175,26 @@ state = os.path.join(tmp, "state")
 tokens = {}
 
 
+store, seqs = {}, {"w1:p1": 10, "w1:p2": 6}  # every token of each pane; each agent's seq
+
+
 def handler(req):
     if req["method"] == "session.snapshot":
-        agents = [ag("w1:p1", "w1:t1", 10, tokens.get("w1:p1")), ag("w1:p2", "w1:t1", 6, tokens.get("w1:p2"))]
+        agents = []
+        for pane in sorted(seqs):
+            a = ag(pane, "w1:t1", seqs[pane])
+            a["tokens"] = dict(store.get(pane, {}))
+            agents.append(a)
         return {"id": req["id"], "result": {"type": "session_snapshot", "snapshot": snap("w1:t1", (100, 30), agents)}}
     if req["method"] == "pane.report_metadata":
-        tokens[req["params"]["pane_id"]] = req["params"]["tokens"][d.TOKEN]
+        t = store.setdefault(req["params"]["pane_id"], {})
+        for k, v in req["params"]["tokens"].items():
+            if v is None:
+                t.pop(k, None)
+            else:
+                t[k] = v
+        if d.TOKEN in req["params"]["tokens"]:
+            tokens[req["params"]["pane_id"]] = req["params"]["tokens"][d.TOKEN]
         return {"id": req["id"], "result": {"type": "ok"}}
     if req["method"] == "plugin.list":
         return {"id": req["id"], "result": {"type": "plugin_list", "plugins": []}}
@@ -173,6 +211,19 @@ check("event-one-connection-per-request", [q["method"] for q in fake.requests]
 n = len(fake.requests)
 d.event(env)
 check("event-nothing-new-writes-nothing", [q["method"] for q in fake.requests[n:]] == ["session.snapshot"], fake.requests[n:])
+check("event-change-before-watching-is-unknown", store["w1:p1"].get(d.CHANGED) == "10 0", store)
+seqs["w1:p1"] = 11
+t0 = time.time()
+d.event(env)
+got = d.parse_changed(store["w1:p1"].get(d.CHANGED))
+check("event-change-gets-its-time", got and got[0] == 11 and t0 - 1 <= got[1] <= time.time() + 1, store["w1:p1"])
+check("event-change-both-tokens-in-one-write", [q["params"]["tokens"] for q in fake.requests[-1:]]
+      == [{d.TOKEN: "11 100x30", d.CHANGED: store["w1:p1"][d.CHANGED]}], fake.requests[-1:])
+seqs["w1:p3"] = 2  # a new agent: no token yet, and the event is its own
+d.event(dict(env, HERDR_PLUGIN_EVENT_JSON=json.dumps({"event": "pane.agent_status_changed", "data": {"pane_id": "w1:p3"}})))
+got3 = d.parse_changed(store["w1:p3"].get(d.CHANGED))
+check("event-new-agent-gets-its-time", got3 and got3[0] == 2 and got3[1] > 0, store["w1:p3"])
+del seqs["w1:p3"]
 try:
     d.call(sockpath, "nope", {})
     check("call-error-raises", False)
@@ -274,7 +325,7 @@ for why, plugins in [("removed", []), ("disabled", [dict(ours[0], enabled=False)
     how, loops = run_watch(rpc_with(plugins, writes=writes), wenv)
     check("watch-exits-when-%s" % why, how == "returned", (how, loops))
     check("watch-clears-its-token-when-%s" % why, writes == [{"pane_id": "w1:p2", "source": d.SOURCE,
-                                                               "tokens": {d.TOKEN: None}}], writes)
+                                                               "tokens": {d.TOKEN: None, d.CHANGED: None}}], writes)
 writes = []
 check("watch-exits-when-updated", run_watch(rpc_with([dict(ours[0], plugin_root=tmp)], writes=writes), wenv)[0]
       == "returned" and writes == [], writes)

@@ -83,8 +83,10 @@ and `workspace.focused`). The install and update previews list these commands. E
 the local snapshot over herdr's socket (`HERDR_SOCKET_PATH`) and, for the agents in the focused
 tab, writes one pane token, `switchboard_drawn`, through `pane.report_metadata` with the source
 `plugin:trustxai.switchboard`. The token holds numbers only: herdr's change counter for that
-agent and the size of the window that drew it (`12 239x63`). It changes no title, label, status
-or focus, and it never reads pane output.
+agent and the size of the window that drew it (`12 239x63`). For every agent it also writes
+`switchboard_changed`: that counter and the time this machine saw it change (`12
+1794803477.1`, or `0` when unknown). It changes no title, label, status or focus, and it never
+reads pane output.
 
 It also starts a watcher, one per herdr server, that does the same once a second, because herdr sends
 no event when a window starts showing a machine. The watcher is that same script with `--watch`:
@@ -92,7 +94,7 @@ detached in its own session, with `/dev/null` for input and output, at a lower p
 talks only to the local herdr socket, and it exits when the socket is gone or has not answered
 for a minute, when the plugin is disabled, removed or updated to another directory (it asks
 `plugin.list` every 30 seconds), or when its own file is gone. When the plugin is disabled or
-removed, it first takes `switchboard_drawn` off every pane. One watcher runs per herdr server:
+removed, it first takes both tokens off every pane. One watcher runs per herdr server:
 named sessions on one machine each get their own.
 
 ### What comes back from herdr is untrusted

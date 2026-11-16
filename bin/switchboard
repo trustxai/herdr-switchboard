@@ -835,6 +835,9 @@ def entries_from(snap, machine=LOCAL, machine_label="", machine_index=0):
             "completion": completion if _int(completion, None) is not None else None,
             # {window size: seq} the plugin's hook noted as drawn on that machine (bin/drawn).
             "drawn": parse_drawn(tokens.get(DRAWN_TOKEN) if isinstance(tokens, dict) else None),
+            # When that machine saw this seq appear (bin/drawn), or None when not known.
+            "changed": changed_at(tokens.get(CHANGED_TOKEN) if isinstance(tokens, dict) else None,
+                                  _int((a or {}).get("state_change_seq"))),
             "ws_label": clean(w.get("label")) or clean(p.get("workspace_id")),
             "ws_number": _int(w.get("number")),
             # An unnamed tab is called "1", "2": that is its number, not a name.
@@ -1144,6 +1147,8 @@ DRAWN_TOKEN = "switchboard_drawn"
 # herdr's default headless size: what a machine's layout falls back to with no window on it.
 HEADLESS_SIZE = "120x40"
 WINDOWS_KEPT = 4  # sizes of the windows the popup was opened from, kept in recency.json
+# The pane token where the same hook notes when its machine saw each agent's seq appear.
+CHANGED_TOKEN = "switchboard_changed"
 
 
 def _size(value):
@@ -1168,6 +1173,19 @@ def parse_drawn(value):
         if size and bits[0].isdigit():
             out[size] = max(out.get(size, -1), int(bits[0]))
     return out
+
+
+def changed_at(value, seq):
+    """The time in a switchboard_changed token ("<seq> <unix time>") when it is about this seq
+    and known (not 0); else None. Untrusted input: anything malformed is None."""
+    bits = value.split(" ") if isinstance(value, str) and len(value) <= 80 else []
+    if len(bits) != 2 or not bits[0].isdigit() or int(bits[0]) != seq:
+        return None
+    try:
+        t = float(bits[1])
+    except ValueError:
+        return None
+    return t if 0 < t < 1e11 else None
 
 
 def focused_size(snap):
@@ -1275,10 +1293,11 @@ class Recency:
     - It is kept on disk (recency.json in the state directory), with the time each change
       was seen.
     - Everything that changed while the popup was closed is seen at once on open, and the
-      API gives no timestamps to tell which happened first on which machine. Those changes
-      get the opening time and, at equal time, interleave: the most recent of each machine,
-      then the second of each. While the popup is open the order is the real one, within
-      the refresh interval.
+      API gives no timestamps to tell which happened first on which machine. Where the
+      plugin's hook runs (bin/drawn), each agent carries the time its machine saw the change
+      (`changed`), and that time decides. Otherwise those changes get the opening time and,
+      at equal time, interleave: the most recent of each machine, then the second of each.
+      While the popup is open the order is the real one, within the refresh interval.
 
     It also decides what is `done`, meaning finished and not seen yet. The server's own
     status is not enough: it marks as seen whatever finishes in its active tab while a
@@ -1376,6 +1395,10 @@ class Recency:
             if e["kind"] == "a":
                 known = self.seen.get(e["machine"], {}).get(e["pane"])
                 e["stamp"], e["rank"] = (known[1], known[2]) if known else (0.0, 0)
+                if e.get("changed"):
+                    # When its machine saw the change, noted by the hook there: the real order
+                    # across machines, as in herdr's panel, also for what changed while closed.
+                    e["stamp"], e["rank"] = e["changed"], 0
                 raw = e.get("server_status", e["status"])
                 unseen = bool(known) and known[0] == e["seq"] and max(known[3], self.drawn(e)) < e["seq"]
                 e["status"] = "done" if raw == "idle" and unseen and self.completed(e) else raw

@@ -59,6 +59,7 @@ What it has to get right, and how it fails otherwise:
    survives between openings; what changed while closed rises on open, interleaved across
    machines. The cache is not a read, and an agent that left is removed only from its own
    machine (pane ids repeat across machines).
+   With the hook's change times (bin/drawn), the time each machine saw the change decides.
 17. `done` is "finished and not seen", and the tool keeps that count itself. Stays done:
    what finished in the active tab of another machine, or in the tab you were on and left.
    Counts as seen: what is in front of you when the popup opens, what you pick with Enter,
@@ -1570,6 +1571,38 @@ with tempfile.TemporaryDirectory() as d:
 lv = sb.Live([], ents17("", 0, drawn17("L", "idle", 1)), cache=False, focus=T1, window=W)
 check("drawn-live-records-the-window", W in lv.recency.windows, lv.recency.windows)
 check("drawn-popup-passes-the-window", "window=focused_size(snap)" in SOURCE)
+
+# The order across machines: when each machine saw the change (bin/drawn), as in herdr's panel.
+check("changed-at", sb.changed_at("7 1794803477.1", 7) == 1794803477.1)
+check("changed-at-other-seq-or-unknown", sb.changed_at("6 1794803477.1", 7) is None and sb.changed_at("7 0", 7) is None)
+check("changed-at-garbage", all(sb.changed_at(v, 7) is None for v in
+                                (None, 7, "", "7", "x 1", "7 x", "7 -3", "7 1e12", "7 1 2", "7 " + "1" * 90)))
+
+
+def changed17(pid, status, seq, tab=T1, compl=None, at=None):
+    a = ag17(pid, status, seq, tab, compl)
+    if at is not None:
+        a["tokens"] = {sb.CHANGED_TOKEN: "%d %s" % (seq, at)}
+    return a
+
+
+check("changed-in-the-entries", ents17("m1", 1, changed17("A", "idle", 7, at=1500.5))[0]["changed"] == 1500.5)
+rd = sb.Recency(persist=False, now=1000.0)
+# Both machines read for the first time at the same moment: without times they interleave by
+# machine (this one first); with the times each machine noted, the later change goes on top.
+here = ents17("", 0, changed17("L1", "idle", 3, at=1100.0), changed17("L2", "idle", 2, at=1050.0))
+there = ents17("m1", 1, changed17("R1", "idle", 9, at=1200.0), changed17("R2", "idle", 8, at=1075.0))
+rd.observe("", here, focus=T2, here=True)
+rd.observe("m1", there, focus=T2)
+got = [e["pane"] for e in sorted(here + there, key=sb.sort_key)]
+check("changed-orders-across-machines", got == ["R1", "L1", "R2", "L2"], got)
+here = ents17("", 0, changed17("L1", "idle", 3), changed17("L2", "idle", 2))
+there = ents17("m1", 1, changed17("R1", "idle", 9, at=1200.0), changed17("R2", "idle", 8))
+rd2 = sb.Recency(persist=False, now=1000.0)
+rd2.observe("", here, focus=T2, here=True)
+rd2.observe("m1", there, focus=T2)
+got = [e["pane"] for e in sorted(here + there, key=sb.sort_key)]
+check("changed-mixed-known-first-then-interleaved", got[0] == "R1" and set(got[1:]) == {"L1", "L2", "R2"}, got)
 
 # 18. Config.
 block('18. Config')
