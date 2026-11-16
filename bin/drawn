@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Switchboard's hook: note which agents a window has drawn, on this machine.
+
+    drawn            an event hook: note what is drawn now, and start the watcher if it is
+                     not running
+    drawn --start    the startup hook: start the watcher if it is not running
+    drawn --watch    the watcher itself (what --start runs, detached)
+
+herdr's own agent panel counts a finished piece of work as seen once the window has shown
+it. Each window keeps that count in memory, and no API exposes it, so the popup cannot read
+it. This keeps the closest record the API allows.
+
+A window that shows this machine gives the focused tab its own size; with no window on it,
+the tab falls back to the headless size. For each agent in the focused tab, this records the
+agent's state_change_seq under that size, in the pane token `switchboard_drawn` ("<seq>
+<cols>x<rows>", several joined by commas, highest seq first). The popup reads the token with
+the snapshot it already takes, from any machine, and counts only the sizes of the windows it
+was opened from: a window nobody uses (a Mac's own screen with the lid closed) draws too, but
+never opens the popup.
+
+Two things call it. The event hooks run on what changes what a window shows on this
+machine: an agent changing state and the focus moving. herdr sends no event when a window
+starts or stops showing a machine (its layout takes the window's size without one), so a
+watcher reads the snapshot once a second as well. It runs one per machine (a lock in the
+plugin's state directory), and exits when herdr's socket is gone, when the plugin is
+disabled or removed, or when an update moved the plugin's root: the next event or startup
+starts the new one.
+
+Standard library only. It prints nothing, never waits on herdr for more than a few seconds,
+and always exits 0: a hook that fails must not get in the way of herdr.
+"""
+import errno
+import fcntl
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+TOKEN = "switchboard_drawn"
+SOURCE = "plugin:trustxai.switchboard"
+PLUGIN_ID = "trustxai.switchboard"
+KEEP = 4             # sizes kept per pane; 4 entries stay under herdr's 80-character limit
+MAX_LEN = 80         # herdr caps a token value at 80 characters
+HEADLESS = "120x40"  # herdr's default headless size: no window draws it, so it is not noted
+TIMEOUT = 3.0        # seconds for one pass of the event hook, socket and lock included
+INTERVAL = 1.0       # seconds between the watcher's reads
+CHECK_EVERY = 30.0   # seconds between the watcher's checks that it is still the plugin's
+GONE_AFTER = 60.0    # seconds without herdr's socket before the watcher exits
+
+
+def valid_size(size):
+    cols, x, rows = size.partition("x")
+    return bool(x) and cols.isdigit() and rows.isdigit() and 0 < int(cols) < 100000 and 0 < int(rows) < 100000
+
+
+def parse(value):
+    """{size: seq} from a token value; anything malformed is skipped."""
+    out = {}
+    if not isinstance(value, str):
+        return out
+    for part in value.split(","):
+        bits = part.strip().split(" ")
+        if len(bits) != 2:
+            continue
+        seq, size = bits
+        if not seq.isdigit() or not valid_size(size):
+            continue
+        out[size] = max(out.get(size, -1), int(seq))
+    return out
+
+
+def serialize(drawn):
+    """The token value: highest seq first, at most KEEP sizes and MAX_LEN characters."""
+    items = sorted(drawn.items(), key=lambda kv: (-kv[1], kv[0]))[:KEEP]
+    while items:
+        value = ",".join("%d %s" % (seq, size) for size, seq in items)
+        if len(value) <= MAX_LEN:
+            return value
+        items = items[:-1]
+    return ""
+
+
+def merge(value, size, seq):
+    """The new token value once `size` drew `seq`, or None when nothing changes."""
+    drawn = parse(value)
+    if drawn.get(size, -1) >= seq:
+        return None
+    drawn[size] = seq
+    new = serialize(drawn)
+    return new if new and new != value else None
+
+
+def focused_size(snap):
+    """'<cols>x<rows>' of the focused tab's layout, or None."""
+    tab = snap.get("focused_tab_id")
+    for lay in snap.get("layouts") or []:
+        if isinstance(lay, dict) and lay.get("tab_id") == tab:
+            area = lay.get("area") or {}
+            cols, rows = area.get("width"), area.get("height")
+            if isinstance(cols, int) and isinstance(rows, int) and cols > 0 and rows > 0:
+                return "%dx%d" % (cols, rows)
+    return None
+
+
+def reports(snap):
+    """The pane.report_metadata params this snapshot calls for, one per pane that changes."""
+    size = focused_size(snap)
+    tab = snap.get("focused_tab_id")
+    if not size or size == HEADLESS or not isinstance(tab, str):
+        return []
+    out = []
+    for a in snap.get("agents") or []:
+        if not isinstance(a, dict) or a.get("tab_id") != tab or not isinstance(a.get("pane_id"), str):
+            continue
+        seq = a.get("state_change_seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+            continue
+        tokens = a.get("tokens") if isinstance(a.get("tokens"), dict) else {}
+        new = merge(tokens.get(TOKEN), size, seq)
+        if new is not None:
+            out.append({"pane_id": a["pane_id"], "source": SOURCE, "tokens": {TOKEN: new}})
+    return out
+
+
+def call(path, method, params, timeout=TIMEOUT):
+    """One request to herdr's socket and its result. herdr answers a request and closes the
+    connection, so each request opens its own."""
+    deadline = time.time() + timeout
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(timeout)
+        sock.connect(path)
+        sock.sendall((json.dumps({"id": "switchboard-drawn", "method": method, "params": params}) + "\n").encode())
+        buf = b""
+        while b"\n" not in buf:
+            sock.settimeout(max(0.05, deadline - time.time()))
+            chunk = sock.recv(1 << 16)
+            if not chunk:
+                raise OSError(errno.ECONNRESET, "herdr closed the socket before answering")
+            buf += chunk
+        msg = json.loads(buf.split(b"\n", 1)[0])
+    finally:
+        sock.close()
+    if not isinstance(msg, dict) or "error" in msg:
+        raise ValueError("herdr refused %s" % method)
+    return msg.get("result")
+
+
+def open_lock(state_dir, name):
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        return os.open(os.path.join(state_dir, name), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return None
+
+
+def try_lock(fd, wait):
+    """True once fd holds an exclusive lock; False when it cannot within `wait` seconds."""
+    deadline = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except OSError:
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.02)
+
+
+def note(path, state_dir, wait, rpc=call):
+    """One pass: read the snapshot and write the tokens it calls for. The write lock keeps
+    the event hooks and the watcher from rewriting one token from the same old value; when it
+    cannot be had in time, this pass is skipped, and the next one notes the same thing."""
+    fd = open_lock(state_dir, "drawn.lock")
+    if fd is None:
+        return
+    try:
+        if not try_lock(fd, wait):
+            return
+        result = rpc(path, "session.snapshot", {})
+        snap = result.get("snapshot") if isinstance(result, dict) else None
+        if isinstance(snap, dict):
+            for params in reports(snap):
+                rpc(path, "pane.report_metadata", params)
+    finally:
+        os.close(fd)
+
+
+def event(env, rpc=call):
+    """An event hook: note what is drawn now."""
+    path, state_dir = env.get("HERDR_SOCKET_PATH"), env.get("HERDR_PLUGIN_STATE_DIR")
+    if path and state_dir:
+        note(path, state_dir, TIMEOUT, rpc)
+
+
+def start_watcher(env, popen=subprocess.Popen):
+    """Start the watcher, detached, unless one already holds its lock. True when started."""
+    state_dir = env.get("HERDR_PLUGIN_STATE_DIR")
+    if not state_dir or not env.get("HERDR_SOCKET_PATH"):
+        return False
+    fd = open_lock(state_dir, "watch.lock")
+    if fd is None:
+        return False
+    try:
+        if not try_lock(fd, 0):
+            return False  # one is running
+    finally:
+        os.close(fd)  # the watcher takes the lock itself; a second one started meanwhile exits
+    popen([sys.executable, os.path.abspath(__file__), "--watch"], stdin=subprocess.DEVNULL,
+          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True,
+          start_new_session=True, cwd=state_dir, env=dict(env))
+    return True
+
+
+def last_error(state_dir, where, exc):
+    """Keep the watcher's last error, one line, in drawn.err: it prints nowhere else."""
+    try:
+        with open(os.path.join(state_dir, "drawn.err"), "w") as f:
+            f.write("%s %s: %s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), where,
+                                        type(exc).__name__, str(exc)[:200]))
+    except OSError:
+        pass
+
+
+def still_ours(path, env, rpc=call):
+    """False when the plugin is disabled, removed, or now runs from another root (an update):
+    this watcher's code is then not the plugin's any more."""
+    result = rpc(path, "plugin.list", {})
+    plugins = result.get("plugins") if isinstance(result, dict) else None
+    if not isinstance(plugins, list):
+        return True  # an answer it does not understand is no reason to stop
+    plugin_id = env.get("HERDR_PLUGIN_ID") or PLUGIN_ID
+    root = env.get("HERDR_PLUGIN_ROOT")
+    for p in plugins:
+        if isinstance(p, dict) and p.get("plugin_id") == plugin_id:
+            if not p.get("enabled", True):
+                return False
+            return not root or not p.get("plugin_root") or \
+                os.path.realpath(p["plugin_root"]) == os.path.realpath(root)
+    return False
+
+
+def watch(env, sleep=time.sleep, clock=time.time, rpc=call):
+    """The watcher: note what is drawn once a second, until it is not wanted any more."""
+    path, state_dir = env.get("HERDR_SOCKET_PATH"), env.get("HERDR_PLUGIN_STATE_DIR")
+    if not path or not state_dir:
+        return
+    fd = open_lock(state_dir, "watch.lock")
+    if fd is None:
+        return
+    try:
+        if not try_lock(fd, 0):
+            return
+        try:
+            os.ftruncate(fd, 0)
+            os.write(fd, ("%d\n" % os.getpid()).encode())
+        except OSError:
+            pass
+        me = os.path.abspath(__file__)
+        root = env.get("HERDR_PLUGIN_ROOT")
+        last_ok, next_check = clock(), 0.0
+        while True:
+            # A check that fails is no reason to stop noting: only a clear answer stops it.
+            if clock() >= next_check:
+                try:
+                    ours = still_ours(path, env, rpc)
+                except Exception as exc:
+                    ours = True
+                    last_error(state_dir, "plugin.list", exc)
+                if not ours or not os.path.exists(me) or (root and not os.path.isdir(root)):
+                    return
+                next_check = clock() + CHECK_EVERY
+            try:
+                note(path, state_dir, INTERVAL, rpc)
+                last_ok = clock()
+            except Exception as exc:
+                last_error(state_dir, "note", exc)
+                # herdr's server is gone (its socket with it, or no answer for a minute); its
+                # next start runs the startup hook, which starts a new watcher.
+                if not os.path.exists(path) or clock() - last_ok > GONE_AFTER:
+                    return
+            sleep(INTERVAL)
+    finally:
+        os.close(fd)
+
+
+def main(argv):
+    try:
+        if argv[:1] == ["--watch"]:
+            try:
+                os.nice(5)  # it runs all day: below the work in the panes
+            except OSError:
+                pass
+            watch(os.environ)
+        elif argv[:1] == ["--start"]:
+            start_watcher(os.environ)
+        else:
+            try:
+                event(os.environ)
+            finally:
+                start_watcher(os.environ)
+    except Exception:  # a hook never fails loudly
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

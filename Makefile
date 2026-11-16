@@ -1,15 +1,15 @@
 # Checks for herdr-switchboard.
 #
-# There is nothing to build: the plugin is one Python script that uses only the
-# standard library. These targets test and lint it, and CI runs the same targets
+# There is nothing to build: the plugin is two Python scripts (the popup and its
+# hook) that use only the standard library. These targets test and lint them, and CI runs the same targets
 # (.github/workflows/ci.yml), so a green `make check` here predicts a green CI.
 #
 # Works with the GNU make 3.81 that macOS ships.
 
 PYTHON ?= python3
 
-PROGRAM := bin/switchboard
-TESTS := tests/test_switchboard.py
+PROGRAM := bin/switchboard bin/drawn
+TESTS := tests/test_switchboard.py tests/test_drawn.py
 # Named, not globbed: a missing program or test file makes compile and ruff fail. The
 # converter behind the README images and the scripts behind the demo video are checked the
 # same way.
@@ -61,7 +61,7 @@ help:
 check: test lint secrets
 
 test:
-	$(PYTHON) $(TESTS)
+	@for t in $(TESTS); do echo "$(PYTHON) $$t"; $(PYTHON) $$t || exit 1; done
 	$(PYTHON) $(VIDEO_TESTS)
 
 lint: compile ruff scripts pycache
