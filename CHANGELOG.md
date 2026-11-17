@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-17
+
 ### Fixed
 
 - The time the popup waits for its own focus move to show up on another machine, and the time
@@ -123,6 +125,7 @@ First public release.
 - README images made from `--demo`, and `docs/render.sh`, which regenerates them.
 - Apache License 2.0, security policy, contributing guide and CI on Linux and macOS.
 
-[Unreleased]: https://github.com/trustxai/herdr-switchboard/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/trustxai/herdr-switchboard/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/trustxai/herdr-switchboard/releases/tag/v0.2.1
 [0.2.0]: https://github.com/trustxai/herdr-switchboard/releases/tag/v0.2.0
 [0.1.0]: https://github.com/trustxai/herdr-switchboard/releases/tag/v0.1.0
